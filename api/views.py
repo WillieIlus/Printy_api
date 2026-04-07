@@ -405,7 +405,6 @@ class PublicAllProductsView(APIView):
             Product.objects.filter(
                 shop__is_active=True,
                 shop__is_public=True,
-                shop__public_match_ready=True,
                 is_active=True,
                 status="PUBLISHED",
             )

@@ -226,15 +226,12 @@ def calculate_booklet_pricing(
 
     binding_rule = _resolve_binding_rule(shop, binding_type, binding_finishing_rate)
     if binding_rule is None:
-        reason = f"No active {_binding_display_name(binding_type)} rate is configured for this shop."
-        return _booklet_failure_payload(
-            shop=shop,
-            quantity=quantity,
-            width_mm=width_mm,
-            height_mm=height_mm,
-            warnings=warnings,
-            assumptions=assumptions,
-            reason=reason,
+        # Allow preview even when no binding rate is configured — many shops price binding
+        # as part of their standard booklet rate rather than as a separate finishing line.
+        # Add an assumption note so the buyer knows binding cost is not separately itemised.
+        assumptions.append(
+            f"{_binding_display_name(binding_type)} binding is not separately priced for this shop. "
+            "The quoted total covers paper and printing only. Ask the shop for their binding price."
         )
 
     cover_result = _build_section_result(
@@ -279,13 +276,18 @@ def calculate_booklet_pricing(
             reason=insert_result.reason,
         )
 
-    binding_line = compute_finishing_line(
-        binding_rule,
-        quantity=quantity,
-        good_sheets=0,
-        selected_side="both",
-    )
-    binding_total = Decimal(binding_line.total)
+    if binding_rule is not None:
+        binding_line = compute_finishing_line(
+            binding_rule,
+            quantity=quantity,
+            good_sheets=0,
+            selected_side="both",
+        )
+        binding_total = Decimal(binding_line.total)
+    else:
+        binding_line = None
+        binding_total = Decimal("0")
+
     cover_subtotal = _decimal(cover_result.totals.get("subtotal"))
     insert_subtotal = _decimal(insert_result.totals.get("subtotal"))
     lamination_total = _decimal(cover_result.totals.get("finishing_total"))
@@ -302,7 +304,7 @@ def calculate_booklet_pricing(
             continue
         if lamination_rule and rule.id == lamination_rule.id:
             continue
-        if rule.id == binding_rule.id:
+        if binding_rule is not None and rule.id == binding_rule.id:
             continue
         line = compute_finishing_line(
             rule,
@@ -324,7 +326,7 @@ def calculate_booklet_pricing(
         f"Pages: {total_pages} requested, {normalized_pages} priced.",
         f"Cover: {quantity} cover sheet(s) with {cover_sides.lower()} printing on {cover_breakdown.get('paper', {}).get('label', '')}.",
         f"Inserts: {insert_pages} inside page(s) -> {insert_sheets_per_booklet} insert sheet(s) per booklet, {total_insert_sheet_instances} insert sheet instance(s) total.",
-        f"Binding: {binding_rule.name} for {quantity} booklet(s).",
+        f"Binding: {binding_rule.name if binding_rule else _binding_display_name(binding_type) + ' (not separately priced)'} for {quantity} booklet(s).",
     ]
     explanations.extend(warnings)
     explanations.extend(assumptions)
@@ -377,10 +379,10 @@ def calculate_booklet_pricing(
             },
             {
                 "code": "binding",
-                "label": binding_rule.name,
+                "label": binding_rule.name if binding_rule else f"{_binding_display_name(binding_type)} (not priced)",
                 "amount": _format_money(binding_total),
-                "formula": binding_line.formula,
-                "metadata": binding_line.to_dict(),
+                "formula": binding_line.formula if binding_line else None,
+                "metadata": binding_line.to_dict() if binding_line else {},
             },
         ]
     )
@@ -453,12 +455,12 @@ def calculate_booklet_pricing(
         },
         "binding": {
             "binding_type": binding_type,
-            "label": binding_rule.name,
-            "formula": binding_line.formula,
-            "rate": binding_line.rate,
-            "units": binding_line.units,
+            "label": binding_rule.name if binding_rule else f"{_binding_display_name(binding_type)} (not separately priced)",
+            "formula": binding_line.formula if binding_line else None,
+            "rate": binding_line.rate if binding_line else None,
+            "units": binding_line.units if binding_line else None,
             "total": _format_money(binding_total),
-            "line": binding_line.to_dict(),
+            "line": binding_line.to_dict() if binding_line else {},
         },
         "finishings": [line.to_dict() for line in final_finishing_lines],
         "turnaround": {
