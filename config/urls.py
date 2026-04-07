@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/auth/", include("accounts.urls")),
     path("api/setup/", include("setup.urls")),
     path("api/", include("feedback.urls")),
+    path("api/billing/", include("billing.urls")),
     path("accounts/", include("allauth.urls")),
 ]
 

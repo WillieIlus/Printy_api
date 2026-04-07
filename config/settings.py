@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     "jobs",
     "subscriptions",
     "production",
+    "billing",
 ]
 
 AUTH_USER_MODEL = "accounts.User"
@@ -244,11 +245,26 @@ MPESA_STK_CALLBACK_URL = os.environ.get(
 )
 
 # =============================================================================
-# Subscription
+# Subscription (legacy)
 # =============================================================================
 
 FREE_TRIAL_DAYS = 14
 DEFAULT_SUBSCRIPTION_PLAN = "STARTER"
+
+# =============================================================================
+# Billing (new system)
+# =============================================================================
+
+MPESA_ENV = os.environ.get("MPESA_ENV", "sandbox")  # "sandbox" | "production"
+MPESA_CALLBACK_URL = os.environ.get(
+    "MPESA_CALLBACK_URL",
+    "https://printy.ke/api/billing/mpesa/callback/",
+)
+BILLING_GRACE_PERIOD_DAYS = int(os.environ.get("BILLING_GRACE_PERIOD_DAYS", "3"))
+# Retry schedule: hours after each failed attempt (initial → retry1 → retry2 → retry3)
+BILLING_RETRY_SCHEDULE_HOURS = [
+    int(h) for h in os.environ.get("BILLING_RETRY_SCHEDULE_HOURS", "6,24,48").split(",")
+]
 
 # =============================================================================
 # Middleware
