@@ -98,7 +98,7 @@ class QuoteItemFinishingInline(admin.TabularInline):
 class QuoteItemComponentInline(admin.TabularInline):
     model = QuoteItemComponent
     extra = 0
-    fields = ["component_type", "display_order", "paper", "material", "chosen_width_mm", "chosen_height_mm", "sides", "color_mode"]
+    fields = ["component_type", "display_order", "pages", "paper", "material", "chosen_width_mm", "chosen_height_mm", "sides", "color_mode"]
 
 
 class QuoteRequestServiceInline(admin.TabularInline):
@@ -177,6 +177,14 @@ class QuoteItemAdmin(admin.ModelAdmin):
             {
                 "fields": ("material", "chosen_width_mm", "chosen_height_mm"),
                 "description": "Material.selling_price × area_sqm. Area = (width_mm/1000)×(height_mm/1000)×quantity.",
+            },
+        ),
+        (
+            "Booklet",
+            {
+                "fields": ("input_pages", "normalized_pages", "binding_type"),
+                "description": "Booklet-specific fields. Leave blank for flat jobs.",
+                "classes": ["collapse"],
             },
         ),
         (

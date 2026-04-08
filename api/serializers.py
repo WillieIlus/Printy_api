@@ -1274,6 +1274,8 @@ class MaterialSerializer(serializers.ModelSerializer):
             "buying_price",
             "selling_price",
             "print_price_per_sqm",
+            "lead_in_mm",
+            "lead_out_mm",
             "is_active",
         ]
 

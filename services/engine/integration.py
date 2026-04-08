@@ -26,6 +26,8 @@ def build_media_spec_from_material(material) -> MediaSpec | None:
         width_mm=float(getattr(production_size, "width_mm", 0) or 0),
         height_mm=None,
         is_roll=True,
+        printable_margin_top_mm=float(getattr(material, "lead_in_mm", None) or 0),
+        printable_margin_bottom_mm=float(getattr(material, "lead_out_mm", None) or 0),
     )
 
 

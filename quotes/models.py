@@ -732,10 +732,45 @@ class QuoteItem(TimeStampedModel):
         ),
     )
 
+    # ------------------------------------------------------------------
+    # Booklet summary fields (null-safe; flat jobs leave these blank)
+    # ------------------------------------------------------------------
+    input_pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("input pages"),
+        help_text=_("Raw page count as entered by the buyer (before normalisation)."),
+    )
+    normalized_pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("normalized pages"),
+        help_text=_(
+            "Page count rounded up to the nearest booklet_page_multiple. "
+            "Stored so pricing components can reference it without re-computing."
+        ),
+    )
+    binding_type = models.CharField(
+        max_length=20,
+        choices=[
+            ("SADDLE_STITCH", "Saddle Stitch"),
+            ("PERFECT_BIND", "Perfect Bind"),
+        ],
+        blank=True,
+        default="",
+        verbose_name=_("binding type"),
+        help_text=_("Binding method chosen for this booklet item. Blank for flat jobs."),
+    )
+
     class Meta:
         ordering = ["pk"]
         verbose_name = _("quote item")
         verbose_name_plural = _("quote items")
+
+    @property
+    def has_booklet_structure(self) -> bool:
+        """True when this item carries booklet page data (cover + insert components expected)."""
+        return self.normalized_pages is not None
 
     def __str__(self):
         if self.item_type == "PRODUCT" and self.product_id:
@@ -938,6 +973,16 @@ class QuoteItemComponent(TimeStampedModel):
         blank=True,
         default="",
         verbose_name=_("color mode"),
+    )
+    pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("pages"),
+        help_text=_(
+            "Page count for this component. "
+            "COVER = typically 4; INSERT = normalized_pages − 4. "
+            "Null for flat (BODY) components."
+        ),
     )
 
     class Meta:

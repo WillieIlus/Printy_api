@@ -8,7 +8,7 @@ from catalog.choices import PricingMode
 from catalog.imposition import pieces_per_sheet, sheets_needed
 from catalog.models import Product
 from inventory.choices import SheetSize
-from inventory.models import Machine, Paper
+from inventory.models import Machine, Paper, ProductionPaperSize
 from pricing.choices import ChargeUnit, ColorMode, Sides
 from pricing.models import FinishingRate, Material, PrintingRate
 from quotes.choices import QuoteStatus
@@ -675,3 +675,369 @@ class QuoteEngineTests(TestCase):
         self.assertEqual(result.breakdown["per_sheet_pricing"]["total_job_price"], "4000.00")
         self.assertEqual(result.totals["print_cost"], "3500.00")
         self.assertEqual(result.totals["total_job_price"], "4000.00")
+
+
+# ---------------------------------------------------------------------------
+# Large-format roll-media calculator tests
+# ---------------------------------------------------------------------------
+
+class LargeFormatCalculatorTests(TestCase):
+    """
+    Tests for quotes/large_format_calculator.py.
+
+    Uses the calculator function directly (no HTTP, no ORM saves) so each test
+    is fast and precisely targeted. Backward-compat with existing
+    test_large_format_mode is enforced by test_fallback_no_production_size.
+    """
+
+    def setUp(self):
+        from quotes.large_format_calculator import calculate_large_format, build_large_format_snapshot
+        self.calc = calculate_large_format
+        self.snapshot = build_large_format_snapshot
+
+        self.user = User.objects.create_user(email="lf@test.com", password="pass")
+        self.shop = Shop.objects.create(
+            owner=self.user, name="LF Shop", slug="lf-shop", is_active=True
+        )
+        # 1200mm wide roll with 50mm lead-in and 50mm lead-out
+        self.roll = ProductionPaperSize.objects.create(
+            name="1.2m Roll", width_mm=1200, height_mm=1
+        )
+        self.material = Material.objects.create(
+            shop=self.shop,
+            material_type="Vinyl",
+            unit="SQM",
+            production_size=self.roll,
+            buying_price=Decimal("60.00"),
+            selling_price=Decimal("120.00"),
+            print_price_per_sqm=Decimal("0.00"),
+            lead_in_mm=50,
+            lead_out_mm=50,
+        )
+        # Product with bleed=0 and min_area=0.50 m²
+        self.product = Product.objects.create(
+            shop=self.shop,
+            name="Banner",
+            pricing_mode=PricingMode.LARGE_FORMAT,
+            default_finished_width_mm=1000,
+            default_finished_height_mm=500,
+            default_bleed_mm=0,
+            min_area_m2=Decimal("0.50"),
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Fallback — no production_size (backward-compat with original test)
+    # ------------------------------------------------------------------
+    def test_fallback_no_production_size(self):
+        """When material has no production_size, fall back to artwork-area pricing."""
+        mat_no_roll = Material.objects.create(
+            shop=self.shop,
+            material_type="Vinyl",
+            unit="SQM",
+            buying_price=Decimal("5.00"),
+            selling_price=Decimal("12.00"),
+            print_price_per_sqm=Decimal("0.00"),
+        )
+        product_no_min = Product.objects.create(
+            shop=self.shop,
+            name="Banner2",
+            pricing_mode=PricingMode.LARGE_FORMAT,
+            default_finished_width_mm=1000,
+            default_finished_height_mm=500,
+            min_area_m2=None,
+        )
+        result = self.calc(
+            width_mm=1000,
+            height_mm=500,
+            quantity=2,
+            material=mat_no_roll,
+            product=product_no_min,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        self.assertTrue(result.fallback_artwork_area)
+        # 12.00 * (1.0 m²) == 12.00  — exact match with existing test expectation
+        self.assertEqual(result.final_price, Decimal("12.00"))
+        self.assertEqual(result.artwork_area_m2, Decimal("1.0000"))
+
+    # ------------------------------------------------------------------
+    # 2. Nesting — items_across > 1
+    # ------------------------------------------------------------------
+    def test_items_across_nesting(self):
+        """3 × 400mm pieces nest across 1200mm roll (1200/400 = 3)."""
+        result = self.calc(
+            width_mm=400,
+            height_mm=500,
+            quantity=3,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        self.assertFalse(result.fallback_artwork_area)
+        self.assertEqual(result.items_across, 3)
+        self.assertEqual(result.rows, 1)  # 3 items, 3 across → 1 row
+
+    # ------------------------------------------------------------------
+    # 3. Consumed length includes lead-in + lead-out
+    # ------------------------------------------------------------------
+    def test_consumed_length_includes_lead_margins(self):
+        """
+        Lead-in (50mm) + lead-out (50mm) must be included in consumed_length_mm.
+
+        With a 1000×300mm piece and allow_rotation=True the imposer selects the
+        rotated layout (300mm across, 1000mm down) because it nests 4 items
+        across the 1200mm roll instead of just 1, minimising run length.
+        Expected consumed length = 1000 (item_height rotated) + 50 + 50 = 1100mm.
+        """
+        result = self.calc(
+            width_mm=1000,
+            height_mm=300,
+            quantity=1,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        # The imposer adds printable_margin_top + printable_margin_bottom to roll_length.
+        # Rotated layout: item_width=300, item_height=1000 → 4 across, 1 row.
+        # roll_length = 1 × 1000 + 50 + 50 = 1100mm.
+        self.assertEqual(result.consumed_length_mm, Decimal("1100.00"))
+
+    # ------------------------------------------------------------------
+    # 4. Billable area = consumed_length × printable_width / 1_000_000
+    # ------------------------------------------------------------------
+    def test_billable_area_formula(self):
+        """billable_media_area = roll_length_mm × printable_width_mm / 1_000_000."""
+        result = self.calc(
+            width_mm=1000,
+            height_mm=300,
+            quantity=1,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        expected = (result.consumed_length_mm * Decimal("1200") / Decimal("1000000")).quantize(Decimal("0.0001"))
+        self.assertEqual(result.billable_media_area_m2, expected)
+
+    # ------------------------------------------------------------------
+    # 5. Billable area > artwork area when nesting wastes roll width
+    # ------------------------------------------------------------------
+    def test_billable_greater_than_artwork_when_nesting(self):
+        """
+        1 × 1100mm-wide piece on a 1200mm roll.
+        Artwork area  = (1.1 × 0.5) = 0.55 m²
+        Billable area = (1.2 × (0.5 + 0.1)) = 0.72 m²  (1200mm width × roll_length)
+        Waste > 0.
+        """
+        result = self.calc(
+            width_mm=1100,
+            height_mm=500,
+            quantity=1,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        self.assertGreater(result.billable_media_area_m2, result.artwork_area_m2)
+        self.assertGreater(result.waste_area_m2, Decimal("0"))
+
+    # ------------------------------------------------------------------
+    # 6. Minimum area charge applied
+    # ------------------------------------------------------------------
+    def test_min_area_applied(self):
+        """200×200mm at qty=1 → 0.04 m² < min 0.50 m² → minimum_charge_applied."""
+        result = self.calc(
+            width_mm=200,
+            height_mm=200,
+            quantity=1,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        self.assertTrue(result.minimum_charge_applied)
+        self.assertTrue(any("Minimum" in w for w in result.warnings))
+        # Price must be based on min_area (0.50 m²), not tiny artwork area
+        expected_min_cost = (Decimal("120.00") * Decimal("0.50")).quantize(Decimal("0.01"))
+        self.assertEqual(result.material_cost, expected_min_cost)
+
+    # ------------------------------------------------------------------
+    # 7. Minimum area NOT applied for large artwork
+    # ------------------------------------------------------------------
+    def test_min_area_not_applied_for_large_artwork(self):
+        """Large piece (1000×600mm) exceeds min_area — no minimum charge."""
+        result = self.calc(
+            width_mm=1000,
+            height_mm=600,
+            quantity=2,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        self.assertFalse(result.minimum_charge_applied)
+
+    # ------------------------------------------------------------------
+    # 8. Tiling — piece wider than roll
+    # ------------------------------------------------------------------
+    def test_tiling_when_piece_exceeds_roll_width(self):
+        """
+        Both dimensions exceed the 1200mm roll width → tiling required even
+        after auto-rotation is attempted.
+        1500×1400mm: rotated = 1400×1500. 1400mm > 1200mm → still doesn't fit.
+        """
+        result = self.calc(
+            width_mm=1500,
+            height_mm=1400,
+            quantity=1,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        self.assertTrue(result.tiled)
+        self.assertGreater(result.tile_count, 1)
+        # The imposer writes a tiling note into layout.notes which surfaces in warnings
+        self.assertTrue(result.warnings, "Expected at least one warning for tiled job")
+
+    # ------------------------------------------------------------------
+    # 9. print_price_per_sqm included
+    # ------------------------------------------------------------------
+    def test_print_price_per_sqm_included_in_final_price(self):
+        """Material with print_price_per_sqm=50 → print_cost = billable × 50."""
+        mat_with_print = Material.objects.create(
+            shop=self.shop,
+            material_type="Canvas",
+            unit="SQM",
+            production_size=self.roll,
+            buying_price=Decimal("80.00"),
+            selling_price=Decimal("150.00"),
+            print_price_per_sqm=Decimal("50.00"),
+        )
+        result = self.calc(
+            width_mm=1000,
+            height_mm=500,
+            quantity=1,
+            material=mat_with_print,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        expected_print = (result.billable_media_area_m2 * Decimal("50.00")).quantize(Decimal("0.01"))
+        self.assertEqual(result.print_cost, expected_print)
+        self.assertEqual(
+            result.final_price,
+            result.material_cost + result.print_cost,
+        )
+
+    # ------------------------------------------------------------------
+    # 10. Snapshot keys — all required fields present
+    # ------------------------------------------------------------------
+    def test_snapshot_contains_all_required_keys(self):
+        """build_large_format_snapshot() must include every key the API exposes."""
+        result = self.calc(
+            width_mm=1000,
+            height_mm=500,
+            quantity=1,
+            material=self.material,
+            product=self.product,
+            finishing_total=Decimal("0"),
+            services_total=Decimal("0"),
+        )
+        snap = self.snapshot(result)
+        required_keys = {
+            "orientation", "rotated", "items_across", "rows",
+            "tiled", "tile_count", "consumed_length_mm",
+            "billable_media_area_m2", "artwork_area_m2", "waste_area_m2",
+            "material_cost", "print_cost", "finishing_cost",
+            "minimum_charge_applied", "final_price", "warnings",
+            "fallback_artwork_area",
+        }
+        missing = required_keys - set(snap.keys())
+        self.assertFalse(missing, f"Snapshot missing keys: {missing}")
+
+    # ------------------------------------------------------------------
+    # 11. lead_in/lead_out delta — materials with vs without margins
+    # ------------------------------------------------------------------
+    def test_lead_in_out_adds_to_consumed_length(self):
+        """Material B with 100mm each margin should consume 200mm more than Material A."""
+        mat_no_margins = Material.objects.create(
+            shop=self.shop,
+            material_type="Vinyl B",
+            unit="SQM",
+            production_size=self.roll,
+            buying_price=Decimal("60.00"),
+            selling_price=Decimal("120.00"),
+            print_price_per_sqm=Decimal("0.00"),
+            lead_in_mm=None,
+            lead_out_mm=None,
+        )
+        mat_with_margins = Material.objects.create(
+            shop=self.shop,
+            material_type="Vinyl C",
+            unit="SQM",
+            production_size=self.roll,
+            buying_price=Decimal("60.00"),
+            selling_price=Decimal("120.00"),
+            print_price_per_sqm=Decimal("0.00"),
+            lead_in_mm=100,
+            lead_out_mm=100,
+        )
+        product_no_min = Product.objects.create(
+            shop=self.shop,
+            name="Banner3",
+            pricing_mode=PricingMode.LARGE_FORMAT,
+            default_finished_width_mm=1000,
+            default_finished_height_mm=500,
+            min_area_m2=None,
+        )
+        r_no = self.calc(
+            width_mm=800, height_mm=400, quantity=2,
+            material=mat_no_margins, product=product_no_min,
+            finishing_total=Decimal("0"), services_total=Decimal("0"),
+        )
+        r_with = self.calc(
+            width_mm=800, height_mm=400, quantity=2,
+            material=mat_with_margins, product=product_no_min,
+            finishing_total=Decimal("0"), services_total=Decimal("0"),
+        )
+        delta = r_with.consumed_length_mm - r_no.consumed_length_mm
+        self.assertEqual(delta, Decimal("200.00"))
+
+    # ------------------------------------------------------------------
+    # 12. Integration — full QuoteItem path (pricing_service delegation)
+    # ------------------------------------------------------------------
+    def test_integration_quote_item_uses_roll_calculator(self):
+        """
+        Full stack: compute_and_store_pricing() with a material that has production_size
+        should persist a pricing_snapshot with 'billable_media_area_m2' in breakdown.
+        """
+        qr = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.user,
+            customer_name="Test",
+            customer_email="t@t.com",
+            status="DRAFT",
+        )
+        item = QuoteItem.objects.create(
+            quote_request=qr,
+            product=self.product,
+            quantity=1,
+            pricing_mode=PricingMode.LARGE_FORMAT,
+            material=self.material,
+            chosen_width_mm=1000,
+            chosen_height_mm=500,
+        )
+        # compute_and_store_pricing saves the snapshot on item and returns PricingResult.
+        compute_and_store_pricing(item)
+        item.refresh_from_db()
+        self.assertIsNotNone(item.pricing_snapshot)
+        snap = item.pricing_snapshot
+        # breakdown should contain the roll-calculator snapshot fields
+        breakdown = snap.get("breakdown", {})
+        self.assertIn("billable_media_area_m2", breakdown)
+        self.assertIn("artwork_area_m2", breakdown)
+        self.assertIn("consumed_length_mm", breakdown)
+        self.assertIn("warnings", breakdown)

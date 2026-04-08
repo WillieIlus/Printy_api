@@ -41,13 +41,13 @@ class ProductAdmin(admin.ModelAdmin):
         "default_finished_height_mm",
         "is_active",
     ]
-    list_filter = ["pricing_mode", "is_active"]
+    list_filter = ["pricing_mode", "product_kind", "is_active"]
     search_fields = ["name", "category__name"]
     inlines = [ImpositionInline, ProductFinishingOptionInline, ProductImageInline]
     readonly_fields = ["imposition_preview", "calculation_formula_display", "price_status_display"]
 
     fieldsets = (
-        (None, {"fields": ("shop", "name", "description", "category", "slug", "pricing_mode", "is_active")}),
+        (None, {"fields": ("shop", "name", "description", "category", "slug", "pricing_mode", "product_kind", "is_active")}),
         (
             "Dimensions",
             {
@@ -92,6 +92,26 @@ class ProductAdmin(admin.ModelAdmin):
         (
             "Gallery display",
             {"fields": ("dimensions_label", "weight_label", "is_popular", "is_best_value", "is_new")},
+        ),
+        (
+            "Booklet configuration",
+            {
+                "fields": (
+                    "default_binding_type",
+                    "booklet_min_pages",
+                    "booklet_max_pages",
+                    "booklet_page_multiple",
+                    "saddle_stitch_recommended_max_pages",
+                    "perfect_bind_recommended_min_pages",
+                    "creep_warning_start_pages",
+                ),
+                "description": (
+                    "Only relevant when product_kind = BOOKLET. "
+                    "Thresholds are transparency signals used by the service layer for warnings and binding recommendations, "
+                    "not hard limits."
+                ),
+                "classes": ["collapse"],
+            },
         ),
         (
             "Calculated",

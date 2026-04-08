@@ -599,6 +599,7 @@ def _compute_sheet_pricing(item, product, quantity, sides_count, result: Pricing
 
 
 def _compute_large_format_pricing(item, product, quantity, sides_count, result: PricingResult) -> PricingResult:
+    # ------------------------------------------------------------------ validation
     if not item.material_id:
         result.missing_fields.append("material")
     w = item.chosen_width_mm
@@ -613,61 +614,76 @@ def _compute_large_format_pricing(item, product, quantity, sides_count, result: 
 
     material = item.material
     result.quote_type = "large_format"
-    result.currency = getattr(getattr(item, "quote_request", None), "shop", None).currency if getattr(getattr(item, "quote_request", None), "shop", None) else ""
+    shop = getattr(getattr(item, "quote_request", None), "shop", None)
+    result.currency = getattr(shop, "currency", "") or ""
     result.material_label = f"{material.material_type} ({material.unit})"
-    area_sqm = compute_large_format_area(w, h, quantity)
-    result.area_m2 = str(area_sqm)
 
-    material_cost = material.selling_price * area_sqm
-    result.material_cost = str(material_cost)
-
+    # ------------------------------------------------------------------ pre-compute finishing / services
+    # Finishing billing uses artwork area (per-piece rates, eyelets, PER_SQM lamination, etc.)
+    # Roll-consumption area is only used for material/print cost lines.
+    artwork_area = compute_large_format_area(w, h, quantity)
     finishing_total, finishing_lines = compute_finishings_cost(
-        item.finishings, quantity, area_sqm, sides_count, 0
+        item.finishings, quantity, artwork_area, sides_count, 0
     )
+    services_total = _compute_services_total(item)
+
+    # ------------------------------------------------------------------ delegate to roll-media calculator
+    from quotes.large_format_calculator import (
+        LargeFormatCalcResult,
+        build_large_format_snapshot,
+        calculate_large_format,
+    )
+    calc: LargeFormatCalcResult = calculate_large_format(
+        width_mm=w,
+        height_mm=h,
+        quantity=quantity,
+        material=material,
+        product=product,
+        finishing_total=finishing_total,
+        services_total=services_total,
+    )
+
+    # ------------------------------------------------------------------ map to PricingResult
+    result.area_m2 = str(calc.billable_media_area_m2)
+    result.material_cost = str(calc.material_cost)
     result.finishing_total = str(finishing_total)
     result.finishing_lines = [asdict(fl) for fl in finishing_lines]
-
-    services_total = _compute_services_total(item)
     result.services_total = str(services_total)
+    result.line_total = str(calc.final_price)
+    result.unit_price = str(calc.final_price / quantity) if quantity > 0 else "0"
+    result.engine_type = "roll"
 
-    line_total = material_cost + finishing_total + services_total
-    result.line_total = str(line_total)
-    result.unit_price = str(line_total / quantity) if quantity > 0 else "0"
-    engine_summary = _calculate_engine_summary(item, product)
-    result.engine_type = engine_summary.engine_type if engine_summary else "roll"
-    result.layout_result = serialize_result(engine_summary.layout_result) if engine_summary and engine_summary.layout_result else {}
-    result.finishing_plan = serialize_result(engine_summary.finishing) if engine_summary and engine_summary.finishing else {}
-    result.layout_notes = list(getattr(engine_summary, "notes", []) or [])
+    snapshot = build_large_format_snapshot(calc)
+    result.breakdown = snapshot
+    result.layout_notes = list(calc.warnings)
+
     result.explanations = [
-        f"Large format area: {result.area_m2} sqm for {quantity} piece(s).",
-        f"Material cost: {result.material_cost}.",
-        f"Finishing total: {result.finishing_total}.",
+        f"Artwork: {w}mm \u00d7 {h}mm \u00d7 {quantity} piece(s).",
+        f"Artwork area: {calc.artwork_area_m2} m\u00b2.",
     ]
-    result.explanations.extend(result.layout_notes)
-    layout_result = result.layout_result or {}
-    if layout_result.get("roll_length_mm"):
-        result.explanations.append(
-            f"Roll usage: {layout_result['roll_length_mm']} mm total length on {layout_result.get('media_name') or 'selected roll'}."
-        )
-    result.calculation_description = "Large format job: material area/roll usage plus finishing."
+    if not calc.fallback_artwork_area:
+        result.explanations += [
+            f"Billable media area: {calc.billable_media_area_m2} m\u00b2 "
+            f"({calc.items_across} across \u00d7 {calc.rows} row(s), "
+            f"{int(calc.consumed_length_mm)} mm consumed).",
+            f"Waste area: {calc.waste_area_m2} m\u00b2.",
+        ]
+    result.explanations += [
+        f"Material cost: {result.currency} {calc.material_cost}.",
+        f"Print cost: {result.currency} {calc.print_cost}.",
+        f"Finishing: {result.currency} {finishing_total}.",
+    ]
+    result.explanations.extend(calc.warnings)
+    result.calculation_description = "Large-format roll-media job: billable roll area plus finishing."
+
     result.totals = {
         "material_cost": result.material_cost,
+        "print_cost": str(calc.print_cost),
         "finishing_total": result.finishing_total,
         "grand_total": result.line_total,
         "unit_price": result.unit_price,
     }
-    result.breakdown = {
-        "material": {
-            "label": result.material_label,
-            "unit": getattr(material, "unit", ""),
-        },
-        "dimensions": {
-            "width_mm": w,
-            "height_mm": h,
-            "area_sqm": result.area_m2,
-        },
-        "finishings": result.finishing_lines,
-    }
+
     result.calculation_result = build_calculation_result(
         quote_type=result.quote_type,
         pricing_mode=result.pricing_mode,
@@ -680,34 +696,53 @@ def _compute_large_format_pricing(item, product, quantity, sides_count, result: 
                 "code": "material",
                 "label": "Material",
                 "amount": result.material_cost,
-                "formula": f"{result.area_m2} sqm x {material.selling_price}",
+                "formula": f"{calc.billable_media_area_m2} m\u00b2 \u00d7 {material.selling_price}",
                 "metadata": {
                     "material_label": result.material_label,
                     "unit": getattr(material, "unit", ""),
+                    "rate_per_m2": str(material.selling_price),
+                },
+            },
+            {
+                "code": "print",
+                "label": "Print charge",
+                "amount": str(calc.print_cost),
+                "formula": (
+                    f"{calc.billable_media_area_m2} m\u00b2 \u00d7 {getattr(material, 'print_price_per_sqm', 0)}"
+                ),
+                "metadata": {
+                    "print_price_per_sqm": str(getattr(material, "print_price_per_sqm", 0) or 0),
                 },
             },
             *[
                 {
-                    "code": f"finishing_{index}",
+                    "code": f"finishing_{i}",
                     "label": line["name"],
                     "amount": line["computed_cost"],
                     "formula": line["charge_unit"],
                     "metadata": {"charge_unit": line["charge_unit"]},
                 }
-                for index, line in enumerate(result.finishing_lines)
+                for i, line in enumerate(result.finishing_lines)
             ],
         ],
         subtotal=result.line_total,
         finishing_total=result.finishing_total,
         grand_total=result.line_total,
         unit_price=result.unit_price,
-        explanation_blocks=[{"title": "Calculation", "text": text} for text in result.explanations],
+        warnings=calc.warnings,
+        explanation_blocks=[{"title": "Calculation", "text": t} for t in result.explanations if t],
         metadata={
-            "material": result.breakdown["material"],
-            "dimensions": result.breakdown["dimensions"],
-            "layout_result": result.layout_result,
-            "finishing_plan": result.finishing_plan,
-            "engine_type": result.engine_type,
+            "material": {
+                "label": result.material_label,
+                "unit": getattr(material, "unit", ""),
+            },
+            "dimensions": {
+                "width_mm": w,
+                "height_mm": h,
+                "artwork_area_m2": str(calc.artwork_area_m2),
+            },
+            "large_format_snapshot": snapshot,
+            "engine_type": "roll",
         },
         can_calculate=True,
         reason=result.reason,

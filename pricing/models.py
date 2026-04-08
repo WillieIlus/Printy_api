@@ -539,6 +539,24 @@ class Material(TimeStampedModel):
         verbose_name=_("is active"),
         help_text=_("Whether this material is active."),
     )
+    lead_in_mm = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("lead-in (mm)"),
+        help_text=_(
+            "Blank roll margin before the first printed row in mm. "
+            "Added to consumed roll length and therefore to billable area. Null = 0."
+        ),
+    )
+    lead_out_mm = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("lead-out (mm)"),
+        help_text=_(
+            "Blank roll margin after the last printed row in mm. "
+            "Added to consumed roll length and therefore to billable area. Null = 0."
+        ),
+    )
 
     class Meta:
         ordering = ["shop", "material_type"]

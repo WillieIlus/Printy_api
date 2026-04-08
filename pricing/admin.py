@@ -125,10 +125,31 @@ class FinishingRateAdmin(admin.ModelAdmin):
 
 @admin.register(Material)
 class MaterialAdmin(admin.ModelAdmin):
-    list_display = ["material_type", "shop", "production_size", "unit", "selling_price", "print_price_per_sqm", "is_active"]
+    list_display = [
+        "material_type", "shop", "production_size", "unit",
+        "selling_price", "print_price_per_sqm",
+        "lead_in_mm", "lead_out_mm", "is_active",
+    ]
     list_filter = ["is_active"]
     search_fields = ["material_type"]
     autocomplete_fields = ["production_size"]
+    fieldsets = (
+        (None, {
+            "fields": ("shop", "material_type", "unit", "production_size", "is_active"),
+        }),
+        ("Pricing", {
+            "fields": ("buying_price", "selling_price", "print_price_per_sqm"),
+        }),
+        ("Roll Configuration", {
+            "fields": ("lead_in_mm", "lead_out_mm"),
+            "description": (
+                "Lead-in and lead-out are blank roll margins (mm) before the first "
+                "and after the last printed row. They are added to the consumed roll "
+                "length and therefore increase the billable media area."
+            ),
+            "classes": ("collapse",),
+        }),
+    )
 
 
 class ServiceRateTierInline(admin.TabularInline):

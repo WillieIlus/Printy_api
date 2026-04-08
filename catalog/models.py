@@ -11,7 +11,7 @@ from pricing.choices import FinishingSides, Sides
 from pricing.models import FinishingRate
 from shops.models import Shop
 
-from .choices import PricingMode, ProductStatus
+from .choices import BindingType, PricingMode, ProductKind, ProductStatus
 from .imposition import pieces_per_sheet as imposition_pieces_per_sheet
 
 # Standard bleed for imposition calculation (mm)
@@ -319,6 +319,74 @@ class Product(TimeStampedModel, AutoSlugMixin):
     is_best_value = models.BooleanField(default=False, verbose_name=_("is best value"))
     is_new = models.BooleanField(default=False, verbose_name=_("is new"))
 
+    # ------------------------------------------------------------------
+    # Booklet identity and configuration
+    # ------------------------------------------------------------------
+    product_kind = models.CharField(
+        max_length=20,
+        choices=ProductKind.choices,
+        default=ProductKind.FLAT,
+        verbose_name=_("product kind"),
+        help_text=_("FLAT = standard single-sheet job. BOOKLET = multi-page bound product."),
+    )
+    default_binding_type = models.CharField(
+        max_length=20,
+        choices=BindingType.choices,
+        blank=True,
+        default="",
+        verbose_name=_("default binding type"),
+        help_text=_("Default binding method for booklets. Leave blank for flat products."),
+    )
+    booklet_min_pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("booklet min pages"),
+        help_text=_("Minimum page count allowed for this booklet product."),
+    )
+    booklet_max_pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("booklet max pages"),
+        help_text=_("Maximum page count allowed for this booklet product."),
+    )
+    booklet_page_multiple = models.PositiveIntegerField(
+        default=4,
+        verbose_name=_("booklet page multiple"),
+        help_text=_(
+            "Page count must be a multiple of this value. "
+            "4 = standard saddle-stitch (cover + inners both fold to 4). "
+            "Service layer rounds input_pages up to the nearest multiple."
+        ),
+    )
+    saddle_stitch_recommended_max_pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("saddle stitch recommended max pages"),
+        help_text=_(
+            "Transparent guidance threshold: saddle stitch is practical up to this page count. "
+            "Above this, service layer may warn and recommend perfect binding. "
+            "Not a hard limit — a UX trust-building signal."
+        ),
+    )
+    perfect_bind_recommended_min_pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("perfect bind recommended min pages"),
+        help_text=_(
+            "Page count from which perfect binding is recommended. "
+            "Used by service layer to suggest a binding upgrade."
+        ),
+    )
+    creep_warning_start_pages = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("creep warning start pages"),
+        help_text=_(
+            "Page count above which inner-page creep / trimming caution is surfaced. "
+            "Used later for thick-booklet UX warnings."
+        ),
+    )
+
     class Meta:
         ordering = ["shop", "name"]
         constraints = [
@@ -335,6 +403,11 @@ class Product(TimeStampedModel, AutoSlugMixin):
 
     def get_slug_scope(self):
         return {"shop_id": self.shop_id} if self.shop_id else None
+
+    @property
+    def is_booklet(self) -> bool:
+        """True when this product is a booklet (not a flat job)."""
+        return self.product_kind == ProductKind.BOOKLET
 
     def get_primary_image(self):
         """Return the primary image, or the first image, or None."""
