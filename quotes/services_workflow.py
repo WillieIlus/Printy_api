@@ -76,12 +76,14 @@ def _extract_shop_preview(pricing_snapshot, shop: Shop):
 
 
 def _build_item_spec_snapshot(*, draft: QuoteDraft, merged_request_details: dict, shop: Shop):
+    selected_shop_preview = _extract_shop_preview(draft.pricing_snapshot, shop)
     return {
         "source": "calculator_draft_send",
         "draft_reference": draft.draft_reference,
         "calculator_inputs": draft.calculator_inputs_snapshot or {},
         "custom_product_snapshot": draft.custom_product_snapshot or {},
         "request_details": merged_request_details,
+        "selected_shop_preview": selected_shop_preview or {},
         "selected_shop": {
             "id": shop.id,
             "slug": shop.slug,
@@ -94,6 +96,10 @@ def _build_quote_item(*, quote_request: QuoteRequest, draft: QuoteDraft, shop: S
     calculator_inputs = draft.calculator_inputs_snapshot or {}
     custom_snapshot = draft.custom_product_snapshot or {}
     product = _resolve_product_for_shop(draft, shop)
+    shop_preview = _extract_shop_preview(draft.pricing_snapshot, shop) or {}
+    shop_selection = shop_preview.get("selection") if isinstance(shop_preview, dict) else {}
+    if not isinstance(shop_selection, dict):
+        shop_selection = {}
 
     pricing_mode = (
         calculator_inputs.get("product_pricing_mode")
@@ -101,12 +107,22 @@ def _build_quote_item(*, quote_request: QuoteRequest, draft: QuoteDraft, shop: S
         or getattr(product, "pricing_mode", "")
         or ("LARGE_FORMAT" if calculator_inputs.get("material_id") else "SHEET")
     )
-    paper = _resolve_shop_resource(Paper, shop, calculator_inputs.get("paper_id"), active_only=True)
-    material = _resolve_shop_resource(Material, shop, calculator_inputs.get("material_id"), active_only=True)
+    paper = _resolve_shop_resource(
+        Paper,
+        shop,
+        calculator_inputs.get("paper_id") or shop_selection.get("paper_id"),
+        active_only=True,
+    )
+    material = _resolve_shop_resource(
+        Material,
+        shop,
+        calculator_inputs.get("material_id") or shop_selection.get("material_id"),
+        active_only=True,
+    )
     machine = _resolve_shop_resource(
         Machine,
         shop,
-        calculator_inputs.get("machine_id") or getattr(product, "default_machine_id", None),
+        calculator_inputs.get("machine_id") or shop_selection.get("machine_id") or getattr(product, "default_machine_id", None),
         active_only=True,
     )
     width_mm = _coerce_positive_int(
@@ -267,6 +283,7 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                     "draft_reference": draft.draft_reference,
                     "calculator_inputs": draft.calculator_inputs_snapshot,
                     "pricing_snapshot": draft.pricing_snapshot,
+                    "selected_shop_preview": _extract_shop_preview(draft.pricing_snapshot, shop),
                     "request_details": merged_request_details,
                     "custom_product_snapshot": draft.custom_product_snapshot,
                     "selected_shop": {"id": shop.id, "slug": shop.slug, "name": shop.name},

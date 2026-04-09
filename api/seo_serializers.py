@@ -78,13 +78,10 @@ class SEOProductDetailSerializer(serializers.ModelSerializer):
         fields = ["slug", "name", "description", "product_count"]
 
     def get_product_count(self, obj):
-        from catalog.models import Product
-        return Product.objects.filter(
+        from catalog.services import public_products_queryset
+
+        return public_products_queryset().filter(
             category=obj,
-            status="PUBLISHED",
-            is_active=True,
-            shop__is_active=True,
-            shop__pricing_ready=True,
         ).count()
 
 

@@ -19,6 +19,7 @@ from pricing.choices import ChargeUnit, FinishingBillingBasis, FinishingSideMode
 from pricing.models import FinishingRate, Material, PrintingRate, VolumeDiscount
 from quotes.choices import QuoteStatus, ShopQuoteStatus
 from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteRequest, ShopQuote
+from services.public_matching import recompute_shop_match_readiness
 from shops.models import Shop
 
 
@@ -835,6 +836,48 @@ class PublicShopsAPITestCase(TestCase):
         products = data["products"]
         self.assertEqual(len(products), 1)
         self.assertEqual(products[0]["name"], "Business Card")
+
+    def test_public_catalog_includes_active_draft_product_when_public(self):
+        Product.objects.create(
+            shop=self.shop,
+            name="Flyer",
+            pricing_mode=PricingMode.SHEET,
+            default_finished_width_mm=210,
+            default_finished_height_mm=297,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.DRAFT,
+        )
+
+        response = self.client.get("/api/public/shops/test-shop/catalog/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(len(data["products"]), 2)
+        self.assertTrue(any(product["name"] == "Flyer" for product in data["products"]))
+
+    def test_public_catalog_hides_product_when_not_public(self):
+        Product.objects.create(
+            shop=self.shop,
+            name="Secret Card",
+            pricing_mode=PricingMode.SHEET,
+            default_finished_width_mm=90,
+            default_finished_height_mm=55,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=True,
+            is_public=False,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        response = self.client.get("/api/public/products/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(len(data["products"]), 1)
+        self.assertEqual(data["products"][0]["name"], "Business Card")
 
 
 class ShopsNearbyAPITestCase(TestCase):
@@ -2527,6 +2570,112 @@ class PublicCalculatorPayloadSerializerTestCase(TestCase):
         self.assertEqual(serializer.validated_data["height_mm"], 297)
         self.assertEqual(serializer.validated_data["print_sides"], "DUPLEX")
         self.assertEqual(serializer.validated_data["colour_mode"], "COLOR")
+
+
+class PublicMatchShopsAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(email="match-owner@test.com", password="pass12345", role="shop_owner")
+        self.flat_shop = Shop.objects.create(owner=self.owner, name="Flat Shop", slug="flat-shop", is_active=True, is_public=True)
+        self.large_shop = Shop.objects.create(owner=self.owner, name="Large Shop", slug="large-shop", is_active=True, is_public=True)
+
+        flat_machine = Machine.objects.create(shop=self.flat_shop, name="Flat Press", max_width_mm=320, max_height_mm=450, is_active=True)
+        flat_paper = Paper.objects.create(
+            shop=self.flat_shop,
+            sheet_size="SRA3",
+            gsm=300,
+            paper_type="GLOSS",
+            buying_price=Decimal("10.00"),
+            selling_price=Decimal("24.00"),
+            width_mm=320,
+            height_mm=450,
+            is_active=True,
+        )
+        PrintingRate.objects.create(
+            machine=flat_machine,
+            sheet_size="SRA3",
+            color_mode="COLOR",
+            single_price=Decimal("45.00"),
+            double_price=Decimal("75.00"),
+            is_active=True,
+        )
+        Product.objects.create(
+            shop=self.flat_shop,
+            name="Flat Flyers",
+            pricing_mode=PricingMode.SHEET,
+            product_kind="FLAT",
+            default_finished_width_mm=210,
+            default_finished_height_mm=297,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        roll = ProductionPaperSize.objects.create(name="3.2m Roll", code="ROLL3200", width_mm=3200, height_mm=1)
+        Material.objects.create(
+            shop=self.large_shop,
+            production_size=roll,
+            material_type="Banner PVC",
+            unit="SQM",
+            buying_price=Decimal("200.00"),
+            selling_price=Decimal("450.00"),
+            print_price_per_sqm=Decimal("150.00"),
+            is_active=True,
+        )
+        Product.objects.create(
+            shop=self.large_shop,
+            name="PVC Banner",
+            pricing_mode=PricingMode.LARGE_FORMAT,
+            default_finished_width_mm=1000,
+            default_finished_height_mm=2000,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        recompute_shop_match_readiness(self.flat_shop)
+        recompute_shop_match_readiness(self.large_shop)
+
+    def test_large_format_public_match_returns_normalized_matches(self):
+        response = self.client.post(
+            "/api/public/match-shops/",
+            {
+                "pricing_mode": "custom",
+                "product_family": "large_format",
+                "product_pricing_mode": "LARGE_FORMAT",
+                "quantity": 1,
+                "width_mm": 1000,
+                "height_mm": 2000,
+                "material_type": "Banner PVC",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("matches", payload)
+        self.assertTrue(payload["matches"])
+        self.assertEqual(payload["matches"][0]["slug"], "large-shop")
+        self.assertEqual(payload["shops"][0]["slug"], "large-shop")
+
+    def test_large_format_public_match_excludes_flat_only_shops(self):
+        response = self.client.post(
+            "/api/public/match-shops/",
+            {
+                "pricing_mode": "custom",
+                "product_family": "large_format",
+                "product_pricing_mode": "LARGE_FORMAT",
+                "quantity": 1,
+                "width_mm": 1000,
+                "height_mm": 2000,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        slugs = [match["slug"] for match in response.json()["matches"]]
+        self.assertIn("large-shop", slugs)
+        self.assertNotIn("flat-shop", slugs)
 
 
 class CalculatorPreviewSerializerTestCase(TestCase):

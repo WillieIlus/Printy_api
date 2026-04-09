@@ -12,6 +12,11 @@ class PublicFinishingSelectionSerializer(serializers.Serializer):
 
 class PublicCalculatorPayloadSerializer(serializers.Serializer):
     calculator_mode = serializers.CharField(required=False, allow_blank=True, default="marketplace")
+    product_family = serializers.ChoiceField(
+        choices=["flat", "booklet", "large_format"],
+        required=False,
+        default="flat",
+    )
     shop_scope = serializers.ChoiceField(
         choices=["marketplace", "single_shop", "admin", "quote_draft", "tweak"],
         required=False,
@@ -39,6 +44,7 @@ class PublicCalculatorPayloadSerializer(serializers.Serializer):
     colour_mode = serializers.ChoiceField(choices=["BW", "COLOR"], default="COLOR")
     paper_id = serializers.IntegerField(required=False, allow_null=True)
     material_id = serializers.IntegerField(required=False, allow_null=True)
+    material_type = serializers.CharField(required=False, allow_blank=True, default="")
     sheet_size = serializers.CharField(required=False, allow_blank=True, default="")
     paper_gsm = serializers.IntegerField(required=False, allow_null=True)
     paper_type = serializers.CharField(required=False, allow_blank=True, default="")
@@ -69,6 +75,8 @@ class PublicCalculatorPayloadSerializer(serializers.Serializer):
                 normalized.setdefault("pricing_mode", legacy_path)
             if legacy_product_mode in {"SHEET", "LARGE_FORMAT"}:
                 normalized["product_pricing_mode"] = legacy_product_mode
+            if normalized.get("product_family") not in {"flat", "booklet", "large_format"}:
+                normalized["product_family"] = "large_format" if normalized.get("product_pricing_mode") == "LARGE_FORMAT" else "flat"
 
             if "sides" in normalized and "print_sides" not in normalized:
                 normalized["print_sides"] = normalized["sides"]
@@ -129,6 +137,39 @@ class PublicPreviewSelectionSerializer(serializers.Serializer):
     material_label = serializers.CharField(required=False)
     machine_id = serializers.IntegerField(required=False)
     machine_label = serializers.CharField(required=False)
+    # Booklet-specific selections
+    cover_paper_id = serializers.IntegerField(required=False)
+    cover_paper_label = serializers.CharField(required=False)
+    insert_paper_id = serializers.IntegerField(required=False)
+    insert_paper_label = serializers.CharField(required=False)
+    binding_rate_id = serializers.IntegerField(required=False)
+    binding_rate_label = serializers.CharField(required=False)
+
+
+class PublicBookletMatchPayloadSerializer(serializers.Serializer):
+    """Job-first payload for booklet marketplace matching — no shop required."""
+    product_family = serializers.ChoiceField(choices=["booklet"], required=False, default="booklet")
+    quantity = serializers.IntegerField(min_value=1, default=100)
+    total_pages = serializers.IntegerField(min_value=4, default=12)
+    binding_type = serializers.ChoiceField(
+        choices=["saddle_stitch", "perfect_bind", "wire_o"], default="saddle_stitch"
+    )
+    cover_paper_type = serializers.CharField(required=False, allow_blank=True, default="")
+    cover_paper_gsm = serializers.IntegerField(required=False, allow_null=True)
+    insert_paper_type = serializers.CharField(required=False, allow_blank=True, default="")
+    insert_paper_gsm = serializers.IntegerField(required=False, allow_null=True)
+    sheet_size = serializers.CharField(required=False, allow_blank=True, default="")
+    cover_sides = serializers.ChoiceField(choices=["SIMPLEX", "DUPLEX"], default="DUPLEX")
+    insert_sides = serializers.ChoiceField(choices=["SIMPLEX", "DUPLEX"], default="DUPLEX")
+    cover_color_mode = serializers.ChoiceField(choices=["BW", "COLOR"], default="COLOR")
+    insert_color_mode = serializers.ChoiceField(choices=["BW", "COLOR"], default="COLOR")
+    cover_lamination_mode = serializers.ChoiceField(choices=["none", "front", "both"], default="none")
+    width_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    height_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    lat = serializers.FloatField(required=False, allow_null=True)
+    lng = serializers.FloatField(required=False, allow_null=True)
+    radius_km = serializers.FloatField(required=False, allow_null=True, min_value=0.1, max_value=500)
 
 
 class PublicMatchShopSerializer(serializers.Serializer):
@@ -140,6 +181,8 @@ class PublicMatchShopSerializer(serializers.Serializer):
     reason = serializers.CharField()
     missing_fields = serializers.ListField(child=serializers.CharField(), default=list)
     similarity_score = serializers.FloatField(required=False)
+    confidence_score = serializers.FloatField(required=False)
+    distance_km = serializers.FloatField(required=False, allow_null=True)
     total = serializers.CharField(required=False, allow_null=True)
     preview = serializers.JSONField(required=False, allow_null=True)
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True)
@@ -157,6 +200,7 @@ class PublicCalculatorResponseSerializer(serializers.Serializer):
     min_price = serializers.CharField(required=False, allow_null=True)
     max_price = serializers.CharField(required=False, allow_null=True)
     currency = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    matches = PublicMatchShopSerializer(many=True)
     shops = PublicMatchShopSerializer(many=True)
     selected_shops = PublicMatchShopSerializer(many=True)
     fixed_shop_preview = PublicMatchShopSerializer(required=False, allow_null=True)

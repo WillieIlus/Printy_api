@@ -55,6 +55,7 @@ from .permissions import (
 )
 from .serializers import QuoteCalculatorInputSerializer
 from catalog.models import ProductImage
+from catalog.services import public_products_queryset, public_shop_products_queryset
 from .serializers import (
     MatchShopsInputSerializer,
     MatchShopsResponseSerializer,
@@ -134,13 +135,9 @@ class PublicShopViewSet(viewsets.ReadOnlyModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="catalog")
     def catalog(self, request, slug=None):
-        """GET /api/public/shops/{slug}/catalog/ — only PUBLISHED products from pricing-ready shops."""
+        """GET /api/public/shops/{slug}/catalog/ — active public products for this shop."""
         shop = self.get_object()
-        products = Product.objects.filter(
-            shop=shop,
-            is_active=True,
-            status="PUBLISHED",
-        ).select_related("category").prefetch_related(
+        products = public_shop_products_queryset(shop).select_related("category").prefetch_related(
             "finishing_options__finishing_rate",
             "images",
         )
@@ -281,12 +278,10 @@ class ShopRateCardForCalculatorView(APIView):
     def get(self, request, shop_slug):
         shop = get_object_or_404(Shop, slug=shop_slug, is_active=True)
 
-        # Templates from shop's PUBLISHED products
-        products = Product.objects.filter(
-            shop=shop,
-            is_active=True,
-            status="PUBLISHED",
-        ).prefetch_related("finishing_options__finishing_rate", "impositions").select_related("category")[:50]
+        # Templates from active public products.
+        products = public_shop_products_queryset(shop).prefetch_related(
+            "finishing_options__finishing_rate", "impositions"
+        ).select_related("category")[:50]
 
         templates = []
         for p in products:
@@ -396,18 +391,13 @@ class ShopRateCardForCalculatorView(APIView):
 
 
 class PublicAllProductsView(APIView):
-    """GET /api/public/products/ — only PUBLISHED products from pricing-ready active shops."""
+    """GET /api/public/products/ — active public products from active public shops."""
 
     permission_classes = [AllowAny]
 
     def get(self, request):
         products = (
-            Product.objects.filter(
-                shop__is_active=True,
-                shop__is_public=True,
-                is_active=True,
-                status="PUBLISHED",
-            )
+            public_products_queryset()
             .select_related("shop", "category")
             .prefetch_related(
                 "finishing_options__finishing_rate",
@@ -2307,10 +2297,9 @@ class GalleryProductDetailView(APIView):
 
     def get(self, request, pk):
         product = get_object_or_404(
-            Product.objects.select_related("shop")
+            public_products_queryset().select_related("shop")
                 .prefetch_related("finishing_options__finishing_rate", "images"),
             pk=pk,
-            is_active=True,
         )
         serializer = GalleryProductOptionsSerializer(product)
         return Response(serializer.data)

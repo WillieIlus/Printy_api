@@ -95,6 +95,7 @@ urlpatterns = [
     path("", include(finishing_category_router.urls)),
     path("public/products/", views.PublicAllProductsView.as_view(), name="public-all-products"),
     path("public/match-shops/", public_matching_views.PublicMatchShopsView.as_view(), name="public-match-shops"),
+    path("public/match-shops/booklet/", public_matching_views.PublicMatchBookletShopsView.as_view(), name="public-match-booklet-shops"),
     # SEO (public, no auth — for sitemap and dynamic pages)
     path("seo/locations/", SEOLocationsView.as_view(), name="seo-locations"),
     path("seo/locations/<slug:slug>/", SEOLocationDetailView.as_view(), name="seo-location-detail"),

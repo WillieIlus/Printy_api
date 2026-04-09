@@ -331,6 +331,8 @@ class CatalogProductSerializer(serializers.ModelSerializer):
     default_sides = serializers.CharField()
     pricing_mode = serializers.CharField()
     price_hint = serializers.SerializerMethodField()
+    can_calculate = serializers.SerializerMethodField()
+    pricing_ready = serializers.SerializerMethodField()
     price_range_est = serializers.SerializerMethodField()
     imposition_summary = serializers.SerializerMethodField()
     default_size_label = serializers.SerializerMethodField()
@@ -373,6 +375,8 @@ class CatalogProductSerializer(serializers.ModelSerializer):
             "finishing_options",
             "images",
             "primary_image",
+            "can_calculate",
+            "pricing_ready",
             "price_hint",
             "price_range_est",
             "imposition_summary",
@@ -416,6 +420,14 @@ class CatalogProductSerializer(serializers.ModelSerializer):
         from catalog.services import product_price_hint
 
         return product_price_hint(obj)
+
+    def get_can_calculate(self, obj):
+        hint = self.get_price_hint(obj) or {}
+        return bool(hint.get("can_calculate"))
+
+    def get_pricing_ready(self, obj):
+        shop = self.context.get("shop") or getattr(obj, "shop", None)
+        return bool(getattr(shop, "pricing_ready", False))
 
     def get_price_range_est(self, obj):
         from catalog.services import compute_product_price_range_est
@@ -1376,6 +1388,7 @@ class ProductWriteSerializer(serializers.ModelSerializer):
             "allow_simplex",
             "allow_duplex",
             "is_active",
+            "is_public",
             "status",
             "finishing_options",
         ]
@@ -1400,6 +1413,7 @@ class ProductWriteSerializer(serializers.ModelSerializer):
             "allowed_sheet_sizes": {"required": False},
             "allow_simplex": {"required": False},
             "allow_duplex": {"required": False},
+            "is_public": {"required": False},
             "status": {"required": False},
         }
 
@@ -1471,6 +1485,7 @@ class ProductWriteSerializer(serializers.ModelSerializer):
         if validated_data.get("min_quantity", 1) < 1:
             validated_data["min_quantity"] = 1
         validated_data.setdefault("status", "DRAFT")
+        validated_data.setdefault("is_public", True)
         product = Product.objects.create(shop=shop, **validated_data)
         for fd in finishings_data:
             ProductFinishingOption.objects.create(product=product, **fd)
@@ -1545,6 +1560,7 @@ class ProductListSerializer(serializers.ModelSerializer):
             "allow_simplex",
             "allow_duplex",
             "is_active",
+            "is_public",
             "status",
             "can_publish",
             "publish_block_reason",
@@ -1625,6 +1641,8 @@ class ProductSerializer(serializers.ModelSerializer):
             "allow_simplex",
             "allow_duplex",
             "is_active",
+            "is_public",
+            "status",
             "finishing_options",
             "price_hint",
             "price_range_est",

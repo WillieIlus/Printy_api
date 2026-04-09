@@ -119,7 +119,7 @@ def get_setup_status(user) -> dict:
     has_machines = Machine.objects.filter(shop=shop, is_active=True).exists()
     has_pricing = pricing_exists(shop)
     has_finishing = FinishingRate.objects.filter(shop=shop, is_active=True).exists()
-    has_published_products = Product.objects.filter(shop=shop, status="PUBLISHED", is_active=True).exists()
+    has_published_products = Product.objects.filter(shop=shop, is_public=True, is_active=True).exists()
 
     if not has_machines:
         next_step = "machines"

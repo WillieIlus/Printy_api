@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from catalog.models import Product, ProductCategory
+from catalog.services import public_products_queryset
 from locations.models import Location
 from shops.models import Shop
 
@@ -94,17 +95,15 @@ class SEORoutesView(APIView):
             # Shops in this location that have products
             shop_ids = set(
                 Shop.objects.filter(
-                    location=loc, is_active=True, pricing_ready=True
+                    location=loc, is_active=True, is_public=True
                 ).values_list("id", flat=True)
             )
             if not shop_ids:
                 continue
             # Product categories that have products from these shops
             cat_ids = set(
-                Product.objects.filter(
+                public_products_queryset().filter(
                     shop_id__in=shop_ids,
-                    status="PUBLISHED",
-                    is_active=True,
                     category__isnull=False,
                     category__shop__isnull=True,
                     category__is_active=True,
@@ -149,16 +148,14 @@ class SEOLocationProductsView(APIView):
         location = get_object_or_404(Location, slug=slug, is_active=True)
         shop_ids = set(
             Shop.objects.filter(
-                location=location, is_active=True, pricing_ready=True
+                location=location, is_active=True, is_public=True
             ).values_list("id", flat=True)
         )
         if not shop_ids:
             return Response([])
         cat_ids = set(
-            Product.objects.filter(
+            public_products_queryset().filter(
                 shop_id__in=shop_ids,
-                status="PUBLISHED",
-                is_active=True,
                 category__isnull=False,
                 category__shop__isnull=True,
                 category__is_active=True,
@@ -201,7 +198,7 @@ class SEOLocationProductView(APIView):
         )
         shop_ids = set(
             Shop.objects.filter(
-                location=location, is_active=True, pricing_ready=True
+                location=location, is_active=True, is_public=True
             ).values_list("id", flat=True)
         )
         if not shop_ids:
@@ -214,8 +211,8 @@ class SEOLocationProductView(APIView):
             Shop.objects.filter(
                 id__in=shop_ids,
                 products__category=category,
-                products__status="PUBLISHED",
                 products__is_active=True,
+                products__is_public=True,
             ).distinct().order_by("name")
         )
         return Response({

@@ -35,6 +35,21 @@ PRICING_MODE_EXPLANATIONS = {
 }
 
 
+def public_products_queryset():
+    """Products eligible for public browsing and public shop catalogs."""
+    return Product.objects.filter(
+        shop__is_active=True,
+        shop__is_public=True,
+        is_active=True,
+        is_public=True,
+    )
+
+
+def public_shop_products_queryset(shop):
+    """Publicly visible products for one active public shop."""
+    return public_products_queryset().filter(shop=shop)
+
+
 def _format_price_display(min_val, max_val, can_calculate) -> str:
     """Human-readable price string for cards."""
     if not can_calculate:

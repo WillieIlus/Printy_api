@@ -242,6 +242,11 @@ class Product(TimeStampedModel, AutoSlugMixin):
         verbose_name=_("is active"),
         help_text=_("Whether this product is active."),
     )
+    is_public = models.BooleanField(
+        default=True,
+        verbose_name=_("is public"),
+        help_text=_("Whether this product is visible on public pages and public shop catalogs."),
+    )
     lowest_price = models.DecimalField(
         max_digits=12,
         decimal_places=2,
