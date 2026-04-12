@@ -9,7 +9,7 @@ from math import ceil
 
 from django.db.models import Q
 
-from catalog.choices import PricingMode
+from catalog.choices import PricingMode, ProductStatus
 from catalog.models import Product
 from catalog.validation import validate_product_configuration
 from inventory.choices import MachineType, SheetSize, SHEET_SIZE_DIMENSIONS
@@ -36,12 +36,20 @@ PRICING_MODE_EXPLANATIONS = {
 
 
 def public_products_queryset():
-    """Products eligible for public browsing and public shop catalogs."""
+    """Products eligible for public browsing and public shop catalogs.
+
+    Requires ALL three conditions:
+      - status=PUBLISHED   (not draft or unavailable)
+      - is_active=True     (not soft-deleted)
+      - is_public=True     (not manually hidden)
+    Shop must also be active and public.
+    """
     return Product.objects.filter(
         shop__is_active=True,
         shop__is_public=True,
         is_active=True,
         is_public=True,
+        status=ProductStatus.PUBLISHED,
     )
 
 

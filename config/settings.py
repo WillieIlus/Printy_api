@@ -3,21 +3,58 @@ Django settings for printy_API project.
 Prepared for printy.ke launch and frontend connection.
 """
 import os
+import logging
 from pathlib import Path
 from datetime import timedelta
+from django.core.exceptions import ImproperlyConfigured
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env", override=False)
 
-SECRET_KEY = os.environ.get(
-    "DJANGO_SECRET_KEY", "django-insecure-dev-key-change-in-production"
+logger = logging.getLogger(__name__)
+
+DEBUG = os.environ.get("DEBUG", "false").lower() in ("1", "true", "yes")
+
+
+def _get_env(name, *, fallback_names=(), default=None, required=False):
+    for candidate in (name, *fallback_names):
+        value = os.environ.get(candidate)
+        if value is not None:
+            return value
+    if required:
+        raise ImproperlyConfigured(f"Set the {name} environment variable.")
+    return default
+
+
+def _get_env_list(name, *, fallback_names=(), default=""):
+    value = _get_env(name, fallback_names=fallback_names, default=default)
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _env_debug_enabled():
+    return os.environ.get("ENV_DEBUG", "false").lower() in ("1", "true", "yes")
+
+
+def _log_env_presence(*names):
+    if not _env_debug_enabled():
+        return
+    presence = ", ".join(
+        f"{name}={'set' if os.environ.get(name) else 'missing'}" for name in names
+    )
+    logger.warning("Environment variable presence: %s", presence)
+
+
+SECRET_KEY = _get_env(
+    "SECRET_KEY",
+    fallback_names=("DJANGO_SECRET_KEY",),
+    required=True,
 )
 
-DEBUG = os.environ.get("DEBUG", "true").lower() in ("1", "true", "yes")
-
-ALLOWED_HOSTS = os.environ.get(
+ALLOWED_HOSTS = _get_env_list(
     "ALLOWED_HOSTS",
-    "localhost,127.0.0.1,testserver,printy.ke,www.printy.ke,amazingace00.pythonanywhere.com,willieilus.pythonanywhere.com",
-).split(",")
+    default="localhost,127.0.0.1,testserver",
+)
 
 # =============================================================================
 # Apps
@@ -150,9 +187,9 @@ SOCIALACCOUNT_PROVIDERS = {
 # =============================================================================
 
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
-DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@printy.ke")
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@example.com")
 
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://printy.ke")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 EMAIL_CONFIRMATION_URL = f"{FRONTEND_URL}/auth/confirm-email"
 PASSWORD_RESET_URL = f"{FRONTEND_URL}/auth/reset-password"
 
@@ -160,37 +197,15 @@ PASSWORD_RESET_URL = f"{FRONTEND_URL}/auth/reset-password"
 # CSRF & CORS (printy.ke + local dev)
 # =============================================================================
 
-# Frontend origins (admin/allauth forms). Prune to only what you use.
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:8000",
-    "http://127.0.0.1:8000",
-    "https://printyke.netlify.app",
-    "https://printy.ke",
-    "https://www.printy.ke",
-    "https://amazingace00.pythonanywhere.com",
-    "https://willieilus.pythonanywhere.com",
-]
+# Frontend origins (admin/allauth forms). Configure deployment hosts via env.
+CSRF_TRUSTED_ORIGINS = _get_env_list(
+    "CSRF_TRUSTED_ORIGINS",
+    default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000",
+)
 
-# Override via CORS_ALLOWED_ORIGINS env (comma-separated) if needed on PythonAnywhere
-_cors_env = os.environ.get("CORS_ALLOWED_ORIGINS", "").strip()
-CORS_ALLOWED_ORIGINS = (
-    [o.strip() for o in _cors_env.split(",") if o.strip()]
-    if _cors_env
-    else [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://printyke.netlify.app",
-        "https://printy.ke",
-        "https://www.printy.ke",
-        "https://amazingace00.pythonanywhere.com",
-        "https://willieilus.pythonanywhere.com",
-    ]
+CORS_ALLOWED_ORIGINS = _get_env_list(
+    "CORS_ALLOWED_ORIGINS",
+    default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
 )
 
 # JWT in header: no cookies needed for API. Set False for cross-site SPA.
@@ -311,29 +326,22 @@ TEMPLATES = [
 # Database
 # =============================================================================
 
-_db_engine = os.environ.get("DB_ENGINE", "sqlite")
-if _db_engine == "mysql":
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.mysql",
-            "NAME": os.environ.get("DB_NAME", "printshop"),
-            "USER": os.environ.get("DB_USER", "printshop_user"),
-            "PASSWORD": os.environ.get("DB_PASSWORD", ""),
-            "HOST": os.environ.get("DB_HOST", "127.0.0.1"),
-            "PORT": os.environ.get("DB_PORT", "3306"),
-            "OPTIONS": {
-                "charset": "utf8mb4",
-                "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
-            },
-        }
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": _get_env("DB_NAME", default="printy_db"),
+        "USER": _get_env("DB_USER", default="printy_user"),
+        "PASSWORD": _get_env("DB_PASSWORD", default=""),
+        "HOST": _get_env("DB_HOST", default="127.0.0.1"),
+        "PORT": _get_env("DB_PORT", default="5432"),
     }
-else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.sqlite3",
-            "NAME": BASE_DIR / "db.sqlite3",
-        }
-    }
+}
+
+_log_env_presence("SECRET_KEY", "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT")
+ 
+
+
 
 # =============================================================================
 # Auth & i18n

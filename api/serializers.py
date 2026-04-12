@@ -385,6 +385,9 @@ class CatalogProductSerializer(serializers.ModelSerializer):
             "finishing_summary",
             "final_size",
             "is_owner",
+            "status",
+            "is_public",
+            "is_active",
         ]
 
     def get_is_owner(self, obj):
@@ -1600,6 +1603,7 @@ class ProductSerializer(serializers.ModelSerializer):
 
     finishing_options = ProductFinishingOptionWriteSerializer(many=True, required=False)
     price_hint = serializers.SerializerMethodField()
+    price_range_est = serializers.SerializerMethodField()
     turnaround_hours = serializers.SerializerMethodField()
     estimated_working_hours = serializers.SerializerMethodField()
     estimated_ready_at = serializers.SerializerMethodField()
