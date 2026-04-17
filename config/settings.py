@@ -53,7 +53,7 @@ SECRET_KEY = _get_env(
 
 ALLOWED_HOSTS = _get_env_list(
     "ALLOWED_HOSTS",
-    default="localhost,127.0.0.1,testserver",
+    default="api.printy.ke,178.128.206.240,localhost,127.0.0.1,testserver",
 )
 
 # =============================================================================
@@ -200,12 +200,12 @@ PASSWORD_RESET_URL = f"{FRONTEND_URL}/auth/reset-password"
 # Frontend origins (admin/allauth forms). Configure deployment hosts via env.
 CSRF_TRUSTED_ORIGINS = _get_env_list(
     "CSRF_TRUSTED_ORIGINS",
-    default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000",
+    default="https://printy.ke,https://www.printy.ke,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000",
 )
 
 CORS_ALLOWED_ORIGINS = _get_env_list(
     "CORS_ALLOWED_ORIGINS",
-    default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+    default="https://printy.ke,https://www.printy.ke,http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
 )
 
 # JWT in header: no cookies needed for API. Set False for cross-site SPA.
