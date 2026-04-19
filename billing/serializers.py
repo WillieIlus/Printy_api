@@ -1,10 +1,6 @@
 """Billing serializers."""
 from __future__ import annotations
 
-import re
-from decimal import Decimal
-
-from django.conf import settings
 from rest_framework import serializers
 
 from billing.models import (
@@ -12,18 +8,11 @@ from billing.models import (
     PaymentTransaction,
     ShopSubscription,
     SubscriptionShop,
-    UsageCounter,
 )
 from billing.services.payments import normalize_phone_number
 
 
-# ---------------------------------------------------------------------------
-# Plan
-# ---------------------------------------------------------------------------
-
 class PublicPlanSerializer(serializers.ModelSerializer):
-    """Minimal plan info for unauthenticated or list views."""
-
     class Meta:
         model = Plan
         fields = [
@@ -51,15 +40,9 @@ class PublicPlanSerializer(serializers.ModelSerializer):
 
 
 class PlanSerializer(PublicPlanSerializer):
-    """Full plan serializer including admin fields."""
-
     class Meta(PublicPlanSerializer.Meta):
         fields = PublicPlanSerializer.Meta.fields + ["is_active", "metadata", "created_at", "updated_at"]
 
-
-# ---------------------------------------------------------------------------
-# Subscription shop link
-# ---------------------------------------------------------------------------
 
 class SubscriptionShopSerializer(serializers.ModelSerializer):
     shop_name = serializers.CharField(source="shop.name", read_only=True)
@@ -69,10 +52,6 @@ class SubscriptionShopSerializer(serializers.ModelSerializer):
         model = SubscriptionShop
         fields = ["id", "shop", "shop_name", "shop_slug", "is_primary", "added_at"]
 
-
-# ---------------------------------------------------------------------------
-# ShopSubscription
-# ---------------------------------------------------------------------------
 
 class ShopSubscriptionSerializer(serializers.ModelSerializer):
     plan = PublicPlanSerializer(read_only=True)
@@ -109,8 +88,6 @@ class ShopSubscriptionSerializer(serializers.ModelSerializer):
 
 
 class SubscriptionDetailSerializer(ShopSubscriptionSerializer):
-    """Extended subscription detail including renewal and cancellation meta."""
-
     class Meta(ShopSubscriptionSerializer.Meta):
         fields = ShopSubscriptionSerializer.Meta.fields + [
             "cancellation_requested_at",
@@ -122,10 +99,6 @@ class SubscriptionDetailSerializer(ShopSubscriptionSerializer):
             "notes",
         ]
 
-
-# ---------------------------------------------------------------------------
-# PaymentTransaction
-# ---------------------------------------------------------------------------
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     plan_name = serializers.CharField(source="plan.name", read_only=True, default="")
@@ -143,22 +116,24 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             "currency",
             "status",
             "phone_number",
-            "mpesa_receipt_number",
+            "account_reference",
+            "transaction_desc",
+            "merchant_request_id",
             "checkout_request_id",
+            "response_code",
+            "response_description",
+            "customer_message",
             "result_code",
             "result_desc",
+            "mpesa_receipt_number",
             "initiated_at",
             "callback_received_at",
             "completed_at",
-            "idempotency_key",
             "created_at",
+            "updated_at",
         ]
         read_only_fields = fields
 
-
-# ---------------------------------------------------------------------------
-# Action serializers
-# ---------------------------------------------------------------------------
 
 def _validate_phone(value: str) -> str:
     try:
@@ -168,16 +143,9 @@ def _validate_phone(value: str) -> str:
 
 
 def _validate_plan_code(value: str) -> str:
-    from billing.models import Plan
     valid = [Plan.CODE_FREE, Plan.CODE_BIASHARA, Plan.CODE_BIASHARA_PLUS, Plan.CODE_BIASHARA_MAX]
     if value not in valid:
         raise serializers.ValidationError(f"Invalid plan code. Choose from: {valid}")
-    return value
-
-
-def _validate_interval(value: str) -> str:
-    if value not in (ShopSubscription.INTERVAL_MONTHLY, ShopSubscription.INTERVAL_ANNUAL):
-        raise serializers.ValidationError("billing_interval must be 'monthly' or 'annual'.")
     return value
 
 
@@ -188,9 +156,7 @@ class StartSubscriptionSerializer(serializers.Serializer):
         default=ShopSubscription.INTERVAL_MONTHLY,
     )
     phone_number = serializers.CharField(max_length=20)
-    selected_shop_ids = serializers.ListField(
-        child=serializers.IntegerField(), min_length=1
-    )
+    selected_shop_ids = serializers.ListField(child=serializers.IntegerField(), min_length=1)
 
     def validate_plan_code(self, value):
         return _validate_plan_code(value)
@@ -203,9 +169,7 @@ class StartSubscriptionSerializer(serializers.Serializer):
         selected = attrs["selected_shop_ids"]
 
         if plan_code == Plan.CODE_FREE:
-            raise serializers.ValidationError(
-                {"plan_code": "Cannot subscribe to Free via this endpoint."}
-            )
+            raise serializers.ValidationError({"plan_code": "Cannot subscribe to Free via this endpoint."})
 
         limit_map = {
             Plan.CODE_BIASHARA: 1,
@@ -218,7 +182,6 @@ class StartSubscriptionSerializer(serializers.Serializer):
                 {"selected_shop_ids": f"Plan {plan_code} allows max {limit} shop(s)."}
             )
 
-        # Validate plan is active
         try:
             plan = Plan.objects.get(code=plan_code, is_active=True)
         except Plan.DoesNotExist:
@@ -234,9 +197,7 @@ class UpgradeSubscriptionSerializer(serializers.Serializer):
         default=ShopSubscription.INTERVAL_MONTHLY,
     )
     phone_number = serializers.CharField(max_length=20, required=False, allow_blank=True)
-    selected_shop_ids = serializers.ListField(
-        child=serializers.IntegerField(), required=False, default=list
-    )
+    selected_shop_ids = serializers.ListField(child=serializers.IntegerField(), required=False, default=list)
 
     def validate_target_plan_code(self, value):
         return _validate_plan_code(value)
@@ -249,9 +210,8 @@ class UpgradeSubscriptionSerializer(serializers.Serializer):
     def validate(self, attrs):
         plan_code = attrs["target_plan_code"]
         if plan_code == Plan.CODE_FREE:
-            raise serializers.ValidationError(
-                {"target_plan_code": "Use downgrade endpoint to move to Free."}
-            )
+            raise serializers.ValidationError({"target_plan_code": "Use downgrade endpoint to move to Free."})
+
         selected = attrs.get("selected_shop_ids", [])
         if selected:
             limit_map = {
@@ -283,19 +243,12 @@ class InitiateRenewalSerializer(serializers.Serializer):
         return _validate_phone(value)
 
 
-# ---------------------------------------------------------------------------
-# Usage
-# ---------------------------------------------------------------------------
-
 class UsageSerializer(serializers.Serializer):
-    """Combines live usage counts + plan limits for the owner."""
-
     shops = serializers.IntegerField()
     machines = serializers.IntegerField()
     active_products = serializers.IntegerField()
     team_members = serializers.IntegerField()
     quotes_this_month = serializers.IntegerField()
-
     shops_limit = serializers.IntegerField(allow_null=True)
     machines_limit = serializers.IntegerField(allow_null=True)
     products_limit = serializers.IntegerField(allow_null=True)

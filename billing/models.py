@@ -359,10 +359,14 @@ class PaymentTransaction(models.Model):
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING,
         verbose_name=_("status"), db_index=True,
     )
+    response_code = models.CharField(max_length=10, blank=True, default="", verbose_name=_("response code"))
+    response_description = models.CharField(max_length=255, blank=True, default="", verbose_name=_("response description"))
+    customer_message = models.CharField(max_length=255, blank=True, default="", verbose_name=_("customer message"))
     result_code = models.CharField(max_length=10, blank=True, default="", verbose_name=_("result code"))
     result_desc = models.CharField(max_length=255, blank=True, default="", verbose_name=_("result description"))
 
     raw_request = models.JSONField(null=True, blank=True, verbose_name=_("raw STK request"))
+    raw_response = models.JSONField(null=True, blank=True, verbose_name=_("raw STK response"))
     raw_callback = models.JSONField(null=True, blank=True, verbose_name=_("raw callback payload"))
 
     initiated_at = models.DateTimeField(null=True, blank=True, verbose_name=_("initiated at"))

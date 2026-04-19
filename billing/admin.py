@@ -1,6 +1,5 @@
-"""Billing admin — full CRUD + action support for all billing models."""
+"""Billing admin for plans, subscriptions, payments, renewals, and usage counters."""
 from django.contrib import admin
-from django.utils.html import format_html
 
 from billing.models import (
     Plan,
@@ -11,10 +10,6 @@ from billing.models import (
     UsageCounter,
 )
 
-
-# ---------------------------------------------------------------------------
-# Plan
-# ---------------------------------------------------------------------------
 
 @admin.register(Plan)
 class PlanAdmin(admin.ModelAdmin):
@@ -27,22 +22,12 @@ class PlanAdmin(admin.ModelAdmin):
     fieldsets = [
         ("Identity", {"fields": ["code", "name", "public_tagline", "best_for", "sort_order", "is_active"]}),
         ("Pricing", {"fields": ["price_monthly", "price_annual", "currency"]}),
-        ("Limits", {"fields": [
-            "shops_limit", "machines_limit", "products_limit",
-            "quotes_per_month_limit", "users_limit",
-        ]}),
-        ("Features", {"fields": [
-            "all_papers_enabled", "branded_quotes_enabled", "customer_history_enabled",
-            "analytics_level", "priority_support",
-        ]}),
+        ("Limits", {"fields": ["shops_limit", "machines_limit", "products_limit", "quotes_per_month_limit", "users_limit"]}),
+        ("Features", {"fields": ["all_papers_enabled", "branded_quotes_enabled", "customer_history_enabled", "analytics_level", "priority_support"]}),
         ("Content", {"fields": ["benefits", "metadata"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
 
-
-# ---------------------------------------------------------------------------
-# SubscriptionShop inline
-# ---------------------------------------------------------------------------
 
 class SubscriptionShopInline(admin.TabularInline):
     model = SubscriptionShop
@@ -50,40 +35,22 @@ class SubscriptionShopInline(admin.TabularInline):
     readonly_fields = ["added_at"]
 
 
-# ---------------------------------------------------------------------------
-# ShopSubscription
-# ---------------------------------------------------------------------------
-
 @admin.register(ShopSubscription)
 class ShopSubscriptionAdmin(admin.ModelAdmin):
-    list_display = [
-        "owner_email", "plan", "billing_interval", "status",
-        "ends_at", "over_limit", "auto_renew_enabled",
-    ]
+    list_display = ["owner_email", "plan", "billing_interval", "status", "ends_at", "over_limit", "auto_renew_enabled"]
     list_filter = ["status", "billing_interval", "plan", "over_limit", "auto_renew_enabled"]
     search_fields = ["owner__email", "payment_phone_e164", "mpesa_reference_last"]
-    readonly_fields = [
-        "created_at", "updated_at", "last_renewal_attempt_at",
-        "next_renewal_attempt_at", "suspended_at", "cancelled_at",
-    ]
+    readonly_fields = ["created_at", "updated_at", "last_renewal_attempt_at", "next_renewal_attempt_at", "suspended_at", "cancelled_at"]
     inlines = [SubscriptionShopInline]
     actions = ["action_mark_active", "action_mark_suspended"]
     ordering = ["-created_at"]
-
     fieldsets = [
         ("Owner & Plan", {"fields": ["owner", "plan", "billing_interval"]}),
-        ("Status & Dates", {"fields": [
-            "status", "starts_at", "ends_at", "renews_at",
-            "grace_period_ends_at", "auto_renew_enabled",
-        ]}),
+        ("Status & Dates", {"fields": ["status", "starts_at", "ends_at", "renews_at", "grace_period_ends_at", "auto_renew_enabled"]}),
         ("Payment", {"fields": ["payment_phone_e164", "mpesa_reference_last"]}),
         ("Flags", {"fields": ["over_limit"]}),
-        ("Cancellation", {"fields": [
-            "cancellation_requested_at", "cancelled_at", "suspended_at",
-        ], "classes": ["collapse"]}),
-        ("Renewal", {"fields": [
-            "last_renewal_attempt_at", "next_renewal_attempt_at",
-        ], "classes": ["collapse"]}),
+        ("Cancellation", {"fields": ["cancellation_requested_at", "cancelled_at", "suspended_at"], "classes": ["collapse"]}),
+        ("Renewal", {"fields": ["last_renewal_attempt_at", "next_renewal_attempt_at"], "classes": ["collapse"]}),
         ("Notes", {"fields": ["notes"]}),
         ("Timestamps", {"fields": ["created_at", "updated_at"], "classes": ["collapse"]}),
     ]
@@ -105,10 +72,6 @@ class ShopSubscriptionAdmin(admin.ModelAdmin):
         self.message_user(request, f"{queryset.count()} subscription(s) suspended.")
 
 
-# ---------------------------------------------------------------------------
-# SubscriptionShop
-# ---------------------------------------------------------------------------
-
 @admin.register(SubscriptionShop)
 class SubscriptionShopAdmin(admin.ModelAdmin):
     list_display = ["subscription", "shop", "is_primary", "added_at"]
@@ -117,46 +80,53 @@ class SubscriptionShopAdmin(admin.ModelAdmin):
     readonly_fields = ["added_at"]
 
 
-# ---------------------------------------------------------------------------
-# PaymentTransaction
-# ---------------------------------------------------------------------------
-
 @admin.register(PaymentTransaction)
 class PaymentTransactionAdmin(admin.ModelAdmin):
     list_display = [
-        "owner_email", "amount", "currency", "status",
-        "transaction_type", "mpesa_receipt_number", "created_at",
+        "owner_email",
+        "amount",
+        "currency",
+        "status",
+        "transaction_type",
+        "phone_number",
+        "mpesa_receipt_number",
+        "checkout_request_id",
+        "created_at",
     ]
-    list_filter = ["status", "transaction_type", "provider_method"]
+    list_filter = ["status", "transaction_type", "provider_method", "provider"]
     search_fields = [
-        "owner__email", "phone_number", "mpesa_receipt_number",
-        "checkout_request_id", "merchant_request_id",
+        "owner__email",
+        "phone_number",
+        "mpesa_receipt_number",
+        "checkout_request_id",
+        "merchant_request_id",
+        "account_reference",
+        "external_reference",
     ]
     readonly_fields = [
-        "raw_request", "raw_callback", "idempotency_key",
-        "merchant_request_id", "checkout_request_id", "mpesa_receipt_number",
-        "initiated_at", "callback_received_at", "completed_at",
-        "created_at", "updated_at",
+        "raw_request",
+        "raw_response",
+        "raw_callback",
+        "idempotency_key",
+        "merchant_request_id",
+        "checkout_request_id",
+        "mpesa_receipt_number",
+        "initiated_at",
+        "callback_received_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
     ]
     ordering = ["-created_at"]
-
     fieldsets = [
         ("Ownership", {"fields": ["owner", "subscription", "shop", "plan"]}),
-        ("Transaction", {"fields": [
-            "transaction_type", "provider", "provider_method",
-            "amount", "currency", "phone_number",
-            "account_reference", "transaction_desc",
-        ]}),
-        ("Status", {"fields": ["status", "result_code", "result_desc"]}),
-        ("Daraja IDs", {"fields": [
-            "merchant_request_id", "checkout_request_id", "mpesa_receipt_number",
-        ]}),
-        ("Idempotency", {"fields": ["idempotency_key", "external_reference"]}),
-        ("Timestamps", {"fields": [
-            "initiated_at", "callback_received_at", "completed_at",
-            "created_at", "updated_at",
-        ], "classes": ["collapse"]}),
-        ("Raw payloads (readonly)", {"fields": ["raw_request", "raw_callback"], "classes": ["collapse"]}),
+        ("Transaction", {"fields": ["transaction_type", "provider", "provider_method", "amount", "currency", "phone_number", "account_reference", "transaction_desc", "external_reference"]}),
+        ("Request response", {"fields": ["response_code", "response_description", "customer_message"]}),
+        ("Callback result", {"fields": ["status", "result_code", "result_desc"]}),
+        ("Daraja IDs", {"fields": ["merchant_request_id", "checkout_request_id", "mpesa_receipt_number"]}),
+        ("Idempotency", {"fields": ["idempotency_key"]}),
+        ("Timestamps", {"fields": ["initiated_at", "callback_received_at", "completed_at", "created_at", "updated_at"], "classes": ["collapse"]}),
+        ("Raw payloads", {"fields": ["raw_request", "raw_response", "raw_callback"], "classes": ["collapse"]}),
     ]
 
     @admin.display(description="Owner email")
@@ -164,16 +134,9 @@ class PaymentTransactionAdmin(admin.ModelAdmin):
         return obj.owner.email
 
 
-# ---------------------------------------------------------------------------
-# RenewalAttempt
-# ---------------------------------------------------------------------------
-
 @admin.register(RenewalAttempt)
 class RenewalAttemptAdmin(admin.ModelAdmin):
-    list_display = [
-        "subscription", "attempt_number", "status", "due_at",
-        "attempted_at", "next_retry_at",
-    ]
+    list_display = ["subscription", "attempt_number", "status", "due_at", "attempted_at", "next_retry_at"]
     list_filter = ["status"]
     search_fields = ["subscription__owner__email"]
     readonly_fields = ["created_at", "updated_at"]
@@ -182,22 +145,13 @@ class RenewalAttemptAdmin(admin.ModelAdmin):
 
     @admin.action(description="Re-queue selected renewal attempts")
     def action_retry_renewal(self, request, queryset):
-        updated = queryset.filter(
-            status__in=[RenewalAttempt.STATUS_FAILED, RenewalAttempt.STATUS_ABANDONED]
-        ).update(status=RenewalAttempt.STATUS_QUEUED)
+        updated = queryset.filter(status__in=[RenewalAttempt.STATUS_FAILED, RenewalAttempt.STATUS_ABANDONED]).update(status=RenewalAttempt.STATUS_QUEUED)
         self.message_user(request, f"{updated} attempt(s) re-queued.")
 
 
-# ---------------------------------------------------------------------------
-# UsageCounter
-# ---------------------------------------------------------------------------
-
 @admin.register(UsageCounter)
 class UsageCounterAdmin(admin.ModelAdmin):
-    list_display = [
-        "owner_email", "month", "quotes_created_count",
-        "active_products_count_snapshot", "shops_count_snapshot",
-    ]
+    list_display = ["owner_email", "month", "quotes_created_count", "active_products_count_snapshot", "shops_count_snapshot"]
     list_filter = ["month"]
     search_fields = ["owner__email"]
     readonly_fields = ["created_at", "updated_at"]

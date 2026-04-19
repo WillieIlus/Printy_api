@@ -135,7 +135,7 @@ class SuccessfulCallbackActivatesSubscriptionTest(TestCase):
         self.assertEqual(result["status"], "ok")
 
         self.txn.refresh_from_db()
-        self.assertEqual(self.txn.status, PaymentTransaction.STATUS_FAILED)
+        self.assertEqual(self.txn.status, PaymentTransaction.STATUS_CANCELLED)
 
         self.sub.refresh_from_db()
         # Subscription stays in trialing after first failure (no grace yet — requires exhausted retries)
@@ -253,3 +253,86 @@ class OverLimitFlagTest(TestCase):
             mock_limits.return_value = {"shops_limit": 1, "machines_limit": 3, "products_limit": 15, "quotes_per_month_limit": 100, "users_limit": 2}
             result = _compute_over_limit(self.sub)
         self.assertTrue(result)
+
+
+class SuccessfulCallbackReplacesFreeSubscriptionTest(TestCase):
+    def setUp(self):
+        seed_plans()
+        self.owner = make_user("replace-free@test.com")
+        self.free_sub = ShopSubscription.objects.create(
+            owner=self.owner,
+            plan=Plan.objects.get(code=Plan.CODE_FREE),
+            billing_interval=ShopSubscription.INTERVAL_MONTHLY,
+            status=ShopSubscription.STATUS_ACTIVE,
+        )
+        self.paid_sub = make_subscription(self.owner, Plan.CODE_BIASHARA)
+        self.txn = make_txn(self.owner, self.paid_sub)
+
+    def test_success_callback_expires_previous_current_subscription(self):
+        result = handle_mpesa_callback(SAMPLE_SUCCESS_CALLBACK)
+        self.assertEqual(result["status"], "ok")
+
+        self.paid_sub.refresh_from_db()
+        self.free_sub.refresh_from_db()
+
+        self.assertEqual(self.paid_sub.status, ShopSubscription.STATUS_ACTIVE)
+        self.assertEqual(self.free_sub.status, ShopSubscription.STATUS_EXPIRED)
+        self.assertFalse(self.free_sub.auto_renew_enabled)
+
+
+class InitiateStkPushServiceTest(TestCase):
+    def setUp(self):
+        seed_plans()
+        self.owner = make_user("service@test.com")
+        self.plan = Plan.objects.get(code=Plan.CODE_BIASHARA)
+        self.sub = make_subscription(self.owner, Plan.CODE_BIASHARA)
+
+    @patch("billing.services.payments.requests.post")
+    @patch("billing.services.payments.get_mpesa_token")
+    @patch("billing.services.payments._get_mpesa_config")
+    def test_initiate_stk_push_persists_request_and_response(
+        self,
+        mock_config,
+        mock_token,
+        mock_post,
+    ):
+        from billing.services.payments import initiate_stk_push
+
+        mock_config.return_value = {
+            "base_url": "https://sandbox.safaricom.co.ke",
+            "callback_url": "https://example.com/api/billing/mpesa/callback/",
+            "consumer_key": "key",
+            "consumer_secret": "secret",
+            "shortcode": "174379",
+            "passkey": "passkey",
+            "env_name": "sandbox",
+        }
+        mock_token.return_value = "token"
+
+        response = MagicMock()
+        response.json.return_value = {
+            "MerchantRequestID": "MER123",
+            "CheckoutRequestID": "CHK123",
+            "ResponseCode": "0",
+            "ResponseDescription": "Success. Request accepted for processing",
+            "CustomerMessage": "Success",
+        }
+        response.raise_for_status.return_value = None
+        mock_post.return_value = response
+
+        txn = initiate_stk_push(
+            owner=self.owner,
+            subscription=self.sub,
+            plan=self.plan,
+            phone_number="0712345678",
+            amount=Decimal("1500.00"),
+            transaction_type=PaymentTransaction.TYPE_ACTIVATION,
+            idempotency_key="service-test-idem",
+        )
+
+        self.assertEqual(txn.status, PaymentTransaction.STATUS_PROCESSING)
+        self.assertEqual(txn.response_code, "0")
+        self.assertEqual(txn.checkout_request_id, "CHK123")
+        self.assertEqual(txn.phone_number, "254712345678")
+        self.assertIsNotNone(txn.raw_request)
+        self.assertEqual(txn.raw_response["CheckoutRequestID"], "CHK123")

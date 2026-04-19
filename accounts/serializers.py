@@ -144,7 +144,17 @@ class UserCreateSerializer(serializers.ModelSerializer):
         return value
 
     def create(self, validated_data):
-        return User.objects.create_user(**validated_data)
+        user = User.objects.create_user(**validated_data)
+        from allauth.account.models import EmailAddress
+        email_address = EmailAddress.objects.create(
+            user=user,
+            email=user.email,
+            primary=True,
+            verified=False,
+        )
+        request = self.context.get("request")
+        email_address.send_confirmation(request, signup=True)
+        return user
 
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
@@ -177,6 +187,15 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             raise serializers.ValidationError(
                 {"detail": "No active account found with the given credentials."}
             )
+
+        from allauth.account.models import EmailAddress
+        from django.conf import settings as django_settings
+        if getattr(django_settings, "ACCOUNT_EMAIL_VERIFICATION", "none") == "mandatory":
+            email_obj = EmailAddress.objects.filter(user=self.user, primary=True).first()
+            if email_obj and not email_obj.verified:
+                raise serializers.ValidationError(
+                    {"detail": "Email address is not verified. Please check your inbox."}
+                )
 
         refresh = self.get_token(self.user)
         data = {

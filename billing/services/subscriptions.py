@@ -47,6 +47,37 @@ def _extend_subscription(subscription: ShopSubscription) -> None:
     subscription.renews_at = new_end
 
 
+def _retire_other_current_subscriptions(subscription: ShopSubscription) -> None:
+    """Ensure a newly paid subscription becomes the single current subscription for the owner."""
+    now = timezone.now()
+    other_subs = (
+        ShopSubscription.objects.filter(owner=subscription.owner)
+        .exclude(id=subscription.id)
+        .exclude(status__in=[ShopSubscription.STATUS_CANCELLED, ShopSubscription.STATUS_EXPIRED])
+    )
+    for other in other_subs:
+        note = f"Superseded by subscription #{subscription.id} on {now.isoformat()}"
+        other.status = ShopSubscription.STATUS_EXPIRED
+        other.auto_renew_enabled = False
+        other.ends_at = other.ends_at or now
+        other.renews_at = None
+        other.grace_period_ends_at = None
+        other.cancelled_at = other.cancelled_at or now
+        other.notes = "\n".join(filter(None, [other.notes.strip(), note])).strip()
+        other.save(
+            update_fields=[
+                "status",
+                "auto_renew_enabled",
+                "ends_at",
+                "renews_at",
+                "grace_period_ends_at",
+                "cancelled_at",
+                "notes",
+                "updated_at",
+            ]
+        )
+
+
 def _attach_shops(subscription: ShopSubscription, shop_ids: list[int]) -> None:
     from shops.models import Shop as ShopModel
     shops = ShopModel.objects.filter(id__in=shop_ids, owner=subscription.owner)
@@ -185,9 +216,18 @@ def activate_subscription_from_successful_payment(txn: PaymentTransaction) -> Sh
 
     with transaction.atomic():
         sub.refresh_from_db()
+        if txn.transaction_type in {
+            PaymentTransaction.TYPE_ACTIVATION,
+            PaymentTransaction.TYPE_UPGRADE,
+        }:
+            _retire_other_current_subscriptions(sub)
         _extend_subscription(sub)
         sub.status = ShopSubscription.STATUS_ACTIVE
         sub.grace_period_ends_at = None
+        sub.cancelled_at = None
+        sub.suspended_at = None
+        sub.cancellation_requested_at = None
+        sub.auto_renew_enabled = True
         sub.over_limit = False
         sub.mpesa_reference_last = txn.mpesa_receipt_number
         if txn.phone_number:

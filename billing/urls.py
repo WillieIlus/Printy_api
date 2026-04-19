@@ -25,6 +25,7 @@ urlpatterns = [
     # Payment history
     path("payments/", views.PaymentListView.as_view(), name="billing-payments"),
     path("payments/<int:pk>/", views.PaymentDetailView.as_view(), name="billing-payment-detail"),
+    path("payments/<int:pk>/reconcile/", views.PaymentReconcileView.as_view(), name="billing-payment-reconcile"),
 
     # Admin / support
     path("admin/manual-activate/", views.AdminManualActivateView.as_view(), name="billing-admin-activate"),

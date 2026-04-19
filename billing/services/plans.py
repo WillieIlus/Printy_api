@@ -133,8 +133,16 @@ def seed_plans(stdout=None) -> None:
 
 
 def get_free_plan() -> Plan:
-    return Plan.objects.get(code=Plan.CODE_FREE)
+    try:
+        return Plan.objects.get(code=Plan.CODE_FREE)
+    except Plan.DoesNotExist:
+        seed_plans()
+        return Plan.objects.get(code=Plan.CODE_FREE)
 
 
 def get_plan_by_code(code: str) -> Plan:
-    return Plan.objects.get(code=code, is_active=True)
+    try:
+        return Plan.objects.get(code=code, is_active=True)
+    except Plan.DoesNotExist:
+        seed_plans()
+        return Plan.objects.get(code=code, is_active=True)

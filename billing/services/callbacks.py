@@ -1,9 +1,10 @@
-"""Callback service — idempotent processing of Daraja STK push callbacks."""
+"""Callback service for idempotent Daraja STK push processing."""
 from __future__ import annotations
 
 import logging
 
 from django.db import transaction
+from django.utils import timezone
 
 from billing.models import PaymentTransaction, RenewalAttempt
 from billing.services.payments import parse_callback, record_callback, verify_callback_minimally
@@ -11,53 +12,52 @@ from billing.services.payments import parse_callback, record_callback, verify_ca
 logger = logging.getLogger("payments")
 
 
-def handle_mpesa_callback(payload: dict) -> dict:
-    """
-    Idempotent entry point for all Daraja STK push callbacks.
-
-    Returns: {"status": "ok"|"error", "message": str}
-    """
+def handle_mpesa_callback(payload: dict) -> dict[str, str]:
     if not verify_callback_minimally(payload):
-        logger.warning("Received malformed M-Pesa callback: %s", str(payload)[:200])
+        logger.warning("Received malformed billing M-Pesa callback.")
         return {"status": "error", "message": "Invalid callback structure"}
 
     parsed = parse_callback(payload)
     checkout_id = parsed.get("checkout_request_id", "")
     merchant_id = parsed.get("merchant_request_id", "")
 
-    # Locate the transaction — prefer checkout_request_id
-    txn = None
-    if checkout_id:
-        txn = PaymentTransaction.objects.filter(checkout_request_id=checkout_id).first()
-    if txn is None and merchant_id:
-        txn = PaymentTransaction.objects.filter(merchant_request_id=merchant_id).first()
-
-    if txn is None:
-        logger.warning(
-            "Callback for unknown transaction: checkout=%s merchant=%s", checkout_id, merchant_id
-        )
-        # Return 200 to Daraja to prevent retries for unknown transactions
-        return {"status": "ok", "message": "Transaction not found — acknowledged"}
-
-    # Idempotency: skip if already processed
-    if txn.status in (PaymentTransaction.STATUS_SUCCESS, PaymentTransaction.STATUS_FAILED):
-        logger.info(
-            "Duplicate callback for txn %s (already %s) — acknowledged without side effects.",
-            txn.id,
-            txn.status,
-        )
-        return {"status": "ok", "message": "Already processed"}
-
-    # Duplicate receipt guard
-    receipt = parsed.get("mpesa_receipt_number")
-    if receipt and PaymentTransaction.objects.filter(mpesa_receipt_number=receipt).exclude(id=txn.id).exists():
-        logger.warning("Duplicate M-Pesa receipt %s for txn %s — rejecting.", receipt, txn.id)
-        txn.status = PaymentTransaction.STATUS_FAILED
-        txn.result_desc = "Duplicate receipt number"
-        txn.save(update_fields=["status", "result_desc", "updated_at"])
-        return {"status": "ok", "message": "Duplicate receipt — acknowledged"}
-
     with transaction.atomic():
+        txn = _find_transaction_for_update(checkout_id, merchant_id)
+        if txn is None:
+            logger.warning(
+                "Callback for unknown billing transaction checkout=%s merchant=%s",
+                checkout_id,
+                merchant_id,
+            )
+            return {"status": "ok", "message": "Transaction not found but acknowledged"}
+
+        if txn.status in {
+            PaymentTransaction.STATUS_SUCCESS,
+            PaymentTransaction.STATUS_FAILED,
+            PaymentTransaction.STATUS_CANCELLED,
+        }:
+            logger.info("Duplicate callback for billing transaction %s ignored.", txn.id)
+            return {"status": "ok", "message": "Already processed"}
+
+        receipt = parsed.get("mpesa_receipt_number")
+        if receipt and PaymentTransaction.objects.select_for_update().filter(
+            mpesa_receipt_number=receipt
+        ).exclude(id=txn.id).exists():
+            logger.warning("Duplicate M-Pesa receipt %s detected for billing transaction %s.", receipt, txn.id)
+            txn.status = PaymentTransaction.STATUS_FAILED
+            txn.result_desc = "Duplicate receipt number"
+            txn.save(update_fields=["status", "result_desc", "updated_at"])
+            return {"status": "ok", "message": "Duplicate receipt acknowledged"}
+
+        if parsed.get("success") and not receipt:
+            txn.raw_callback = payload
+            txn.callback_received_at = timezone.now()
+            txn.result_code = parsed["result_code"]
+            txn.result_desc = "Success callback missing MpesaReceiptNumber"
+            txn.save(update_fields=["raw_callback", "result_code", "result_desc", "updated_at"])
+            logger.warning("Successful callback for billing transaction %s missing receipt number.", txn.id)
+            return {"status": "ok", "message": "Receipt missing; acknowledged for manual review"}
+
         record_callback(txn, parsed, payload)
         txn.refresh_from_db()
 
@@ -69,21 +69,29 @@ def handle_mpesa_callback(payload: dict) -> dict:
     return {"status": "ok", "message": "Processed"}
 
 
+def _find_transaction_for_update(checkout_id: str, merchant_id: str) -> PaymentTransaction | None:
+    txn = None
+    if checkout_id:
+        txn = PaymentTransaction.objects.select_for_update().filter(checkout_request_id=checkout_id).first()
+    if txn is None and merchant_id:
+        txn = PaymentTransaction.objects.select_for_update().filter(merchant_request_id=merchant_id).first()
+    return txn
+
+
 def _handle_success(txn: PaymentTransaction) -> None:
-    """Activate / extend subscription after a confirmed successful payment."""
     from billing.services.subscriptions import activate_subscription_from_successful_payment
 
     if txn.subscription_id is None:
-        logger.warning("Successful txn %s has no subscription — skipping activation.", txn.id)
+        logger.warning("Successful billing transaction %s has no subscription linked.", txn.id)
         return
 
     sub = activate_subscription_from_successful_payment(txn)
     logger.info(
-        "Subscription %s activated/extended via txn %s (receipt=%s).",
-        sub.id, txn.id, txn.mpesa_receipt_number,
+        "Subscription %s activated or extended by billing transaction %s (receipt=%s).",
+        sub.id,
+        txn.id,
+        txn.mpesa_receipt_number,
     )
-
-    # Mark any linked RenewalAttempt as success
     RenewalAttempt.objects.filter(
         payment_transaction=txn,
         status__in=[RenewalAttempt.STATUS_INITIATED, RenewalAttempt.STATUS_AWAITING],
@@ -91,16 +99,12 @@ def _handle_success(txn: PaymentTransaction) -> None:
 
 
 def _handle_failure(txn: PaymentTransaction, reason: str) -> None:
-    """React to a failed payment — may trigger retry or grace period transition."""
     from billing.services.renewals import handle_renewal_failure
 
-    logger.info("Payment failed for txn %s: %s", txn.id, reason)
-
-    # Propagate failure to any linked renewal attempt
+    logger.info("Billing payment transaction %s failed: %s", txn.id, reason)
     attempt = RenewalAttempt.objects.filter(
         payment_transaction=txn,
         status__in=[RenewalAttempt.STATUS_INITIATED, RenewalAttempt.STATUS_AWAITING],
     ).first()
-
     if attempt:
         handle_renewal_failure(attempt, reason)

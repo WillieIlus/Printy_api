@@ -160,6 +160,14 @@ ACCOUNT_LOGIN_METHODS = {"email"}
 ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
 ACCOUNT_UNIQUE_EMAIL = True
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
+ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+ACCOUNT_EMAIL_SUBJECT_PREFIX = ""
+ACCOUNT_CONFIRM_EMAIL_ON_GET = True
+ACCOUNT_DEFAULT_HTTP_PROTOCOL = "http" if DEBUG else "https"
+ACCOUNT_ADAPTER = "accounts.adapters.AccountAdapter"
+
+SITE_DOMAIN = os.environ.get("SITE_DOMAIN", "localhost:8000" if DEBUG else "printy.ke")
+SITE_NAME = os.environ.get("SITE_NAME", "Printyke")
 
 # OAuth: set GOOGLE_* / GITHUB_* env vars, or use SocialApp in Django admin.
 SOCIALACCOUNT_PROVIDERS = {
@@ -186,8 +194,20 @@ SOCIALACCOUNT_PROVIDERS = {
 # Email
 # =============================================================================
 
-EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
-DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@example.com")
+EMAIL_BACKEND = os.environ.get(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend",
+)
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "true").lower() in ("1", "true", "yes")
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
+EMAIL_TIMEOUT = 10
+DEFAULT_FROM_EMAIL = os.environ.get(
+    "DEFAULT_FROM_EMAIL", "Printyke <hello.printyke@gmail.com>"
+)
+SERVER_EMAIL = DEFAULT_FROM_EMAIL
 
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
 EMAIL_CONFIRMATION_URL = f"{FRONTEND_URL}/auth/confirm-email"
@@ -238,28 +258,50 @@ if not DEBUG:
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 # =============================================================================
-# M-Pesa
+# M-Pesa / Daraja
 # =============================================================================
 
-MPESA_BASE_URL = os.environ.get(
-    "MPESA_BASE_URL", "https://sandbox.safaricom.co.ke"
+MPESA_ENV = (_get_env("MPESA_ENV", default="sandbox") or "sandbox").lower()
+if MPESA_ENV not in {"sandbox", "production"}:
+    raise ImproperlyConfigured("MPESA_ENV must be either 'sandbox' or 'production'.")
+
+MPESA_BASE_URL = _get_env(
+    "MPESA_BASE_URL",
+    default=("https://api.safaricom.co.ke" if MPESA_ENV == "production" else "https://sandbox.safaricom.co.ke"),
 ).rstrip("/")
-MPESA_CONSUMER_KEY = os.environ.get("MPESA_CONSUMER_KEY", "")
-MPESA_CONSUMER_SECRET = os.environ.get("MPESA_CONSUMER_SECRET", "")
-MPESA_SHORTCODE = os.environ.get("MPESA_SHORTCODE", "")
-MPESA_INITIATOR_NAME = os.environ.get("MPESA_INITIATOR_NAME", "")
-MPESA_SECURITY_CREDENTIAL = os.environ.get("MPESA_SECURITY_CREDENTIAL", "")
-MPESA_TIMEOUT_URL = os.environ.get(
-    "MPESA_TIMEOUT_URL", "https://printy.ke/api/mpesa/timeout/"
+MPESA_CONSUMER_KEY = _get_env("MPESA_CONSUMER_KEY", default="")
+MPESA_CONSUMER_SECRET = _get_env("MPESA_CONSUMER_SECRET", default="")
+MPESA_SHORTCODE = _get_env("MPESA_SHORTCODE", default="")
+MPESA_PASSKEY = _get_env("MPESA_PASSKEY", default="")
+MPESA_INITIATOR_NAME = _get_env("MPESA_INITIATOR_NAME", default="")
+MPESA_INITIATOR_PASSWORD = _get_env("MPESA_INITIATOR_PASSWORD", default="")
+MPESA_SECURITY_CREDENTIAL = _get_env("MPESA_SECURITY_CREDENTIAL", default="")
+MPESA_TIMEOUT_SECONDS = int(_get_env("MPESA_TIMEOUT_SECONDS", default="30"))
+MPESA_CALLBACK_URL = _get_env(
+    "MPESA_CALLBACK_URL",
+    fallback_names=("MPESA_STK_CALLBACK_URL",),
+    default="",
 )
-MPESA_RESULT_URL = os.environ.get(
-    "MPESA_RESULT_URL", "https://printy.ke/api/mpesa/result/"
+MPESA_STK_CALLBACK_URL = MPESA_CALLBACK_URL
+MPESA_TIMEOUT_URL = _get_env("MPESA_TIMEOUT_URL", default="")
+MPESA_RESULT_URL = _get_env("MPESA_RESULT_URL", default="")
+MPESA_ACCOUNT_REFERENCE_DEFAULT = _get_env(
+    "MPESA_ACCOUNT_REFERENCE_DEFAULT",
+    fallback_names=("MPESA_ACCOUNT_REFERENCE",),
+    default="PRINTY",
 )
-MPESA_PASSKEY = os.environ.get("MPESA_PASSKEY", "")
-MPESA_STK_CALLBACK_URL = os.environ.get(
-    "MPESA_STK_CALLBACK_URL",
-    "https://printy.ke/api/payments/mpesa/callback/",
+MPESA_TRANSACTION_DESC_DEFAULT = _get_env(
+    "MPESA_TRANSACTION_DESC_DEFAULT",
+    fallback_names=("MPESA_TRANSACTION_DESC",),
+    default="Printy payment",
 )
+
+if MPESA_ENV == "production" and MPESA_CALLBACK_URL:
+    parsed_callback = MPESA_CALLBACK_URL.lower()
+    if not parsed_callback.startswith("https://"):
+        logger.warning("MPESA_CALLBACK_URL should use HTTPS in production.")
+    if "localhost" in parsed_callback or "127.0.0.1" in parsed_callback:
+        logger.warning("MPESA_CALLBACK_URL points to localhost; production callbacks will fail.")
 
 # =============================================================================
 # Subscription (legacy)
@@ -272,13 +314,7 @@ DEFAULT_SUBSCRIPTION_PLAN = "STARTER"
 # Billing (new system)
 # =============================================================================
 
-MPESA_ENV = os.environ.get("MPESA_ENV", "sandbox")  # "sandbox" | "production"
-MPESA_CALLBACK_URL = os.environ.get(
-    "MPESA_CALLBACK_URL",
-    "https://printy.ke/api/billing/mpesa/callback/",
-)
 BILLING_GRACE_PERIOD_DAYS = int(os.environ.get("BILLING_GRACE_PERIOD_DAYS", "3"))
-# Retry schedule: hours after each failed attempt (initial → retry1 → retry2 → retry3)
 BILLING_RETRY_SCHEDULE_HOURS = [
     int(h) for h in os.environ.get("BILLING_RETRY_SCHEDULE_HOURS", "6,24,48").split(",")
 ]
@@ -312,7 +348,7 @@ WSGI_APPLICATION = "config.wsgi.application"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [],
+        "DIRS": [BASE_DIR / "templates"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [

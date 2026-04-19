@@ -7,7 +7,7 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from billing.models import PaymentTransaction, Plan, ShopSubscription
+from billing.models import PaymentTransaction, ShopSubscription
 from billing.selectors import (
     get_active_subscription_for_owner,
     get_owner_transactions,
@@ -18,7 +18,6 @@ from billing.serializers import (
     DowngradeSubscriptionSerializer,
     InitiateRenewalSerializer,
     PaymentTransactionSerializer,
-    PlanSerializer,
     PublicPlanSerializer,
     ShopSubscriptionSerializer,
     StartSubscriptionSerializer,
@@ -28,24 +27,21 @@ from billing.serializers import (
 )
 from billing.services.callbacks import handle_mpesa_callback
 from billing.services.entitlements import get_current_usage, get_plan_limits
+from billing.services.payments import reconcile_transaction
 from billing.services.subscriptions import (
     cancel_at_period_end,
     get_or_create_free_subscription,
     immediate_cancel,
     request_downgrade,
     request_upgrade,
+    renew_subscription,
     subscribe_to_plan,
 )
 
 logger = logging.getLogger("payments")
 
 
-# ---------------------------------------------------------------------------
-# Plans
-# ---------------------------------------------------------------------------
-
 class PlanListView(generics.ListAPIView):
-    """GET /api/billing/plans/ — public, no auth required."""
     serializer_class = PublicPlanSerializer
     permission_classes = [permissions.AllowAny]
 
@@ -53,44 +49,23 @@ class PlanListView(generics.ListAPIView):
         return get_public_plans()
 
 
-# ---------------------------------------------------------------------------
-# Subscription
-# ---------------------------------------------------------------------------
-
 class SubscriptionView(APIView):
-    """GET /api/billing/subscription/ — return caller's active subscription."""
-
     def get(self, request):
         sub = get_subscription_detail(request.user)
         if sub is None:
             sub = get_or_create_free_subscription(request.user)
-        serializer = SubscriptionDetailSerializer(sub)
-        return Response(serializer.data)
+        return Response(SubscriptionDetailSerializer(sub).data)
 
-
-# ---------------------------------------------------------------------------
-# Usage
-# ---------------------------------------------------------------------------
 
 class UsageView(APIView):
-    """GET /api/billing/usage/"""
-
     def get(self, request):
         sub = get_active_subscription_for_owner(request.user)
         usage = get_current_usage(request.user)
         limits = get_plan_limits(sub) if sub else {}
-        data = {**usage, **limits}
-        serializer = UsageSerializer(data)
-        return Response(serializer.data)
+        return Response(UsageSerializer({**usage, **limits}).data)
 
-
-# ---------------------------------------------------------------------------
-# Subscribe (new subscription / re-subscribe)
-# ---------------------------------------------------------------------------
 
 class SubscribeView(APIView):
-    """POST /api/billing/subscribe/"""
-
     def post(self, request):
         serializer = StartSubscriptionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -116,13 +91,7 @@ class SubscribeView(APIView):
         )
 
 
-# ---------------------------------------------------------------------------
-# Upgrade
-# ---------------------------------------------------------------------------
-
 class UpgradeView(APIView):
-    """POST /api/billing/upgrade/"""
-
     def post(self, request):
         serializer = UpgradeSubscriptionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -148,23 +117,14 @@ class UpgradeView(APIView):
         )
 
 
-# ---------------------------------------------------------------------------
-# Downgrade
-# ---------------------------------------------------------------------------
-
 class DowngradeView(APIView):
-    """POST /api/billing/downgrade/"""
-
     def post(self, request):
         serializer = DowngradeSubscriptionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
         try:
-            sub = request_downgrade(
-                owner=request.user,
-                target_plan_code=data["target_plan_code"],
-            )
+            sub = request_downgrade(owner=request.user, target_plan_code=data["target_plan_code"])
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -176,13 +136,7 @@ class DowngradeView(APIView):
         )
 
 
-# ---------------------------------------------------------------------------
-# Cancel
-# ---------------------------------------------------------------------------
-
 class CancelView(APIView):
-    """POST /api/billing/cancel/"""
-
     def post(self, request):
         immediate = request.data.get("immediate", False)
         try:
@@ -198,13 +152,7 @@ class CancelView(APIView):
         return Response({"message": msg, "subscription": ShopSubscriptionSerializer(sub).data})
 
 
-# ---------------------------------------------------------------------------
-# Reactivate (manual renewal trigger)
-# ---------------------------------------------------------------------------
-
 class ReactivateView(APIView):
-    """POST /api/billing/reactivate/ — re-enable auto renew or fire a manual STK push."""
-
     def post(self, request):
         serializer = InitiateRenewalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -226,7 +174,6 @@ class ReactivateView(APIView):
         if sub is None:
             return Response({"detail": "No suspended/cancelled subscription to reactivate."}, status=400)
 
-        from billing.services.subscriptions import renew_subscription
         if data.get("phone_number"):
             sub.payment_phone_e164 = data["phone_number"]
             sub.save(update_fields=["payment_phone_e164", "updated_at"])
@@ -246,13 +193,7 @@ class ReactivateView(APIView):
         )
 
 
-# ---------------------------------------------------------------------------
-# Manual renewal
-# ---------------------------------------------------------------------------
-
 class InitiateRenewalView(APIView):
-    """POST /api/billing/initiate-renewal/"""
-
     def post(self, request):
         serializer = InitiateRenewalSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -266,7 +207,6 @@ class InitiateRenewalView(APIView):
             sub.payment_phone_e164 = data["phone_number"]
             sub.save(update_fields=["payment_phone_e164", "updated_at"])
 
-        from billing.services.subscriptions import renew_subscription
         txn = renew_subscription(sub)
         if txn is None:
             return Response({"detail": "Renewal could not be initiated."}, status=400)
@@ -279,29 +219,23 @@ class InitiateRenewalView(APIView):
         )
 
 
-# ---------------------------------------------------------------------------
-# M-Pesa callback (public endpoint — Safaricom calls this)
-# ---------------------------------------------------------------------------
-
 class MpesaCallbackView(APIView):
-    """POST /api/billing/mpesa/callback/ — Daraja STK push result."""
     permission_classes = [permissions.AllowAny]
-    authentication_classes = []  # Daraja cannot send a Bearer token
+    authentication_classes = []
 
     def post(self, request):
-        payload = request.data
-        logger.info("Received M-Pesa callback: %s", str(payload)[:300])
+        payload = request.data if isinstance(request.data, dict) else {}
+        stk = payload.get("Body", {}).get("stkCallback", {}) if isinstance(payload, dict) else {}
+        logger.info(
+            "Received billing M-Pesa callback checkout_request_id=%s merchant_request_id=%s",
+            stk.get("CheckoutRequestID"),
+            stk.get("MerchantRequestID"),
+        )
         result = handle_mpesa_callback(payload)
-        # Always return 200 to prevent Daraja retry storms
         return Response(result, status=status.HTTP_200_OK)
 
 
-# ---------------------------------------------------------------------------
-# Payment history
-# ---------------------------------------------------------------------------
-
 class PaymentListView(generics.ListAPIView):
-    """GET /api/billing/payments/"""
     serializer_class = PaymentTransactionSerializer
 
     def get_queryset(self):
@@ -309,19 +243,49 @@ class PaymentListView(generics.ListAPIView):
 
 
 class PaymentDetailView(generics.RetrieveAPIView):
-    """GET /api/billing/payments/{id}/"""
     serializer_class = PaymentTransactionSerializer
 
     def get_queryset(self):
         return PaymentTransaction.objects.filter(owner=self.request.user)
 
 
-# ---------------------------------------------------------------------------
-# Admin / support actions
-# ---------------------------------------------------------------------------
+class PaymentReconcileView(APIView):
+    def post(self, request, pk: int):
+        try:
+            txn = PaymentTransaction.objects.get(pk=pk, owner=request.user)
+        except PaymentTransaction.DoesNotExist:
+            return Response({"detail": "Payment not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if txn.status == PaymentTransaction.STATUS_SUCCESS:
+            return Response(
+                {
+                    "message": "Payment already marked successful.",
+                    "transaction": PaymentTransactionSerializer(txn).data,
+                }
+            )
+
+        try:
+            query_response = reconcile_transaction(txn)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.exception("Failed to reconcile payment %s: %s", txn.id, exc)
+            return Response(
+                {"detail": "Could not query Daraja at this time."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        txn.refresh_from_db()
+        return Response(
+            {
+                "message": "Payment reconciliation completed.",
+                "transaction": PaymentTransactionSerializer(txn).data,
+                "daraja_response": query_response,
+            }
+        )
+
 
 class AdminManualActivateView(APIView):
-    """POST /api/billing/admin/manual-activate/ — staff only."""
     permission_classes = [permissions.IsAdminUser]
 
     def post(self, request):
@@ -331,11 +295,9 @@ class AdminManualActivateView(APIView):
         except ShopSubscription.DoesNotExist:
             return Response({"detail": "Subscription not found."}, status=404)
 
-        from billing.services.subscriptions import activate_subscription_from_successful_payment
-        from billing.services.payments import build_idempotency_key
         import uuid
+        from billing.services.subscriptions import activate_subscription_from_successful_payment
 
-        # Create a synthetic manual transaction
         txn = PaymentTransaction.objects.create(
             subscription=sub,
             owner=sub.owner,
@@ -349,13 +311,11 @@ class AdminManualActivateView(APIView):
             idempotency_key=f"manual-{sub.id}-{uuid.uuid4().hex[:16]}",
             result_desc="Manual activation by admin",
         )
-        from billing.services.subscriptions import activate_subscription_from_successful_payment
         activate_subscription_from_successful_payment(txn)
         return Response({"detail": "Subscription activated.", "subscription_id": sub.id})
 
 
 class AdminManualSuspendView(APIView):
-    """POST /api/billing/admin/manual-suspend/ — staff only."""
     permission_classes = [permissions.IsAdminUser]
 
     def post(self, request):
