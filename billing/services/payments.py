@@ -164,44 +164,39 @@ def _map_result_code_to_status(result_code: str) -> str:
     return PaymentTransaction.STATUS_FAILED
 
 
-def initiate_stk_push(
+def _save_transaction_initiation_failure(
+    txn: PaymentTransaction,
     *,
-    owner,
-    subscription,
-    plan,
-    phone_number: str,
-    amount: Decimal,
-    transaction_type: str,
-    idempotency_key: str | None = None,
+    payload: dict[str, Any] | None,
+    response_payload: dict[str, Any],
+    error: Exception,
+) -> None:
+    txn.raw_request = payload
+    if response_payload:
+        txn.raw_response = response_payload
+    txn.status = PaymentTransaction.STATUS_FAILED
+    txn.result_desc = str(error)[:255]
+    txn.completed_at = timezone.now()
+    txn.save(update_fields=[
+        "raw_request",
+        "raw_response",
+        "status",
+        "result_desc",
+        "completed_at",
+        "updated_at",
+    ])
+
+
+def _submit_stk_push(
+    *,
+    txn: PaymentTransaction,
+    owner_identifier: str,
+    phone_normalized: str,
+    amount_decimal: Decimal,
+    account_ref: str,
+    desc: str,
 ) -> PaymentTransaction:
-    phone_normalized = normalize_phone_number(phone_number)
     config = _get_mpesa_config()
-    amount_decimal = Decimal(str(amount))
-    if amount_decimal <= 0:
-        raise ValueError("STK push amount must be greater than zero.")
-
-    account_ref = generate_account_reference(owner.email, plan.code)
-    idem_key = idempotency_key or build_idempotency_key(owner.id, plan.code, transaction_type)
-    desc = _build_transaction_description(plan.name)
-
-    txn = PaymentTransaction.objects.create(
-        subscription=subscription,
-        owner=owner,
-        plan=plan,
-        transaction_type=transaction_type,
-        provider=PaymentTransaction.PROVIDER_MPESA,
-        provider_method=PaymentTransaction.METHOD_STK,
-        phone_number=phone_normalized,
-        account_reference=account_ref,
-        transaction_desc=desc,
-        amount=amount_decimal,
-        currency="KES",
-        status=PaymentTransaction.STATUS_PENDING,
-        idempotency_key=idem_key,
-        initiated_at=timezone.now(),
-        external_reference=account_ref,
-    )
-
     payload: dict[str, Any] | None = None
     response_payload: dict[str, Any] = {}
 
@@ -259,29 +254,110 @@ def initiate_stk_push(
             "updated_at",
         ])
         logger.info(
-            "STK push initiated for owner=%s checkout_request_id=%s status=%s",
-            owner.email,
+            "STK push initiated for owner=%s checkout_request_id=%s status=%s amount=%s transaction_type=%s",
+            owner_identifier,
             txn.checkout_request_id,
             txn.status,
+            amount_decimal,
+            txn.transaction_type,
         )
     except Exception as exc:
-        txn.raw_request = payload
-        if response_payload:
-            txn.raw_response = response_payload
-        txn.status = PaymentTransaction.STATUS_FAILED
-        txn.result_desc = str(exc)[:255]
-        txn.completed_at = timezone.now()
-        txn.save(update_fields=[
-            "raw_request",
-            "raw_response",
-            "status",
-            "result_desc",
-            "completed_at",
-            "updated_at",
-        ])
-        logger.exception("STK push failed for owner=%s: %s", owner.email, exc)
+        _save_transaction_initiation_failure(
+            txn,
+            payload=payload,
+            response_payload=response_payload,
+            error=exc,
+        )
+        logger.exception("STK push failed for owner=%s txn=%s: %s", owner_identifier, txn.id, exc)
 
     return txn
+
+
+def initiate_stk_push(
+    *,
+    owner,
+    subscription,
+    plan,
+    phone_number: str,
+    amount: Decimal,
+    transaction_type: str,
+    idempotency_key: str | None = None,
+) -> PaymentTransaction:
+    phone_normalized = normalize_phone_number(phone_number)
+    amount_decimal = Decimal(str(amount))
+    if amount_decimal <= 0:
+        raise ValueError("STK push amount must be greater than zero.")
+
+    account_ref = generate_account_reference(owner.email, plan.code)
+    idem_key = idempotency_key or build_idempotency_key(owner.id, plan.code, transaction_type)
+    desc = _build_transaction_description(plan.name)
+
+    txn = PaymentTransaction.objects.create(
+        subscription=subscription,
+        owner=owner,
+        plan=plan,
+        transaction_type=transaction_type,
+        provider=PaymentTransaction.PROVIDER_MPESA,
+        provider_method=PaymentTransaction.METHOD_STK,
+        phone_number=phone_normalized,
+        account_reference=account_ref,
+        transaction_desc=desc,
+        amount=amount_decimal,
+        currency="KES",
+        status=PaymentTransaction.STATUS_PENDING,
+        idempotency_key=idem_key,
+        initiated_at=timezone.now(),
+        external_reference=account_ref,
+    )
+    return _submit_stk_push(
+        txn=txn,
+        owner_identifier=owner.email,
+        phone_normalized=phone_normalized,
+        amount_decimal=amount_decimal,
+        account_ref=account_ref,
+        desc=desc,
+    )
+
+
+def initiate_test_stk_push(*, owner, phone_number: str) -> PaymentTransaction:
+    config = _get_mpesa_config()
+    if config["env_name"] != "sandbox":
+        raise ValueError("Sandbox STK test endpoint is only available when MPESA_ENV=sandbox.")
+
+    phone_normalized = normalize_phone_number(phone_number)
+    amount_decimal = Decimal("1.00")
+    base_reference = str(
+        getattr(settings, "MPESA_ACCOUNT_REFERENCE_DEFAULT", "PRINTY") or "PRINTY"
+    ).strip()
+    account_ref = f"{base_reference[:8]}TEST".upper()[:12] or "PRINTYTEST"
+    desc = "Sandbox STK test"
+
+    txn = PaymentTransaction.objects.create(
+        subscription=None,
+        owner=owner,
+        plan=None,
+        transaction_type=PaymentTransaction.TYPE_SANDBOX_TEST,
+        provider=PaymentTransaction.PROVIDER_MPESA,
+        provider_method=PaymentTransaction.METHOD_STK,
+        phone_number=phone_normalized,
+        account_reference=account_ref,
+        transaction_desc=desc,
+        amount=amount_decimal,
+        currency="KES",
+        status=PaymentTransaction.STATUS_PENDING,
+        idempotency_key=build_idempotency_key(owner.id, "TEST", PaymentTransaction.TYPE_SANDBOX_TEST),
+        initiated_at=timezone.now(),
+        external_reference=account_ref,
+    )
+
+    return _submit_stk_push(
+        txn=txn,
+        owner_identifier=owner.email,
+        phone_normalized=phone_normalized,
+        amount_decimal=amount_decimal,
+        account_ref=account_ref,
+        desc=desc,
+    )
 
 
 def query_transaction_status(checkout_request_id: str) -> dict[str, Any]:

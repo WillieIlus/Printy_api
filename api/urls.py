@@ -4,6 +4,7 @@ API URL configuration with DRF routers.
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
+from billing import views as billing_views
 from . import public_matching_views, quote_views, views, workflow_views
 from .analytics_views import AnalyticsEventIngestView
 from .admin_views import (
@@ -130,8 +131,13 @@ urlpatterns = [
         name="mpesa-stk-push",
     ),
     path(
+        "payments/mpesa/test-stk/",
+        billing_views.MpesaSandboxTestStkView.as_view(),
+        name="mpesa-test-stk",
+    ),
+    path(
         "payments/mpesa/callback/",
-        subscriptions_views.MpesaCallbackView.as_view(),
+        billing_views.MpesaCallbackView.as_view(),
         name="mpesa-callback",
     ),
     # Profile (User as Profile)

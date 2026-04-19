@@ -79,6 +79,14 @@ def _find_transaction_for_update(checkout_id: str, merchant_id: str) -> PaymentT
 
 
 def _handle_success(txn: PaymentTransaction) -> None:
+    if txn.transaction_type == PaymentTransaction.TYPE_SANDBOX_TEST:
+        logger.info(
+            "Sandbox test transaction %s marked successful with receipt=%s; no subscription activation performed.",
+            txn.id,
+            txn.mpesa_receipt_number,
+        )
+        return
+
     from billing.services.subscriptions import activate_subscription_from_successful_payment
 
     if txn.subscription_id is None:
@@ -99,6 +107,10 @@ def _handle_success(txn: PaymentTransaction) -> None:
 
 
 def _handle_failure(txn: PaymentTransaction, reason: str) -> None:
+    if txn.transaction_type == PaymentTransaction.TYPE_SANDBOX_TEST:
+        logger.info("Sandbox test transaction %s failed: %s", txn.id, reason)
+        return
+
     from billing.services.renewals import handle_renewal_failure
 
     logger.info("Billing payment transaction %s failed: %s", txn.id, reason)

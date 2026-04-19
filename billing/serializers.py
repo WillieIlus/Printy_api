@@ -243,6 +243,19 @@ class InitiateRenewalSerializer(serializers.Serializer):
         return _validate_phone(value)
 
 
+class MpesaSandboxTestSerializer(serializers.Serializer):
+    phone_number = serializers.CharField(max_length=20)
+    amount = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        default=1,
+    )
+
+    def validate_phone_number(self, value):
+        return _validate_phone(value)
+
+
 class UsageSerializer(serializers.Serializer):
     shops = serializers.IntegerField()
     machines = serializers.IntegerField()

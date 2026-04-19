@@ -3,12 +3,14 @@ from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
+from django.test import override_settings
 from django.test import TestCase
 from django.utils import timezone
+from rest_framework.test import APIClient
 
 from billing.models import Plan, PaymentTransaction, RenewalAttempt, ShopSubscription
 from billing.services.callbacks import handle_mpesa_callback
-from billing.services.payments import normalize_phone_number, parse_callback
+from billing.services.payments import initiate_test_stk_push, normalize_phone_number, parse_callback
 from billing.services.plans import seed_plans
 
 User = get_user_model()
@@ -336,3 +338,137 @@ class InitiateStkPushServiceTest(TestCase):
         self.assertEqual(txn.phone_number, "254712345678")
         self.assertIsNotNone(txn.raw_request)
         self.assertEqual(txn.raw_response["CheckoutRequestID"], "CHK123")
+
+
+class SandboxTestStkServiceTest(TestCase):
+    def setUp(self):
+        seed_plans()
+        self.owner = make_user("sandbox-service@test.com")
+
+    @override_settings(
+        MPESA_ENV="sandbox",
+        MPESA_BASE_URL="https://sandbox.safaricom.co.ke",
+        MPESA_CALLBACK_URL="https://api.printy.ke/api/payments/mpesa/callback/",
+        MPESA_CONSUMER_KEY="key",
+        MPESA_CONSUMER_SECRET="secret",
+        MPESA_SHORTCODE="174379",
+        MPESA_PASSKEY="passkey",
+        MPESA_ACCOUNT_REFERENCE_DEFAULT="Printyke",
+    )
+    @patch("billing.services.payments.requests.post")
+    @patch("billing.services.payments.get_mpesa_token")
+    def test_initiate_test_stk_push_forces_amount_one(self, mock_token, mock_post):
+        mock_token.return_value = "token"
+
+        response = MagicMock()
+        response.json.return_value = {
+            "MerchantRequestID": "MERTEST1",
+            "CheckoutRequestID": "CHKTEST1",
+            "ResponseCode": "0",
+            "ResponseDescription": "Success. Request accepted for processing",
+            "CustomerMessage": "Success",
+        }
+        response.raise_for_status.return_value = None
+        mock_post.return_value = response
+
+        txn = initiate_test_stk_push(owner=self.owner, phone_number="0712345678")
+
+        self.assertEqual(txn.transaction_type, PaymentTransaction.TYPE_SANDBOX_TEST)
+        self.assertEqual(txn.amount, Decimal("1.00"))
+        self.assertEqual(txn.phone_number, "254712345678")
+        self.assertEqual(txn.status, PaymentTransaction.STATUS_PROCESSING)
+        self.assertEqual(txn.raw_request["Amount"], 1)
+
+    @override_settings(
+        MPESA_ENV="production",
+        MPESA_BASE_URL="https://api.safaricom.co.ke",
+        MPESA_CALLBACK_URL="https://api.printy.ke/api/payments/mpesa/callback/",
+        MPESA_CONSUMER_KEY="key",
+        MPESA_CONSUMER_SECRET="secret",
+        MPESA_SHORTCODE="174379",
+        MPESA_PASSKEY="passkey",
+    )
+    def test_initiate_test_stk_push_rejects_non_sandbox_env(self):
+        with self.assertRaisesMessage(ValueError, "only available when MPESA_ENV=sandbox"):
+            initiate_test_stk_push(owner=self.owner, phone_number="0712345678")
+
+
+class SandboxTestCallbackTest(TestCase):
+    def setUp(self):
+        seed_plans()
+        self.owner = make_user("sandbox-callback@test.com")
+        self.txn = PaymentTransaction.objects.create(
+            owner=self.owner,
+            subscription=None,
+            plan=None,
+            transaction_type=PaymentTransaction.TYPE_SANDBOX_TEST,
+            amount=Decimal("1.00"),
+            currency="KES",
+            status=PaymentTransaction.STATUS_PROCESSING,
+            checkout_request_id="CHK001",
+            merchant_request_id="MER001",
+            phone_number="254700000001",
+            idempotency_key="sandbox-callback-1",
+        )
+
+    def test_success_callback_does_not_activate_subscription(self):
+        result = handle_mpesa_callback(SAMPLE_SUCCESS_CALLBACK)
+        self.assertEqual(result["status"], "ok")
+
+        self.txn.refresh_from_db()
+        self.assertEqual(self.txn.status, PaymentTransaction.STATUS_SUCCESS)
+        self.assertEqual(self.txn.mpesa_receipt_number, "RCP12345")
+        self.assertEqual(ShopSubscription.objects.filter(owner=self.owner).count(), 0)
+
+
+class SandboxTestEndpointTest(TestCase):
+    def setUp(self):
+        seed_plans()
+        self.owner = make_user("sandbox-endpoint@test.com")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.owner)
+
+    @override_settings(
+        MPESA_ENV="sandbox",
+        MPESA_BASE_URL="https://sandbox.safaricom.co.ke",
+        MPESA_CALLBACK_URL="https://api.printy.ke/api/payments/mpesa/callback/",
+        MPESA_CONSUMER_KEY="key",
+        MPESA_CONSUMER_SECRET="secret",
+        MPESA_SHORTCODE="174379",
+        MPESA_PASSKEY="passkey",
+    )
+    @patch("billing.services.payments.requests.post")
+    @patch("billing.services.payments.get_mpesa_token")
+    def test_authenticated_test_endpoint_creates_sandbox_transaction(self, mock_token, mock_post):
+        mock_token.return_value = "token"
+
+        response = MagicMock()
+        response.json.return_value = {
+            "MerchantRequestID": "MERTEST2",
+            "CheckoutRequestID": "CHKTEST2",
+            "ResponseCode": "0",
+            "ResponseDescription": "Success. Request accepted for processing",
+            "CustomerMessage": "Success",
+        }
+        response.raise_for_status.return_value = None
+        mock_post.return_value = response
+
+        resp = self.client.post(
+            "/api/payments/mpesa/test-stk/",
+            {"phone_number": "0712345678", "amount": "99.00"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertIn("Amount is fixed at KES 1", resp.data["message"])
+        self.assertEqual(resp.data["transaction"]["amount"], "1.00")
+        self.assertEqual(resp.data["transaction"]["transaction_type"], PaymentTransaction.TYPE_SANDBOX_TEST)
+
+    def test_test_endpoint_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.post(
+            "/api/payments/mpesa/test-stk/",
+            {"phone_number": "0712345678"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 401)

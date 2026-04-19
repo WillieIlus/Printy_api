@@ -18,8 +18,9 @@ urlpatterns = [
     path("cancel/", views.CancelView.as_view(), name="billing-cancel"),
     path("reactivate/", views.ReactivateView.as_view(), name="billing-reactivate"),
     path("initiate-renewal/", views.InitiateRenewalView.as_view(), name="billing-initiate-renewal"),
+    path("mpesa/test-stk/", views.MpesaSandboxTestStkView.as_view(), name="billing-mpesa-test-stk"),
 
-    # M-Pesa callback (Daraja calls this — no auth)
+    # M-Pesa callback (Daraja calls this - no auth)
     path("mpesa/callback/", views.MpesaCallbackView.as_view(), name="billing-mpesa-callback"),
 
     # Payment history

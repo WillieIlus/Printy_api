@@ -17,6 +17,7 @@ from billing.selectors import (
 from billing.serializers import (
     DowngradeSubscriptionSerializer,
     InitiateRenewalSerializer,
+    MpesaSandboxTestSerializer,
     PaymentTransactionSerializer,
     PublicPlanSerializer,
     ShopSubscriptionSerializer,
@@ -27,7 +28,7 @@ from billing.serializers import (
 )
 from billing.services.callbacks import handle_mpesa_callback
 from billing.services.entitlements import get_current_usage, get_plan_limits
-from billing.services.payments import reconcile_transaction
+from billing.services.payments import initiate_test_stk_push, reconcile_transaction
 from billing.services.subscriptions import (
     cancel_at_period_end,
     get_or_create_free_subscription,
@@ -216,6 +217,40 @@ class InitiateRenewalView(APIView):
                 "message": "Renewal STK push sent.",
                 "transaction": PaymentTransactionSerializer(txn).data,
             }
+        )
+
+
+class MpesaSandboxTestStkView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = MpesaSandboxTestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            txn = initiate_test_stk_push(
+                owner=request.user,
+                phone_number=serializer.validated_data["phone_number"],
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            logger.exception("Failed to initiate sandbox test STK push for user=%s: %s", request.user.id, exc)
+            return Response(
+                {"detail": "Could not initiate sandbox STK push at this time."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        response_status = status.HTTP_201_CREATED
+        if txn.status == PaymentTransaction.STATUS_FAILED:
+            response_status = status.HTTP_502_BAD_GATEWAY
+
+        return Response(
+            {
+                "message": "Sandbox STK push initiated. Amount is fixed at KES 1. Approve on your phone.",
+                "transaction": PaymentTransactionSerializer(txn).data,
+            },
+            status=response_status,
         )
 
 

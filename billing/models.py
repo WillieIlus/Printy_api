@@ -264,11 +264,13 @@ class PaymentTransaction(models.Model):
     TYPE_RENEWAL = "renewal"
     TYPE_UPGRADE = "upgrade"
     TYPE_MANUAL_RETRY = "manual_retry"
+    TYPE_SANDBOX_TEST = "sandbox_test"
     TYPE_CHOICES = [
         (TYPE_ACTIVATION, "Activation"),
         (TYPE_RENEWAL, "Renewal"),
         (TYPE_UPGRADE, "Upgrade"),
         (TYPE_MANUAL_RETRY, "Manual retry"),
+        (TYPE_SANDBOX_TEST, "Sandbox test"),
     ]
 
     PROVIDER_MPESA = "mpesa"
