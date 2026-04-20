@@ -62,8 +62,17 @@ class UsageView(APIView):
     def get(self, request):
         sub = get_active_subscription_for_owner(request.user)
         usage = get_current_usage(request.user)
-        limits = get_plan_limits(sub) if sub else {}
-        return Response(UsageSerializer({**usage, **limits}).data)
+        # get_active_subscription_for_owner always returns a subscription (creates Free if needed),
+        # but we provide explicit None defaults so the serializer never receives missing keys.
+        null_limits = {
+            "shops_limit": None,
+            "machines_limit": None,
+            "products_limit": None,
+            "quotes_per_month_limit": None,
+            "users_limit": None,
+        }
+        limits = get_plan_limits(sub) if sub else null_limits
+        return Response(UsageSerializer({**null_limits, **usage, **limits}).data)
 
 
 class SubscribeView(APIView):

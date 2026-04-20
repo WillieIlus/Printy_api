@@ -35,6 +35,7 @@ def handle_mpesa_callback(payload: dict) -> dict[str, str]:
             PaymentTransaction.STATUS_SUCCESS,
             PaymentTransaction.STATUS_FAILED,
             PaymentTransaction.STATUS_CANCELLED,
+            PaymentTransaction.STATUS_TIMED_OUT,  # late callback after timeout must not reprocess
         }:
             logger.info("Duplicate callback for billing transaction %s ignored.", txn.id)
             return {"status": "ok", "message": "Already processed"}

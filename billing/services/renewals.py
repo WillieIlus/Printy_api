@@ -51,11 +51,12 @@ _provider = DarajaManualRenewalProvider()
 def queue_due_renewals() -> int:
     """Create RenewalAttempt(queued) for subscriptions whose renews_at is now past."""
     now = timezone.now()
+    from billing.models import Plan as BillingPlan
     due_subs = ShopSubscription.objects.filter(
         status__in=[ShopSubscription.STATUS_ACTIVE, ShopSubscription.STATUS_TRIALING],
         auto_renew_enabled=True,
         renews_at__lte=now,
-    ).exclude(plan__price_monthly=0)  # never queue Free plan
+    ).exclude(plan__code=BillingPlan.CODE_FREE)  # never queue the Free plan
 
     created = 0
     for sub in due_subs:
@@ -174,16 +175,23 @@ def _handle_retry_or_escalate(subscription: ShopSubscription, last_attempt: Rene
 
 
 def _escalate_to_past_due_if_exhausted(subscription: ShopSubscription, attempt: RenewalAttempt) -> None:
-    """All retries exhausted — move to past_due then schedule grace transition."""
+    """All retries exhausted — move directly to grace_period (skipping a redundant past_due save)."""
     from billing.services.subscriptions import move_to_grace_period
-    if subscription.status not in (
-        ShopSubscription.STATUS_PAST_DUE, ShopSubscription.STATUS_GRACE, ShopSubscription.STATUS_SUSPENDED
-    ):
-        with transaction.atomic():
-            subscription.refresh_from_db()
-            subscription.mark_past_due()
-            move_to_grace_period(subscription, reason="Renewal retries exhausted")
-        logger.info("Subscription %s moved to grace_period after failed renewals.", subscription.id)
+    # Re-check status inside the atomic block after a fresh read to close the race window
+    # between the caller's status check and acquiring the row lock.
+    with transaction.atomic():
+        subscription.refresh_from_db()
+        if subscription.status in (
+            ShopSubscription.STATUS_PAST_DUE,
+            ShopSubscription.STATUS_GRACE,
+            ShopSubscription.STATUS_SUSPENDED,
+        ):
+            return
+        # Mark past_due in memory only — move_to_grace_period will save the final state,
+        # so we avoid a redundant intermediate DB write.
+        subscription.status = ShopSubscription.STATUS_PAST_DUE
+        move_to_grace_period(subscription, reason="Renewal retries exhausted")
+    logger.info("Subscription %s moved to grace_period after failed renewals.", subscription.id)
 
 
 def expire_grace_periods() -> int:

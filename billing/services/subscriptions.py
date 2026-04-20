@@ -62,7 +62,8 @@ def _retire_other_current_subscriptions(subscription: ShopSubscription) -> None:
         other.ends_at = other.ends_at or now
         other.renews_at = None
         other.grace_period_ends_at = None
-        other.cancelled_at = other.cancelled_at or now
+        # Do NOT set cancelled_at — this subscription was superseded by an upgrade/new
+        # activation, not cancelled by the user. Conflating the two pollutes audit logs.
         other.notes = "\n".join(filter(None, [other.notes.strip(), note])).strip()
         other.save(
             update_fields=[
@@ -71,7 +72,6 @@ def _retire_other_current_subscriptions(subscription: ShopSubscription) -> None:
                 "ends_at",
                 "renews_at",
                 "grace_period_ends_at",
-                "cancelled_at",
                 "notes",
                 "updated_at",
             ]
@@ -87,6 +87,35 @@ def _attach_shops(subscription: ShopSubscription, shop_ids: list[int]) -> None:
             shop=shop,
             defaults={"is_primary": idx == 0},
         )
+
+
+def _find_pending_activation_transaction(
+    owner, plan: Plan, billing_interval: str
+) -> PaymentTransaction | None:
+    """
+    Return an existing in-flight PENDING/PROCESSING activation (or upgrade) transaction
+    for this owner+plan+interval combination so callers can reuse it instead of
+    creating a duplicate TRIALING subscription and firing a second STK push.
+    """
+    return (
+        PaymentTransaction.objects.filter(
+            owner=owner,
+            plan=plan,
+            transaction_type__in=[
+                PaymentTransaction.TYPE_ACTIVATION,
+                PaymentTransaction.TYPE_UPGRADE,
+            ],
+            status__in=[
+                PaymentTransaction.STATUS_PENDING,
+                PaymentTransaction.STATUS_PROCESSING,
+            ],
+            subscription__billing_interval=billing_interval,
+            subscription__status=ShopSubscription.STATUS_TRIALING,
+        )
+        .select_related("subscription")
+        .order_by("-created_at")
+        .first()
+    )
 
 
 def _compute_over_limit(subscription: ShopSubscription) -> bool:
@@ -172,6 +201,10 @@ def subscribe_to_plan(
     """
     Initiate payment for a new or first-time plan subscription.
     Subscription is activated by callbacks.py after successful payment.
+
+    Idempotent: if a TRIALING subscription for the same owner/plan/interval
+    already has a PENDING or PROCESSING transaction, that transaction is returned
+    instead of creating a new one and firing a duplicate STK push.
     """
     from billing.services.plans import get_plan_by_code
     plan = get_plan_by_code(plan_code)
@@ -183,6 +216,17 @@ def subscribe_to_plan(
 
     phone_normalized = normalize_phone_number(phone_number)
     amount = plan.get_price(billing_interval)
+
+    # Dedup: reuse an in-flight TRIALING sub if one already exists for this plan+interval
+    existing_txn = _find_pending_activation_transaction(owner, plan, billing_interval)
+    if existing_txn is not None:
+        logger.info(
+            "Reusing in-flight activation transaction %s for owner=%s plan=%s",
+            existing_txn.id,
+            owner.email,
+            plan_code,
+        )
+        return existing_txn
 
     # Create a pending subscription to attach to the transaction
     with transaction.atomic():
@@ -245,7 +289,12 @@ def request_upgrade(
     phone_number: str | None = None,
     selected_shop_ids: list[int] | None = None,
 ) -> PaymentTransaction:
-    """Initiate upgrade payment.  Subscription activates on callback success."""
+    """Initiate upgrade payment.  Subscription activates on callback success.
+
+    Idempotent: if a TRIALING upgrade subscription for the same owner/plan/interval
+    already has a PENDING or PROCESSING transaction, that transaction is returned
+    instead of firing a duplicate STK push.
+    """
     from billing.services.plans import get_plan_by_code
     target_plan = get_plan_by_code(target_plan_code)
 
@@ -270,6 +319,17 @@ def request_upgrade(
     validate_shop_selection_against_plan(target_plan, shops_ids)
 
     amount = target_plan.get_price(billing_interval)
+
+    # Dedup: reuse an in-flight TRIALING upgrade sub if one already exists
+    existing_txn = _find_pending_activation_transaction(owner, target_plan, billing_interval)
+    if existing_txn is not None:
+        logger.info(
+            "Reusing in-flight upgrade transaction %s for owner=%s plan=%s",
+            existing_txn.id,
+            owner.email,
+            target_plan_code,
+        )
+        return existing_txn
 
     # Create a pending upgrade subscription
     with transaction.atomic():

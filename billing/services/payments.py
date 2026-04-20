@@ -394,6 +394,7 @@ def reconcile_transaction(txn: PaymentTransaction) -> dict[str, Any]:
 
     result_code = response_payload.get("ResultCode")
     result_desc = response_payload.get("ResultDesc")
+    reconciled_success = False
     if result_code is not None:
         result_code_str = str(result_code)
         txn.result_code = result_code_str
@@ -401,8 +402,13 @@ def reconcile_transaction(txn: PaymentTransaction) -> dict[str, Any]:
         if result_code_str != "0":
             txn.status = _map_result_code_to_status(result_code_str)
             txn.completed_at = timezone.now()
-        elif txn.status == PaymentTransaction.STATUS_PENDING:
-            txn.status = PaymentTransaction.STATUS_PROCESSING
+        else:
+            # ResultCode=0 means the payment was actually completed — promote to SUCCESS.
+            # Previously this only moved PENDING→PROCESSING which left subscriptions stuck
+            # forever when a callback was missed and an admin triggered reconciliation.
+            txn.status = PaymentTransaction.STATUS_SUCCESS
+            txn.completed_at = timezone.now()
+            reconciled_success = True
 
     txn.save(update_fields=[
         "raw_response",
@@ -414,7 +420,35 @@ def reconcile_transaction(txn: PaymentTransaction) -> dict[str, Any]:
         "completed_at",
         "updated_at",
     ])
+
+    if reconciled_success and txn.transaction_type != PaymentTransaction.TYPE_SANDBOX_TEST:
+        _activate_after_reconcile(txn)
+
     return response_payload
+
+
+def _activate_after_reconcile(txn: PaymentTransaction) -> None:
+    """Activate the subscription when reconciliation reveals a successful payment."""
+    if txn.subscription_id is None:
+        logger.warning(
+            "Reconciled successful transaction %s has no subscription linked; skipping activation.",
+            txn.id,
+        )
+        return
+    try:
+        from django.db import transaction as db_transaction
+        from billing.services.subscriptions import activate_subscription_from_successful_payment
+        with db_transaction.atomic():
+            activate_subscription_from_successful_payment(txn)
+        logger.info(
+            "Subscription activated via reconciliation for transaction %s (receipt=%s).",
+            txn.id,
+            txn.mpesa_receipt_number,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to activate subscription after reconciliation for transaction %s.", txn.id
+        )
 
 
 def verify_callback_minimally(payload: dict) -> bool:

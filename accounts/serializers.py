@@ -32,6 +32,7 @@ class UserSocialLinkSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     """User profile plus persisted dashboard fields."""
 
+    is_email_verified = serializers.SerializerMethodField()
     bio = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     avatar = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     phone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -52,6 +53,7 @@ class UserSerializer(serializers.ModelSerializer):
             "last_name",
             "role",
             "preferred_language",
+            "is_email_verified",
             "is_active",
             "is_staff",
             "is_superuser",
@@ -68,6 +70,16 @@ class UserSerializer(serializers.ModelSerializer):
             "social_links",
         ]
         read_only_fields = ["id", "email", "is_active", "is_staff", "is_superuser", "date_joined", "last_login"]
+
+    def get_is_email_verified(self, instance):
+        from allauth.account.models import EmailAddress
+
+        return EmailAddress.objects.filter(
+            user=instance,
+            email__iexact=instance.email,
+            primary=True,
+            verified=True,
+        ).exists()
 
     def to_representation(self, instance):
         data = super().to_representation(instance)

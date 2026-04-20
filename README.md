@@ -8,6 +8,15 @@ Next generation print shop SaaS backend for Kenyan print shops.
 - SimpleJWT
 - PostgreSQL / SQLite (dev)
 
+## Auth Email Flow
+
+- `POST /api/auth/register/` creates the user, creates a primary unverified `EmailAddress`, and sends an allauth verification email.
+- Verification emails point to `${FRONTEND_URL}/auth/confirm-email?key=...` via `accounts.adapters.AccountAdapter`.
+- `POST /api/auth/email/resend/` is the SPA-facing resend endpoint. It always returns `200` with a generic message and only sends mail for existing unverified addresses.
+- `POST /api/auth/email/verify/` is the SPA-facing confirmation endpoint. It accepts `{ "key": "<allauth key>" }` and marks the address verified.
+- Legacy aliases remain available at `/api/auth/resend-confirmation/` and `/api/auth/confirm-email/`.
+- Missing `/api/...` routes return JSON, not Django HTML error pages.
+
 ## Architecture Principles
 - No redundant models
 - Shop-scoped pricing

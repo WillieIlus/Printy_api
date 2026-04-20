@@ -26,6 +26,8 @@ All required and optional environment variables. Use a local `.env` file or depl
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `FRONTEND_URL` | No | `http://localhost:3000` | Frontend base URL for links and redirects |
+| `SITE_DOMAIN` | No | `localhost:8000` in debug, `printy.ke` otherwise | Domain stored in Django Sites; run `python manage.py configure_site` after changing it |
+| `SITE_NAME` | No | `Printyke` | Display name stored in Django Sites |
 | `CORS_ALLOWED_ORIGINS` | No | local dev + printy domains | Comma-separated allowed frontend origins |
 | `CSRF_TRUSTED_ORIGINS` | No | local dev + printy domains | Comma-separated trusted origins |
 
@@ -33,10 +35,20 @@ All required and optional environment variables. Use a local `.env` file or depl
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DEFAULT_FROM_EMAIL` | No | `noreply@example.com` | From address for emails |
+| `DEFAULT_FROM_EMAIL` | No | `Printyke <hello.printyke@gmail.com>` | From address for emails |
 | `EMAIL_BACKEND` | No | console backend | SMTP backend override for production |
+| `EMAIL_HOST` | No | `smtp.gmail.com` | SMTP server host |
+| `EMAIL_PORT` | No | `587` | SMTP server port |
+| `EMAIL_USE_TLS` | No | `true` | Enable STARTTLS |
+| `EMAIL_HOST_USER` | Yes in production SMTP | (empty) | SMTP username |
+| `EMAIL_HOST_PASSWORD` | Yes in production SMTP | (empty) | SMTP password or app password |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | If Google login is enabled | (empty) | Google OAuth credentials |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | If GitHub login is enabled | (empty) | GitHub OAuth credentials |
+
+Email verification flow notes:
+- Registration and resend emails generate links to `${FRONTEND_URL}/auth/confirm-email?key=...`.
+- Production should use `FRONTEND_URL=https://printy.ke` and API origin `https://api.printy.ke`.
+- After changing `SITE_DOMAIN` / `SITE_NAME`, run `python manage.py configure_site` so allauth metadata matches the deployed site.
 
 ## JWT
 
