@@ -58,8 +58,9 @@ class ProductSerializer(serializers.ModelSerializer):
         read_only_fields = ["shop", "slug"]
 
     def get_preview_image(self, obj):
+        """Return a relative media path so frontend media resolution stays environment-agnostic."""
         img = obj.get_primary_image()
-        return img.image.url if img and img.image else None
+        return img.image.name if img and img.image else None
 
 
 class ProductGallerySerializer(serializers.ModelSerializer):
@@ -87,5 +88,6 @@ class ProductGallerySerializer(serializers.ModelSerializer):
         ]
 
     def get_preview_image(self, obj):
+        """Return a relative media path so frontend media resolution stays environment-agnostic."""
         img = obj.get_primary_image()
-        return img.image.url if img and img.image else None
+        return img.image.name if img and img.image else None

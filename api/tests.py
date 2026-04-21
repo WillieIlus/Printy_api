@@ -2,6 +2,7 @@
 from decimal import Decimal
 from datetime import timedelta
 
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -11,7 +12,7 @@ from api.workflow_serializers import CalculatorPreviewSerializer
 from accounts.models import User, UserProfile
 from common.models import AnalyticsEvent
 from catalog.choices import PricingMode, ProductStatus
-from catalog.models import Product, ProductCategory
+from catalog.models import Product, ProductCategory, ProductImage
 from inventory.models import Machine, Paper, ProductionPaperSize
 from locations.models import Location
 from notifications.models import Notification
@@ -837,7 +838,7 @@ class PublicShopsAPITestCase(TestCase):
         self.assertEqual(len(products), 1)
         self.assertEqual(products[0]["name"], "Business Card")
 
-    def test_public_catalog_includes_active_draft_product_when_public(self):
+    def test_public_catalog_excludes_active_draft_product_when_public(self):
         Product.objects.create(
             shop=self.shop,
             name="Flyer",
@@ -855,8 +856,8 @@ class PublicShopsAPITestCase(TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(len(data["products"]), 2)
-        self.assertTrue(any(product["name"] == "Flyer" for product in data["products"]))
+        self.assertEqual(len(data["products"]), 1)
+        self.assertFalse(any(product["name"] == "Flyer" for product in data["products"]))
 
     def test_public_catalog_hides_product_when_not_public(self):
         Product.objects.create(
@@ -878,6 +879,183 @@ class PublicShopsAPITestCase(TestCase):
         data = response.json()
         self.assertEqual(len(data["products"]), 1)
         self.assertEqual(data["products"][0]["name"], "Business Card")
+
+
+class PublicProductsAPITestCase(TestCase):
+    """Regression tests for the shared public-product visibility and payload contract."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(email="products@test.com", password="pass")
+        self.shop = Shop.objects.create(
+            owner=self.user,
+            name="Public Shop",
+            slug="public-shop",
+            is_active=True,
+            is_public=True,
+        )
+        self.category = ProductCategory.objects.create(
+            shop=self.shop,
+            name="Business Cards",
+            slug="business-cards",
+        )
+        self.product = Product.objects.create(
+            shop=self.shop,
+            category=self.category,
+            name="Business Card",
+            slug="business-card",
+            pricing_mode=PricingMode.SHEET,
+            product_kind="BOOKLET",
+            default_finished_width_mm=90,
+            default_finished_height_mm=55,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+
+    def _list_products(self):
+        response = self.client.get("/api/public/products/")
+        self.assertEqual(response.status_code, 200)
+        return response.json()["products"]
+
+    def test_published_public_active_product_appears(self):
+        products = self._list_products()
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]["name"], "Business Card")
+
+    def test_draft_product_does_not_appear(self):
+        Product.objects.create(
+            shop=self.shop,
+            category=self.category,
+            name="Draft Card",
+            slug="draft-card",
+            pricing_mode=PricingMode.SHEET,
+            default_finished_width_mm=90,
+            default_finished_height_mm=55,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.DRAFT,
+        )
+
+        products = self._list_products()
+        self.assertEqual([product["name"] for product in products], ["Business Card"])
+
+    def test_hidden_product_does_not_appear(self):
+        Product.objects.create(
+            shop=self.shop,
+            category=self.category,
+            name="Hidden Card",
+            slug="hidden-card",
+            pricing_mode=PricingMode.SHEET,
+            default_finished_width_mm=90,
+            default_finished_height_mm=55,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=True,
+            is_public=False,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        products = self._list_products()
+        self.assertEqual([product["name"] for product in products], ["Business Card"])
+
+    def test_inactive_product_does_not_appear(self):
+        Product.objects.create(
+            shop=self.shop,
+            category=self.category,
+            name="Inactive Card",
+            slug="inactive-card",
+            pricing_mode=PricingMode.SHEET,
+            default_finished_width_mm=90,
+            default_finished_height_mm=55,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=False,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        products = self._list_products()
+        self.assertEqual([product["name"] for product in products], ["Business Card"])
+
+    def test_non_public_shop_product_does_not_appear(self):
+        hidden_shop = Shop.objects.create(
+            owner=self.user,
+            name="Hidden Shop",
+            slug="hidden-shop",
+            is_active=True,
+            is_public=False,
+        )
+        hidden_category = ProductCategory.objects.create(
+            shop=hidden_shop,
+            name="Flyers",
+            slug="flyers",
+        )
+        Product.objects.create(
+            shop=hidden_shop,
+            category=hidden_category,
+            name="Hidden Shop Product",
+            slug="hidden-shop-product",
+            pricing_mode=PricingMode.SHEET,
+            default_finished_width_mm=210,
+            default_finished_height_mm=297,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        products = self._list_products()
+        self.assertEqual([product["name"] for product in products], ["Business Card"])
+
+    def test_inactive_shop_product_does_not_appear(self):
+        inactive_shop = Shop.objects.create(
+            owner=self.user,
+            name="Inactive Shop",
+            slug="inactive-shop",
+            is_active=False,
+            is_public=True,
+        )
+        inactive_category = ProductCategory.objects.create(
+            shop=inactive_shop,
+            name="Posters",
+            slug="posters",
+        )
+        Product.objects.create(
+            shop=inactive_shop,
+            category=inactive_category,
+            name="Inactive Shop Product",
+            slug="inactive-shop-product",
+            pricing_mode=PricingMode.SHEET,
+            default_finished_width_mm=420,
+            default_finished_height_mm=297,
+            default_bleed_mm=3,
+            default_sides=Sides.SIMPLEX,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        products = self._list_products()
+        self.assertEqual([product["name"] for product in products], ["Business Card"])
+
+    def test_public_products_use_relative_media_paths_and_include_product_kind(self):
+        ProductImage.objects.create(
+            product=self.product,
+            image=SimpleUploadedFile("card.jpg", b"fake-image-bytes", content_type="image/jpeg"),
+            is_primary=True,
+        )
+
+        products = self._list_products()
+        self.assertTrue(str(products[0]["primary_image"]).startswith("products/card"))
+        self.assertTrue(str(products[0]["images"][0]["image"]).startswith("products/card"))
+        self.assertEqual(products[0]["product_kind"], "BOOKLET")
+        self.assertFalse(str(products[0]["primary_image"]).startswith("http"))
 
 
 class ShopsNearbyAPITestCase(TestCase):

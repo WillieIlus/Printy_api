@@ -35,22 +35,34 @@ PRICING_MODE_EXPLANATIONS = {
 }
 
 
-def public_products_queryset():
-    """Products eligible for public browsing and public shop catalogs.
+def apply_public_product_visibility(queryset):
+    """Apply the canonical backend-owned public visibility rules for products.
 
-    Requires ALL three conditions:
-      - status=PUBLISHED   (not draft or unavailable)
-      - is_active=True     (not soft-deleted)
-      - is_public=True     (not manually hidden)
-    Shop must also be active and public.
+    All public product surfaces must reuse this helper rather than duplicating
+    the five guards below in views or serializers. This keeps `/api/public/products/`,
+    `/api/products/gallery/`, SEO surfaces, and any future public listings from
+    drifting apart.
     """
-    return Product.objects.filter(
+    return queryset.filter(
         shop__is_active=True,
         shop__is_public=True,
         is_active=True,
         is_public=True,
         status=ProductStatus.PUBLISHED,
     )
+
+
+def public_products_queryset():
+    """Products eligible for public browsing and public shop catalogs.
+
+    Requires all canonical public-product visibility guards:
+      - status=PUBLISHED   (not draft or unavailable)
+      - is_active=True     (not soft-deleted)
+      - is_public=True     (not manually hidden)
+      - shop__is_active=True
+      - shop__is_public=True
+    """
+    return apply_public_product_visibility(Product.objects.all())
 
 
 def public_shop_products_queryset(shop):

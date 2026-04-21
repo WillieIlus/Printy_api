@@ -6,6 +6,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from catalog.services import apply_public_product_visibility
 from shops.models import Shop
 
 from .models import Product, ProductCategory
@@ -18,16 +19,36 @@ from .serializers import (
 
 
 class ProductGalleryView(APIView):
-    """GET /api/products/gallery/ — grouped by category, only active products."""
+    """GET /api/products/gallery/ — grouped by category, published public products only.
+
+    Visibility is enforced by apply_public_product_visibility() from catalog.services,
+    which is the canonical filter shared by all public product surfaces. Do not add
+    inline visibility conditions here — extend that helper instead so all public
+    endpoints stay in sync.
+    """
 
     permission_classes = [AllowAny]
 
     def get(self, request):
-        categories = ProductCategory.objects.prefetch_related("products").order_by("name")
+        public_products = list(
+            apply_public_product_visibility(Product.objects.all())
+            .select_related("category", "shop")
+            .prefetch_related("images")
+            .order_by("category__name", "name")
+        )
+        categories = (
+            ProductCategory.objects.filter(products__in=public_products)
+            .distinct()
+            .order_by("name")
+        )
+        products_by_category = {
+            category.id: [product for product in public_products if product.category_id == category.id]
+            for category in categories
+        }
         result = []
         for cat in categories:
-            products = cat.products.filter(is_active=True).order_by("name")
-            if not products.exists():
+            products = products_by_category.get(cat.id, [])
+            if not products:
                 continue
             result.append({
                 "category": ProductCategoryListSerializer(cat).data,

@@ -1,9 +1,11 @@
 """Tests for Product Gallery API."""
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from accounts.models import User
-from catalog.models import Product, ProductCategory
+from catalog.choices import PricingMode, ProductStatus
+from catalog.models import Product, ProductCategory, ProductImage
 from shops.models import Shop
 
 
@@ -18,7 +20,7 @@ class ProductGalleryPublicAPITests(TestCase):
         self.client = APIClient()
         self.user = _make_user()
         self.shop = Shop.objects.create(
-            owner=self.user, name="Test Shop", slug="test-shop", is_active=True
+            owner=self.user, name="Test Shop", slug="test-shop", is_active=True, is_public=True
         )
         self.cat = ProductCategory.objects.create(
             shop=self.shop, name="Business Cards", slug="business-cards"
@@ -28,9 +30,12 @@ class ProductGalleryPublicAPITests(TestCase):
             shop=self.shop,
             name="Premium Business Card",
             slug="premium-business-card",
+            pricing_mode=PricingMode.SHEET,
             dimensions_label="90 × 55 mm",
             weight_label="350gsm",
             is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
         )
 
     def test_gallery_list_returns_categories_with_active_products(self):
@@ -55,7 +60,10 @@ class ProductGalleryPublicAPITests(TestCase):
             shop=self.shop,
             name="Inactive Card",
             slug="inactive-card",
+            pricing_mode=PricingMode.SHEET,
             is_active=False,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
         )
         response = self.client.get("/api/products/gallery/")
         self.assertEqual(response.status_code, 200)
@@ -74,13 +82,111 @@ class ProductGalleryPublicAPITests(TestCase):
             shop=self.shop,
             name="Inactive",
             slug="inactive",
+            pricing_mode=PricingMode.SHEET,
             is_active=False,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
         )
         response = self.client.get("/api/products/gallery/")
         self.assertEqual(response.status_code, 200)
         cats = response.json()["categories"]
         self.assertEqual(len(cats), 1)
         self.assertEqual(cats[0]["category"]["slug"], "business-cards")
+
+    def test_gallery_excludes_draft_products(self):
+        Product.objects.create(
+            category=self.cat,
+            shop=self.shop,
+            name="Draft Card",
+            slug="draft-card",
+            pricing_mode=PricingMode.SHEET,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.DRAFT,
+        )
+
+        response = self.client.get("/api/products/gallery/")
+
+        self.assertEqual(response.status_code, 200)
+        products = response.json()["categories"][0]["products"]
+        self.assertEqual([product["title"] for product in products], ["Premium Business Card"])
+
+    def test_gallery_excludes_hidden_products(self):
+        Product.objects.create(
+            category=self.cat,
+            shop=self.shop,
+            name="Hidden Card",
+            slug="hidden-card",
+            pricing_mode=PricingMode.SHEET,
+            is_active=True,
+            is_public=False,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        response = self.client.get("/api/products/gallery/")
+
+        self.assertEqual(response.status_code, 200)
+        products = response.json()["categories"][0]["products"]
+        self.assertEqual([product["title"] for product in products], ["Premium Business Card"])
+
+    def test_gallery_excludes_products_from_inactive_or_non_public_shops(self):
+        inactive_shop = Shop.objects.create(
+            owner=self.user, name="Inactive Shop", slug="inactive-shop", is_active=False, is_public=True
+        )
+        inactive_cat = ProductCategory.objects.create(
+            shop=inactive_shop, name="Inactive Shop Category", slug="inactive-shop-category"
+        )
+        Product.objects.create(
+            category=inactive_cat,
+            shop=inactive_shop,
+            name="Inactive Shop Product",
+            slug="inactive-shop-product",
+            pricing_mode=PricingMode.SHEET,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+        hidden_shop = Shop.objects.create(
+            owner=self.user, name="Hidden Shop", slug="hidden-shop", is_active=True, is_public=False
+        )
+        hidden_cat = ProductCategory.objects.create(
+            shop=hidden_shop, name="Hidden Shop Category", slug="hidden-shop-category"
+        )
+        Product.objects.create(
+            category=hidden_cat,
+            shop=hidden_shop,
+            name="Hidden Shop Product",
+            slug="hidden-shop-product",
+            pricing_mode=PricingMode.SHEET,
+            is_active=True,
+            is_public=True,
+            status=ProductStatus.PUBLISHED,
+        )
+
+        response = self.client.get("/api/products/gallery/")
+
+        self.assertEqual(response.status_code, 200)
+        categories = response.json()["categories"]
+        self.assertEqual(len(categories), 1)
+        self.assertEqual(categories[0]["category"]["slug"], "business-cards")
+        self.assertEqual(
+            [product["title"] for product in categories[0]["products"]],
+            ["Premium Business Card"],
+        )
+
+    def test_gallery_preview_image_uses_relative_media_path(self):
+        ProductImage.objects.create(
+            product=self.product,
+            image=SimpleUploadedFile("gallery-card.jpg", b"fake-image-bytes", content_type="image/jpeg"),
+            is_primary=True,
+        )
+
+        response = self.client.get("/api/products/gallery/")
+
+        self.assertEqual(response.status_code, 200)
+        product = response.json()["categories"][0]["products"][0]
+        self.assertEqual(product["preview_image"], "products/gallery-card.jpg")
+        self.assertFalse(str(product["preview_image"]).startswith("http"))
 
     def test_gallery_no_auth_required(self):
         response = self.client.get("/api/products/gallery/")

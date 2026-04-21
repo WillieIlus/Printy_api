@@ -357,6 +357,7 @@ class CatalogProductSerializer(serializers.ModelSerializer):
             "name",
             "description",
             "category",
+            "product_kind",
             "pricing_mode",
             "default_finished_width_mm",
             "default_finished_height_mm",
