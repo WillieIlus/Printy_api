@@ -53,9 +53,8 @@ SECRET_KEY = _get_env(
 
 ALLOWED_HOSTS = _get_env_list(
     "ALLOWED_HOSTS",
-    default="api.printy.ke,178.128.206.240,localhost,127.0.0.1,testserver",
+    default="api.printy.ke,printy.ke,www.printy.ke,178.128.206.240,localhost,127.0.0.1,testserver",
 )
-
 # =============================================================================
 # Apps
 # =============================================================================
