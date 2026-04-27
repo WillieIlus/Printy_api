@@ -163,6 +163,25 @@ class PublicShopListSerializer(serializers.ModelSerializer):
     logo = serializers.SerializerMethodField()
     social_links = serializers.SerializerMethodField()
     schedule_summary = serializers.SerializerMethodField()
+    country = serializers.CharField(read_only=True)
+    location_label = serializers.SerializerMethodField()
+    can_receive_requests = serializers.SerializerMethodField()
+    can_price_requests = serializers.SerializerMethodField()
+    supports_custom_requests = serializers.BooleanField(read_only=True)
+    supports_catalog_requests = serializers.BooleanField(read_only=True)
+    pricing_ready = serializers.BooleanField(read_only=True)
+    public_match_ready = serializers.BooleanField(read_only=True)
+    rate_card_completeness = serializers.SerializerMethodField()
+    setup_percent = serializers.SerializerMethodField()
+    turnaround_configured = serializers.SerializerMethodField()
+    turnaround_label = serializers.SerializerMethodField()
+    products_count = serializers.SerializerMethodField()
+    materials_count = serializers.SerializerMethodField()
+    pricing_rules_count = serializers.SerializerMethodField()
+    finishing_rates_count = serializers.SerializerMethodField()
+    capability_tags = serializers.SerializerMethodField()
+    material_tags = serializers.SerializerMethodField()
+    finishing_tags = serializers.SerializerMethodField()
 
     class Meta:
         model = Shop
@@ -175,12 +194,31 @@ class PublicShopListSerializer(serializers.ModelSerializer):
             "logo",
             "city",
             "state",
+            "country",
+            "location_label",
             "latitude",
             "longitude",
             "google_place_id",
             "opening_hours",
             "social_links",
             "status",
+            "can_receive_requests",
+            "can_price_requests",
+            "supports_custom_requests",
+            "supports_catalog_requests",
+            "pricing_ready",
+            "public_match_ready",
+            "rate_card_completeness",
+            "setup_percent",
+            "turnaround_configured",
+            "turnaround_label",
+            "products_count",
+            "materials_count",
+            "pricing_rules_count",
+            "finishing_rates_count",
+            "capability_tags",
+            "material_tags",
+            "finishing_tags",
             "opening_time",
             "closing_time",
             "closing_soon_minutes",
@@ -205,6 +243,110 @@ class PublicShopListSerializer(serializers.ModelSerializer):
 
     def get_schedule_summary(self, obj):
         return schedule_summary(obj)
+
+    def _setup_status(self, obj):
+        cache = self.context.setdefault("_public_setup_status", {})
+        if obj.pk not in cache:
+            from setup.services import get_setup_status_for_shop
+
+            cache[obj.pk] = get_setup_status_for_shop(obj)
+        return cache[obj.pk]
+
+    def get_location_label(self, obj):
+        parts = [part.strip() for part in [obj.city, obj.state, obj.country] if (part or "").strip()]
+        return ", ".join(parts[:3])
+
+    def get_can_receive_requests(self, obj):
+        return bool(self._setup_status(obj).get("can_receive_requests"))
+
+    def get_can_price_requests(self, obj):
+        return bool(self._setup_status(obj).get("can_price_requests"))
+
+    def get_rate_card_completeness(self, obj):
+        return int(self._setup_status(obj).get("rate_card_completeness") or 0)
+
+    def get_setup_percent(self, obj):
+        return int(self._setup_status(obj).get("setup_percent") or 0)
+
+    def get_turnaround_configured(self, obj):
+        return bool(self._setup_status(obj).get("turnaround_configured"))
+
+    def get_turnaround_label(self, obj):
+        if obj.same_day_cutoff_time:
+            return f"Same-day before {obj.same_day_cutoff_time.strftime('%H:%M')}"
+        if self.get_turnaround_configured(obj):
+            return "Turnaround shown on products"
+        return "Turnaround on request"
+
+    def get_products_count(self, obj):
+        return Product.objects.filter(shop=obj, is_active=True, is_public=True).count()
+
+    def get_materials_count(self, obj):
+        return int(self._setup_status(obj).get("materials_count") or 0)
+
+    def get_pricing_rules_count(self, obj):
+        return int(self._setup_status(obj).get("pricing_rules_count") or 0)
+
+    def get_finishing_rates_count(self, obj):
+        return int(self._setup_status(obj).get("finishing_rates_count") or 0)
+
+    def get_capability_tags(self, obj):
+        tags = []
+        products = (
+            Product.objects.filter(shop=obj, is_active=True, is_public=True)
+            .select_related("category")
+            .order_by("name")[:8]
+        )
+        seen = set()
+        for product in products:
+            category_name = (getattr(product.category, "name", "") or "").strip()
+            label = category_name or (product.pricing_mode or "").replace("_", " ").title()
+            normalized = label.lower()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                tags.append(label)
+            if len(tags) >= 5:
+                break
+        return tags
+
+    def get_material_tags(self, obj):
+        tags = []
+        seen = set()
+        for paper in Paper.objects.filter(shop=obj, is_active=True).order_by("sheet_size", "gsm")[:8]:
+            label = f"{paper.sheet_size} {paper.gsm}gsm"
+            normalized = label.lower()
+            if normalized not in seen:
+                seen.add(normalized)
+                tags.append(label)
+            if len(tags) >= 3:
+                break
+        for material in Material.objects.filter(shop=obj, is_active=True).order_by("material_type")[:6]:
+            label = (material.material_type or "").strip()
+            normalized = label.lower()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                tags.append(label)
+            if len(tags) >= 5:
+                break
+        return tags
+
+    def get_finishing_tags(self, obj):
+        tags = []
+        seen = set()
+        finishings = (
+            FinishingRate.objects.filter(shop=obj, is_active=True)
+            .select_related("category")
+            .order_by("name")[:8]
+        )
+        for finishing in finishings:
+            label = (finishing.name or "").strip() or (getattr(finishing.category, "name", "") or "").strip()
+            normalized = label.lower()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                tags.append(label)
+            if len(tags) >= 5:
+                break
+        return tags
 
 
 class MatchShopsInputSerializer(serializers.Serializer):
@@ -1078,11 +1220,17 @@ class PaperSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "name",
+            "display_name",
             "production_size",
             "production_size_detail",
             "sheet_size",
             "gsm",
+            "category",
             "paper_type",
+            "is_cover_stock",
+            "is_insert_stock",
+            "is_sticker_stock",
+            "is_specialty",
             "width_mm",
             "height_mm",
             "buying_price",

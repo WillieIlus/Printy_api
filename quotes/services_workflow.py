@@ -6,7 +6,7 @@ from django.utils import timezone
 from inventory.models import Machine, Paper
 from locations.models import Location
 from notifications.models import Notification
-from notifications.services import notify
+from notifications.services import notify_quote_event
 from pricing.models import FinishingRate, Material
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
 from quotes.models import (
@@ -17,6 +17,7 @@ from quotes.models import (
     QuoteRequestMessage,
     ShopQuote,
 )
+from quotes.turnaround import estimate_turnaround, legacy_days_from_hours
 from shops.models import Shop
 
 
@@ -75,6 +76,41 @@ def _extract_shop_preview(pricing_snapshot, shop: Shop):
     return pricing_snapshot
 
 
+def _build_buyer_snapshot(*, draft: QuoteDraft, merged_request_details: dict):
+    user = draft.user
+    return {
+        "user_id": getattr(user, "id", None),
+        "is_authenticated": True,
+        "name": (
+            merged_request_details.get("customer_name")
+            or getattr(user, "name", "")
+            or getattr(user, "get_full_name", lambda: "")()
+            or getattr(user, "email", "")
+        ),
+        "email": merged_request_details.get("customer_email") or getattr(user, "email", ""),
+        "phone": merged_request_details.get("customer_phone", ""),
+    }
+
+
+def _build_request_snapshot(*, draft: QuoteDraft, shop: Shop, merged_request_details: dict):
+    selected_shop_preview = _extract_shop_preview(draft.pricing_snapshot, shop) or {}
+    return {
+        "draft_reference": draft.draft_reference,
+        "calculator_inputs": draft.calculator_inputs_snapshot or {},
+        "production_preview_snapshot": (draft.pricing_snapshot or {}).get("production_preview"),
+        "pricing_preview_snapshot": (draft.pricing_snapshot or {}).get("pricing_preview"),
+        "pricing_snapshot": draft.pricing_snapshot,
+        "selected_shop_preview": selected_shop_preview,
+        "matched_specs": selected_shop_preview.get("matched_specs") or [],
+        "needs_confirmation": selected_shop_preview.get("needs_confirmation") or [],
+        "request_details": merged_request_details,
+        "custom_product_snapshot": draft.custom_product_snapshot,
+        "selected_shop_ids": merged_request_details.get("selected_shop_ids") or [],
+        "selected_shop": {"id": shop.id, "slug": shop.slug, "name": shop.name},
+        "buyer": _build_buyer_snapshot(draft=draft, merged_request_details=merged_request_details),
+    }
+
+
 def _build_item_spec_snapshot(*, draft: QuoteDraft, merged_request_details: dict, shop: Shop):
     selected_shop_preview = _extract_shop_preview(draft.pricing_snapshot, shop)
     return {
@@ -83,7 +119,12 @@ def _build_item_spec_snapshot(*, draft: QuoteDraft, merged_request_details: dict
         "calculator_inputs": draft.calculator_inputs_snapshot or {},
         "custom_product_snapshot": draft.custom_product_snapshot or {},
         "request_details": merged_request_details,
+        "production_preview_snapshot": (draft.pricing_snapshot or {}).get("production_preview"),
+        "pricing_preview_snapshot": (draft.pricing_snapshot or {}).get("pricing_preview"),
         "selected_shop_preview": selected_shop_preview or {},
+        "matched_specs": (selected_shop_preview or {}).get("matched_specs") or [],
+        "needs_confirmation": (selected_shop_preview or {}).get("needs_confirmation") or [],
+        "selected_shop_ids": merged_request_details.get("selected_shop_ids") or [],
         "selected_shop": {
             "id": shop.id,
             "slug": shop.slug,
@@ -263,6 +304,7 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
         **(draft.request_details_snapshot or {}),
         **(request_details_snapshot or {}),
     }
+    merged_request_details["selected_shop_ids"] = [shop.id for shop in shops]
     created_requests = []
 
     with transaction.atomic():
@@ -279,15 +321,11 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                 delivery_address=merged_request_details.get("delivery_address", ""),
                 delivery_location=_resolve_location(merged_request_details.get("delivery_location")),
                 source_draft=draft,
-                request_snapshot={
-                    "draft_reference": draft.draft_reference,
-                    "calculator_inputs": draft.calculator_inputs_snapshot,
-                    "pricing_snapshot": draft.pricing_snapshot,
-                    "selected_shop_preview": _extract_shop_preview(draft.pricing_snapshot, shop),
-                    "request_details": merged_request_details,
-                    "custom_product_snapshot": draft.custom_product_snapshot,
-                    "selected_shop": {"id": shop.id, "slug": shop.slug, "name": shop.name},
-                },
+                request_snapshot=_build_request_snapshot(
+                    draft=draft,
+                    shop=shop,
+                    merged_request_details=merged_request_details,
+                ),
             )
             quote_request.request_reference = _build_reference("QR", quote_request.id)
             quote_request.save(update_fields=["request_reference", "updated_at"])
@@ -299,10 +337,19 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
             )
             _create_request_message(quote_request=quote_request, sender=draft.user)
             if shop.owner_id and shop.owner_id != draft.user.id:
-                notify(
+                notify_quote_event(
                     recipient=shop.owner,
                     notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
-                    message=f"New quote request #{quote_request.id} from {quote_request.customer_name or 'customer'}",
+                    message=f"New quote request #{quote_request.id} from {quote_request.customer_name or 'customer'}.",
+                    object_type="quote_request",
+                    object_id=quote_request.id,
+                    actor=draft.user,
+                )
+            if draft.user_id:
+                notify_quote_event(
+                    recipient=draft.user,
+                    notification_type=Notification.QUOTE_REQUEST_SENT,
+                    message=f"Your quote request #{quote_request.id} was sent to {shop.name}.",
                     object_type="quote_request",
                     object_id=quote_request.id,
                     actor=draft.user,

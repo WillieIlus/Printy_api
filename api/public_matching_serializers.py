@@ -12,6 +12,7 @@ class PublicFinishingSelectionSerializer(serializers.Serializer):
 
 class PublicCalculatorPayloadSerializer(serializers.Serializer):
     calculator_mode = serializers.CharField(required=False, allow_blank=True, default="marketplace")
+    job_type = serializers.CharField(required=False, allow_blank=True, default="")
     product_family = serializers.ChoiceField(
         choices=["flat", "booklet", "large_format"],
         required=False,
@@ -28,22 +29,25 @@ class PublicCalculatorPayloadSerializer(serializers.Serializer):
         required=False,
         default="SHEET",
     )
-    product_id = serializers.IntegerField(required=False, allow_null=True)
-    template_id = serializers.IntegerField(required=False, allow_null=True)
-    quantity = serializers.IntegerField(min_value=1, default=1)
+    product_id = serializers.IntegerField(required=False, allow_null=True, help_text="Specific product ID for catalog matching.")
+    product_slug = serializers.CharField(required=False, allow_blank=True, default="", help_text="Specific product slug for catalog matching.")
+    template_id = serializers.IntegerField(required=False, allow_null=True, help_text="Alias for product_id.")
+    quantity = serializers.IntegerField(min_value=1, default=1, help_text="Job quantity.")
     size_mode = serializers.ChoiceField(choices=["standard", "custom"], required=False, default="custom")
-    size_label = serializers.CharField(required=False, allow_blank=True, default="")
+    size_label = serializers.CharField(required=False, allow_blank=True, default="", help_text="Human-readable size label (e.g. 'A4').")
     input_unit = serializers.ChoiceField(choices=["mm", "cm", "m", "in"], required=False, default="mm")
     width_input = serializers.DecimalField(required=False, allow_null=True, max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
     height_input = serializers.DecimalField(required=False, allow_null=True, max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
-    width_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
-    height_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    width_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1, help_text="Finished width in mm.")
+    height_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1, help_text="Finished height in mm.")
     normalized_size = serializers.CharField(required=False, allow_blank=True, default="")
     print_sides = serializers.ChoiceField(choices=["SIMPLEX", "DUPLEX"], default="SIMPLEX")
     apply_duplex_surcharge = serializers.BooleanField(required=False, allow_null=True, default=None)
     colour_mode = serializers.ChoiceField(choices=["BW", "COLOR"], default="COLOR")
     paper_id = serializers.IntegerField(required=False, allow_null=True)
+    paper_preference = serializers.CharField(required=False, allow_blank=True, default="")
     material_id = serializers.IntegerField(required=False, allow_null=True)
+    material_preference = serializers.CharField(required=False, allow_blank=True, default="")
     material_type = serializers.CharField(required=False, allow_blank=True, default="")
     sheet_size = serializers.CharField(required=False, allow_blank=True, default="")
     paper_gsm = serializers.IntegerField(required=False, allow_null=True)
@@ -56,13 +60,34 @@ class PublicCalculatorPayloadSerializer(serializers.Serializer):
     turnaround_mode = serializers.ChoiceField(choices=["standard", "rush"], required=False, default="standard")
     custom_title = serializers.CharField(required=False, allow_blank=True, default="")
     custom_brief = serializers.CharField(required=False, allow_blank=True, default="")
+    notes = serializers.CharField(required=False, allow_blank=True, default="", source="custom_brief")
     fixed_shop_slug = serializers.CharField(required=False, allow_blank=True, default="")
+    location_slug = serializers.CharField(required=False, allow_blank=True, default="")
     lat = serializers.FloatField(required=False, allow_null=True)
     lng = serializers.FloatField(required=False, allow_null=True)
     radius_km = serializers.FloatField(required=False, allow_null=True, min_value=0.1, max_value=500)
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
+            if "job_type" in data and not data.get("product_family"):
+                jt = str(data["job_type"]).lower()
+                if "booklet" in jt:
+                    data["product_family"] = "booklet"
+                elif "large" in jt or "banner" in jt or "vinyl" in jt:
+                    data["product_family"] = "large_format"
+                    data["product_pricing_mode"] = "LARGE_FORMAT"
+                else:
+                    data["product_family"] = "flat"
+            
+            if "notes" in data and "custom_brief" not in data:
+                data["custom_brief"] = data["notes"]
+            
+            if "sides" in data and "print_sides" not in data:
+                data["print_sides"] = data["sides"]
+            
+            if "color_mode" in data and "colour_mode" not in data:
+                data["colour_mode"] = data["color_mode"]
+
             normalized = normalize_size_payload(
                 data,
                 legacy_width_keys=("finished_width_mm",),
@@ -84,6 +109,11 @@ class PublicCalculatorPayloadSerializer(serializers.Serializer):
                 normalized["colour_mode"] = normalized["color_mode"]
             if normalized.get("template_id") and not normalized.get("product_id"):
                 normalized["product_id"] = normalized["template_id"]
+            
+            if normalized.get("paper_preference") and not normalized.get("paper_type"):
+                normalized["paper_type"] = normalized["paper_preference"]
+            if normalized.get("material_preference") and not normalized.get("material_type"):
+                normalized["material_type"] = normalized["material_preference"]
 
             if "finishings" in normalized:
                 finishings = normalized["finishings"]
@@ -172,16 +202,58 @@ class PublicBookletMatchPayloadSerializer(serializers.Serializer):
     radius_km = serializers.FloatField(required=False, allow_null=True, min_value=0.1, max_value=500)
 
 
+class ProductionPreviewSerializer(serializers.Serializer):
+    pieces_per_sheet = serializers.IntegerField(required=False, allow_null=True)
+    sheets_required = serializers.IntegerField(required=False, allow_null=True)
+    parent_sheet = serializers.CharField(required=False, allow_null=True)
+    imposition_label = serializers.CharField(required=False, allow_null=True)
+    size_label = serializers.CharField(required=False, allow_null=True)
+    quantity = serializers.IntegerField(required=False, allow_null=True)
+    cutting_required = serializers.BooleanField(required=False, allow_null=True)
+    selected_finishings = serializers.ListField(child=serializers.CharField(), default=list)
+    suggested_finishings = serializers.ListField(child=serializers.CharField(), default=list)
+    warnings = serializers.ListField(child=serializers.CharField(), default=list)
+
+
+class PricingBreakdownLineSerializer(serializers.Serializer):
+    label = serializers.CharField()
+    amount = serializers.CharField(required=False, allow_null=True)
+    formula = serializers.CharField(required=False, allow_null=True)
+
+
+class PricingBreakdownSerializer(serializers.Serializer):
+    currency = serializers.CharField(default="KES")
+    paper_price = serializers.FloatField(required=False, allow_null=True)
+    print_price_front = serializers.FloatField(required=False, allow_null=True)
+    print_price_back = serializers.FloatField(required=False, allow_null=True)
+    total_per_sheet = serializers.FloatField(required=False, allow_null=True)
+    estimated_total = serializers.FloatField(required=False, allow_null=True)
+    price_range = serializers.JSONField(required=False, allow_null=True)
+    formula = serializers.CharField(required=False, allow_null=True)
+    lines = PricingBreakdownLineSerializer(many=True, default=list)
+
+
 class PublicMatchShopSerializer(serializers.Serializer):
     id = serializers.IntegerField()
+    shop_id = serializers.IntegerField()
     name = serializers.CharField()
+    shop_name = serializers.CharField()
     slug = serializers.CharField()
+    shop_slug = serializers.CharField()
     currency = serializers.CharField(required=False, allow_blank=True)
     can_calculate = serializers.BooleanField()
+    can_price_now = serializers.BooleanField()
+    can_send_quote_request = serializers.BooleanField()
     reason = serializers.CharField()
+    summary = serializers.CharField()
     missing_fields = serializers.ListField(child=serializers.CharField(), default=list)
+    missing_specs = serializers.ListField(child=serializers.CharField(), default=list, source="missing_fields")
     similarity_score = serializers.FloatField(required=False)
+    match_score = serializers.FloatField(required=False)
     confidence_score = serializers.FloatField(required=False)
+    match_type = serializers.CharField(required=False)
+    price_confidence = serializers.CharField(required=False, allow_null=True)
+    quote_basis = serializers.CharField(required=False)
     distance_km = serializers.FloatField(required=False, allow_null=True)
     total = serializers.CharField(required=False, allow_null=True)
     preview = serializers.JSONField(required=False, allow_null=True)
@@ -192,10 +264,21 @@ class PublicMatchShopSerializer(serializers.Serializer):
     turnaround_label = serializers.CharField(required=False, allow_blank=True)
     selection = PublicPreviewSelectionSerializer(required=False)
     exact_or_estimated = serializers.BooleanField(required=False, default=False)
+    product_match = serializers.JSONField(required=False, allow_null=True)
+    matched_specs = serializers.ListField(child=serializers.CharField(), default=list)
+    needs_confirmation = serializers.ListField(child=serializers.CharField(), default=list)
+    closest_alternatives = serializers.ListField(child=serializers.JSONField(), default=list)
+    alternative_suggestions = serializers.ListField(child=serializers.JSONField(), default=list, source="closest_alternatives")
+    estimated_price = serializers.FloatField(required=False, allow_null=True)
+    price_range = serializers.JSONField(required=False, allow_null=True)
+    distance_label = serializers.CharField(required=False, allow_null=True)
+    production_preview = ProductionPreviewSerializer(required=False, allow_null=True)
+    pricing_breakdown = PricingBreakdownSerializer(required=False, allow_null=True)
 
 
 class PublicCalculatorResponseSerializer(serializers.Serializer):
     mode = serializers.CharField()
+    can_calculate = serializers.BooleanField(required=False, default=True)
     matches_count = serializers.IntegerField()
     min_price = serializers.CharField(required=False, allow_null=True)
     max_price = serializers.CharField(required=False, allow_null=True)
@@ -203,8 +286,14 @@ class PublicCalculatorResponseSerializer(serializers.Serializer):
     matches = PublicMatchShopSerializer(many=True)
     shops = PublicMatchShopSerializer(many=True)
     selected_shops = PublicMatchShopSerializer(many=True)
+    shop_matches = PublicMatchShopSerializer(many=True, required=False, source="matches")
     fixed_shop_preview = PublicMatchShopSerializer(required=False, allow_null=True)
+    production_preview = ProductionPreviewSerializer(required=False, allow_null=True)
+    pricing_breakdown = PricingBreakdownSerializer(required=False, allow_null=True)
     missing_requirements = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    missing_fields = serializers.ListField(child=serializers.CharField(), required=False, default=list, source="missing_requirements")
     unsupported_reasons = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     summary = serializers.CharField()
+    suggestions = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     exact_or_estimated = serializers.BooleanField(required=False, default=False)
+    warnings = serializers.ListField(child=serializers.CharField(), required=False, default=list)

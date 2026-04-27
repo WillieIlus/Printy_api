@@ -13,17 +13,23 @@ class Notification(models.Model):
     """
 
     QUOTE_REQUEST_SUBMITTED = "quote_request_submitted"
+    QUOTE_REQUEST_SENT = "quote_request_sent"
     SHOP_QUOTE_SENT = "shop_quote_sent"
     SHOP_QUOTE_REVISED = "shop_quote_revised"
     SHOP_QUOTE_ACCEPTED = "shop_quote_accepted"
+    SHOP_QUESTION_ASKED = "shop_question_asked"
+    BUYER_CLARIFICATION_SENT = "buyer_clarification_sent"
     REQUEST_DECLINED = "request_declined"
     QUOTE_REQUEST_CANCELLED = "quote_request_cancelled"
     JOB_STATUS_UPDATED = "job_status_updated"
     TYPE_CHOICES = [
         (QUOTE_REQUEST_SUBMITTED, _("New quote request")),
+        (QUOTE_REQUEST_SENT, _("Request sent")),
         (SHOP_QUOTE_SENT, _("Quote sent")),
         (SHOP_QUOTE_REVISED, _("Quote revised")),
         (SHOP_QUOTE_ACCEPTED, _("Quote accepted")),
+        (SHOP_QUESTION_ASKED, _("Shop question")),
+        (BUYER_CLARIFICATION_SENT, _("Buyer clarification")),
         (REQUEST_DECLINED, _("Request declined")),
         (QUOTE_REQUEST_CANCELLED, _("Request cancelled")),
         (JOB_STATUS_UPDATED, _("Job status updated")),

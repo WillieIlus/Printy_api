@@ -2,8 +2,9 @@
 from decimal import Decimal
 from datetime import timedelta
 
+from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -11,8 +12,9 @@ from api.public_matching_serializers import PublicCalculatorPayloadSerializer
 from api.workflow_serializers import CalculatorPreviewSerializer
 from accounts.models import User, UserProfile
 from common.models import AnalyticsEvent
-from catalog.choices import PricingMode, ProductStatus
+from catalog.choices import PricingMode, ProductKind, ProductStatus
 from catalog.models import Product, ProductCategory, ProductImage
+from inventory.choices import PaperCategory
 from inventory.models import Machine, Paper, ProductionPaperSize
 from locations.models import Location
 from notifications.models import Notification
@@ -1205,6 +1207,7 @@ class ShopsNearbyAPITestCase(TestCase):
         self.assertLessEqual(results[0]["distance_km"], 5)
 
 
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
 class QuoteRequestAPITestCase(TestCase):
     """Test quote request buyer flow."""
 
@@ -1246,7 +1249,18 @@ class QuoteRequestAPITestCase(TestCase):
         # Submit
         r3 = self.client.post(f"/api/quote-requests/{qr_id}/submit/")
         self.assertEqual(r3.status_code, 200)
-        self.assertEqual(r3.json()["status"], QuoteStatus.SUBMITTED)
+        self.assertEqual(r3.json()["status"], "sent")
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller,
+            notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+            object_id=qr_id,
+        ).exists())
+        self.assertTrue(Notification.objects.filter(
+            user=self.buyer,
+            notification_type=Notification.QUOTE_REQUEST_SENT,
+            object_id=qr_id,
+        ).exists())
+        self.assertEqual(len(mail.outbox), 2)
 
     def test_shop_can_accept_ask_question_and_client_reply(self):
         self.client.force_authenticate(user=self.buyer)
@@ -1267,7 +1281,7 @@ class QuoteRequestAPITestCase(TestCase):
             format="json",
         )
         self.assertEqual(accepted.status_code, 200)
-        self.assertEqual(accepted.json()["status"], QuoteStatus.ACCEPTED)
+        self.assertEqual(accepted.json()["status"], "pending")
 
         questioned = self.client.post(
             f"/api/shops/{self.shop.slug}/incoming-requests/{qr_id}/ask-question/",
@@ -1275,7 +1289,7 @@ class QuoteRequestAPITestCase(TestCase):
             format="json",
         )
         self.assertEqual(questioned.status_code, 200)
-        self.assertEqual(questioned.json()["status"], QuoteStatus.AWAITING_CLIENT_REPLY)
+        self.assertEqual(questioned.json()["status"], "needs_confirmation")
 
         self.client.force_authenticate(user=self.buyer)
         replied = self.client.post(
@@ -1284,12 +1298,131 @@ class QuoteRequestAPITestCase(TestCase):
             format="json",
         )
         self.assertEqual(replied.status_code, 200)
-        self.assertEqual(replied.json()["status"], QuoteStatus.AWAITING_SHOP_ACTION)
+        self.assertEqual(replied.json()["status"], "pending")
         self.assertTrue(Notification.objects.filter(
             user=self.seller,
-            notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+            notification_type=Notification.BUYER_CLARIFICATION_SENT,
             object_id=qr_id,
         ).exists())
+        self.assertTrue(Notification.objects.filter(
+            user=self.buyer,
+            notification_type=Notification.SHOP_QUESTION_ASKED,
+            object_id=qr_id,
+        ).exists())
+
+    def test_quote_request_brief_returns_shareable_summary_fields(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.buyer,
+            customer_name="Buyer One",
+            customer_email="buyer@test.com",
+            customer_phone="+254700111222",
+            notes="Urgent run",
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={
+                "calculator_inputs": {
+                    "product_type": "business_card",
+                    "quantity": 250,
+                    "finished_size": "90 x 55 mm",
+                    "paper_stock": "Matt 350gsm",
+                    "lamination": "gloss_lamination",
+                },
+                "request_details": {
+                    "notes": "Urgent run",
+                    "artwork_file_name": "cards.pdf",
+                },
+                "production_preview_snapshot": {
+                    "pieces_per_sheet": 24,
+                    "sheets_required": 11,
+                    "imposition_label": "24-up on SRA3",
+                },
+                "needs_confirmation": ["Confirm rounded corners"],
+            },
+        )
+
+        self.client.force_authenticate(user=self.buyer)
+        response = self.client.get(f"/api/quote-requests/{quote_request.id}/brief/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["request_id"], quote_request.id)
+        self.assertEqual(payload["job_type"], "Business Card")
+        self.assertEqual(payload["quantity"], "250 pcs")
+        self.assertEqual(payload["size"], "90 x 55 mm")
+        self.assertEqual(payload["paper_material"], "Matt 350gsm")
+        self.assertIn("Gloss Lamination", payload["finishing"])
+        self.assertIn("Confirm rounded corners", payload["needs_confirmation"])
+        self.assertIn("cards.pdf", [item["name"] for item in payload["artwork_files"]])
+        self.assertIn("Production preview", payload["summary"])
+
+    def test_buyer_whatsapp_handoff_only_exposes_public_shop_phone_after_response(self):
+        self.shop.is_public = False
+        self.shop.phone_number = "+254700999111"
+        self.shop.save(update_fields=["is_public", "phone_number", "updated_at"])
+        quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.buyer,
+            customer_name="Buyer One",
+            customer_phone="+254700111222",
+            status=QuoteStatus.QUOTED,
+            request_snapshot={
+                "calculator_inputs": {
+                    "product_type": "flyer",
+                    "quantity": 1000,
+                    "finished_size": "A5",
+                    "paper_stock": "Matt 170gsm",
+                },
+            },
+        )
+        ShopQuote.objects.create(
+            quote_request=quote_request,
+            shop=self.shop,
+            created_by=self.seller,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("3200.00"),
+            revision_number=1,
+        )
+
+        self.client.force_authenticate(user=self.buyer)
+        hidden_response = self.client.get(f"/api/quote-requests/{quote_request.id}/whatsapp-handoff/")
+        self.assertEqual(hidden_response.status_code, 200)
+        self.assertFalse(hidden_response.json()["available"])
+        self.assertEqual(hidden_response.json()["label"], "Connect WhatsApp")
+        self.assertEqual(hidden_response.json()["phone"], "")
+
+        self.shop.is_public = True
+        self.shop.save(update_fields=["is_public", "updated_at"])
+        visible_response = self.client.get(f"/api/quote-requests/{quote_request.id}/whatsapp-handoff/")
+        self.assertEqual(visible_response.status_code, 200)
+        self.assertTrue(visible_response.json()["available"])
+        self.assertEqual(visible_response.json()["phone"], "+254700999111")
+        self.assertIn("https://wa.me/254700999111", visible_response.json()["url"])
+
+    def test_shop_whatsapp_handoff_targets_buyer_phone(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.buyer,
+            customer_name="Buyer One",
+            customer_phone="+254700111222",
+            status=QuoteStatus.QUOTED,
+            request_snapshot={"calculator_inputs": {"product_type": "flyer", "quantity": 500, "finished_size": "A6"}},
+        )
+        ShopQuote.objects.create(
+            quote_request=quote_request,
+            shop=self.shop,
+            created_by=self.seller,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("1800.00"),
+            revision_number=1,
+        )
+
+        self.client.force_authenticate(user=self.seller)
+        response = self.client.get(f"/api/shops/{self.shop.slug}/incoming-requests/{quote_request.id}/whatsapp-handoff/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["available"])
+        self.assertEqual(response.json()["phone"], "+254700111222")
+        self.assertIn("https://wa.me/254700111222", response.json()["url"])
 
     def test_client_accepts_shop_quote_without_changing_request_from_quoted(self):
         quote_request = QuoteRequest.objects.create(
@@ -1315,9 +1448,14 @@ class QuoteRequestAPITestCase(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], QuoteStatus.QUOTED)
+        self.assertEqual(response.json()["status"], "responded")
         shop_quote.refresh_from_db()
         self.assertEqual(shop_quote.status, ShopQuoteStatus.ACCEPTED)
+        self.assertTrue(Notification.objects.filter(
+            user=self.seller,
+            notification_type=Notification.SHOP_QUOTE_ACCEPTED,
+            object_id=shop_quote.id,
+        ).exists())
 
     def test_activity_summary_returns_shop_and_client_badge_counts(self):
         customer_request = QuoteRequest.objects.create(
@@ -1353,10 +1491,18 @@ class QuoteRequestAPITestCase(TestCase):
         Notification.objects.create(
             user=self.buyer,
             actor=self.seller,
-            notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+            notification_type=Notification.SHOP_QUESTION_ASKED,
             object_type="quote_request",
             object_id=customer_request.id,
             message="Shop asked a question",
+        )
+        Notification.objects.create(
+            user=self.buyer,
+            actor=self.seller,
+            notification_type=Notification.QUOTE_REQUEST_SENT,
+            object_type="quote_request",
+            object_id=customer_request.id,
+            message="Request sent",
         )
         Notification.objects.create(
             user=self.buyer,
@@ -1377,7 +1523,7 @@ class QuoteRequestAPITestCase(TestCase):
         Notification.objects.create(
             user=self.seller,
             actor=self.buyer,
-            notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+            notification_type=Notification.BUYER_CLARIFICATION_SENT,
             object_type="quote_request",
             object_id=actionable_request.id,
             message="Client replied",
@@ -2152,6 +2298,7 @@ class DashboardQuoteFileAPITestCase(TestCase):
         self.assertEqual(response.status_code, 404)
 
 
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
 class QuoteWorkflowAPITestCase(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -2198,7 +2345,17 @@ class QuoteWorkflowAPITestCase(TestCase):
         self.assertEqual(send_response.status_code, 201)
         request_payload = send_response.json()[0]
         request_id = request_payload["id"]
-        self.assertEqual(request_payload["status"], "submitted")
+        self.assertEqual(request_payload["status"], "sent")
+        self.assertTrue(Notification.objects.filter(
+            user=self.owner,
+            notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+            object_id=request_id,
+        ).exists())
+        self.assertTrue(Notification.objects.filter(
+            user=self.customer,
+            notification_type=Notification.QUOTE_REQUEST_SENT,
+            object_id=request_id,
+        ).exists())
         self.assertEqual(
             request_payload["request_snapshot"]["draft_reference"],
             QuoteDraft.objects.get(pk=draft_id).draft_reference,
@@ -2238,6 +2395,11 @@ class QuoteWorkflowAPITestCase(TestCase):
         response_id = create_response.json()["id"]
         self.assertEqual(create_response.json()["status"], "modified")
         self.assertEqual(create_response.json()["response_snapshot"]["pricing"]["grand_total"], "2550.00")
+        self.assertTrue(Notification.objects.filter(
+            user=self.customer,
+            notification_type=Notification.SHOP_QUOTE_SENT,
+            object_id=request_id,
+        ).exists())
 
         list_requests = self.client.get("/api/workflow/quote-requests/")
         self.assertEqual(list_requests.status_code, 200)
@@ -2253,6 +2415,11 @@ class QuoteWorkflowAPITestCase(TestCase):
         )
         self.assertEqual(patch_quote_response.status_code, 200)
         self.assertEqual(patch_quote_response.json()["status"], "accepted")
+        self.assertTrue(Notification.objects.filter(
+            user=self.customer,
+            notification_type=Notification.SHOP_QUOTE_REVISED,
+            object_id=response_id,
+        ).exists())
 
         request_record = QuoteRequest.objects.get(pk=request_id)
         response_record = ShopQuote.objects.get(pk=response_id)
@@ -2263,6 +2430,8 @@ class QuoteWorkflowAPITestCase(TestCase):
         response_list = self.client.get(f"/api/quote-requests/{request_id}/responses/")
         self.assertEqual(response_list.status_code, 200)
         self.assertEqual(response_list.json()[0]["status"], "accepted")
+        self.assertIn("whatsapp_available", response_list.json()[0])
+        self.assertIn("whatsapp_label", response_list.json()[0])
 
 
 class CalculatorPreviewAPITestCase(TestCase):
@@ -2563,11 +2732,17 @@ class CalculatorPreviewAPITestCase(TestCase):
         data = response.json()
         self.assertEqual(data["quote_type"], "booklet")
         self.assertEqual(data["calculation_result"]["quote_type"], "booklet")
+        self.assertEqual(data["product_type"], "booklet")
+        self.assertEqual(data["finished_size"], "A5")
+        self.assertEqual(data["input_pages"], 12)
+        self.assertEqual(data["blank_pages_added"], 0)
         self.assertIn("cover", data["breakdown"])
         self.assertIn("inserts", data["breakdown"])
         self.assertIn("binding", data["breakdown"])
         self.assertEqual(data["breakdown"]["binding"]["label"], "Saddle stitch binding")
         self.assertEqual(data["breakdown"]["booklet"]["normalized_pages"], 12)
+        self.assertEqual(data["cover_pages"], 4)
+        self.assertEqual(data["insert_pages"], 8)
 
     def test_booklet_preview_warns_when_pages_are_normalized(self):
         binding = FinishingRate.objects.create(
@@ -2605,6 +2780,27 @@ class CalculatorPreviewAPITestCase(TestCase):
         data = response.json()
         self.assertTrue(data["warnings"])
         self.assertEqual(data["breakdown"]["booklet"]["normalized_pages"], 12)
+        self.assertEqual(data["blank_pages_added"], 2)
+
+    def test_booklet_preview_returns_missing_fields_for_partial_payload(self):
+        response = self.client.post(
+            "/api/calculator/booklet-preview/",
+            {
+                "shop": self.shop.id,
+                "quantity": 25,
+                "total_pages": 12,
+                "width_mm": 210,
+                "height_mm": 297,
+                "insert_paper": self.paper.id,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertFalse(data["can_calculate"])
+        self.assertIn("cover_stock", data["missing_fields"])
+        self.assertIn("Choose", data["message"])
 
     def test_large_format_preview_returns_area_printing_and_hardware_breakdown(self):
         roll = ProductionPaperSize.objects.create(name="1.2m Roll", code="ROLL1200", width_mm=1200, height_mm=1)
@@ -3059,3 +3255,223 @@ class ShopRateCardPaperDuplexSurchargeTestCase(TestCase):
         self.assertEqual(rows[150]["duplex_surcharge"], "5.00")
         self.assertTrue(rows[150]["duplex_surcharge_enabled"])
         self.assertEqual(rows[150]["duplex_surcharge_min_gsm"], 150)
+
+
+class CalculatorConfigContractAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(email="calc-owner@test.com", password="pass12345")
+        self.shop = Shop.objects.create(
+            owner=self.owner,
+            name="Calculator Shop",
+            slug="calculator-shop",
+            is_active=True,
+            is_public=True,
+        )
+        self.machine = Machine.objects.create(
+            shop=self.shop,
+            name="Digital Press",
+            machine_type="DIGITAL",
+            max_width_mm=450,
+            max_height_mm=320,
+            is_active=True,
+        )
+        PrintingRate.objects.create(
+            machine=self.machine,
+            sheet_size="SRA3",
+            color_mode="COLOR",
+            single_price=Decimal("15.00"),
+            double_price=Decimal("28.00"),
+            is_active=True,
+            is_default=True,
+        )
+        self.category = ProductCategory.objects.create(name="Cards", slug="cards")
+        Product.objects.create(
+            shop=self.shop,
+            category=self.category,
+            name="Business Cards",
+            pricing_mode=PricingMode.SHEET,
+            product_kind=ProductKind.FLAT,
+            default_finished_width_mm=90,
+            default_finished_height_mm=55,
+            default_sides=Sides.DUPLEX,
+            min_quantity=100,
+            is_active=True,
+            is_public=True,
+        )
+        Product.objects.create(
+            shop=self.shop,
+            category=self.category,
+            name="Booklets",
+            pricing_mode=PricingMode.SHEET,
+            product_kind=ProductKind.BOOKLET,
+            default_finished_width_mm=210,
+            default_finished_height_mm=297,
+            default_sides=Sides.DUPLEX,
+            min_quantity=50,
+            is_active=True,
+            is_public=True,
+        )
+        self.paper_130 = Paper.objects.create(
+            shop=self.shop,
+            name="Matt 130",
+            display_name="Matt 130gsm",
+            sheet_size="SRA3",
+            gsm=130,
+            category=PaperCategory.MATTE,
+            paper_type="MATTE",
+            is_cover_stock=False,
+            is_insert_stock=True,
+            buying_price=Decimal("3.00"),
+            selling_price=Decimal("5.00"),
+            is_active=True,
+        )
+        Paper.objects.create(
+            shop=self.shop,
+            name="Matt 150",
+            display_name="Matt 150gsm",
+            sheet_size="SRA3",
+            gsm=150,
+            category=PaperCategory.MATTE,
+            paper_type="MATTE",
+            is_cover_stock=False,
+            is_insert_stock=True,
+            buying_price=Decimal("3.50"),
+            selling_price=Decimal("5.50"),
+            is_active=True,
+        )
+        self.cover_stock = Paper.objects.create(
+            shop=self.shop,
+            name="Artcard 300",
+            display_name="Artcard 300gsm",
+            sheet_size="SRA3",
+            gsm=300,
+            category=PaperCategory.ARTCARD,
+            paper_type="GLOSS",
+            is_cover_stock=True,
+            is_insert_stock=False,
+            buying_price=Decimal("8.00"),
+            selling_price=Decimal("12.00"),
+            is_active=True,
+        )
+        FinishingRate.objects.create(
+            shop=self.shop,
+            name="Saddle Stitch",
+            slug="saddle-stitch",
+            charge_unit=ChargeUnit.PER_PIECE,
+            billing_basis=FinishingBillingBasis.FLAT_PER_JOB,
+            side_mode=FinishingSideMode.IGNORE_SIDES,
+            price=Decimal("6.00"),
+            is_active=True,
+        )
+        recompute_shop_match_readiness(self.shop)
+
+    def _stock_key(self, label: str) -> str:
+        response = self.client.get("/api/calculator/config/")
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()["paper_stocks"]
+        match = next(item for item in rows if item["label"] == label)
+        return match["key"]
+
+    def test_calculator_config_lists_supported_products_and_categories(self):
+        response = self.client.get("/api/calculator/config/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        product_keys = {item["key"] for item in data["products"]}
+        self.assertEqual(
+            product_keys,
+            {"business_card", "flyer", "label_sticker", "letterhead", "booklet"},
+        )
+        category_values = {item["value"] for item in data["paper_categories"]}
+        self.assertTrue({"ivory", "tictac", "conqueror"}.issubset(category_values))
+
+    def test_public_preview_returns_missing_fields_without_validation_error(self):
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {"product_type": "business_card", "quantity": 100},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertFalse(data["can_calculate"])
+        self.assertIn("finished_size", data["missing_fields"])
+        self.assertIn("paper_stock", data["missing_fields"])
+
+    def test_public_preview_matches_requested_gsm_to_closest_stock(self):
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {
+                "product_type": "flyer",
+                "quantity": 100,
+                "finished_size": "A5",
+                "paper_stock": self._stock_key("Matt 130gsm"),
+                "requested_paper_category": "matt",
+                "requested_gsm": 135,
+                "print_sides": "SIMPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["can_calculate"])
+        top_preview = data["matches"][0]["preview"]
+        self.assertEqual(top_preview["matched_stock"]["requested_paper"], "Matt 135gsm")
+        self.assertEqual(top_preview["matched_stock"]["matched_paper"], "Matt 130gsm")
+        self.assertEqual(top_preview["matched_stock"]["match_note"], "Closest available stock")
+
+    def test_public_preview_returns_normalized_sections_for_flat_jobs(self):
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "85x55mm",
+                "paper_stock": self._stock_key("Matt 130gsm"),
+                "requested_paper_category": "matt",
+                "requested_gsm": 130,
+                "print_sides": "DUPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["can_calculate"])
+        self.assertIn("production_preview", data)
+        self.assertIn("pricing_breakdown", data)
+        self.assertIn("shop_matches", data)
+        self.assertGreaterEqual(data["production_preview"]["pieces_per_sheet"], 1)
+        self.assertGreaterEqual(data["production_preview"]["sheets_required"], 1)
+        self.assertEqual(data["pricing_breakdown"]["currency"], "KES")
+        self.assertIsInstance(data["pricing_breakdown"]["lines"], list)
+        self.assertTrue(data["shop_matches"])
+        first_match = data["shop_matches"][0]
+        self.assertIn("missing_specs", first_match)
+        self.assertIn("alternative_suggestions", first_match)
+        self.assertIn("estimated_price", first_match)
+
+    def test_public_preview_booklet_flow_still_returns_backend_booklet_fields(self):
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {
+                "product_type": "booklet",
+                "quantity": 100,
+                "finished_size": "A4",
+                "total_pages": 98,
+                "cover_stock": self._stock_key("Artcard 300gsm"),
+                "insert_stock": self._stock_key("Matt 130gsm"),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["can_calculate"])
+        top_preview = data["matches"][0]["preview"]
+        self.assertEqual(top_preview["normalized_pages"], 100)
+        self.assertEqual(top_preview["blank_pages_added"], 2)

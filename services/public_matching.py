@@ -7,6 +7,7 @@ from catalog.choices import PricingMode, ProductKind
 from catalog.models import Product
 from common.geo import haversine_km
 from inventory.models import Machine, Paper
+from locations.models import Location
 from pricing.models import FinishingRate, Material, PrintingRate
 from services.pricing.engine import calculate_large_format_pricing, calculate_sheet_pricing
 from quotes.turnaround import derive_product_turnaround_hours, estimate_turnaround, humanize_working_hours
@@ -64,9 +65,21 @@ def _distance_km_for_payload(shop: Shop, payload: dict[str, Any]) -> float | Non
 def _apply_radius_filter(queryset, payload: dict[str, Any]):
     lat = payload.get("lat")
     lng = payload.get("lng")
+    location_slug = payload.get("location_slug")
+    
+    if location_slug:
+        loc = Location.objects.filter(slug=location_slug, is_active=True).first()
+        if loc and loc.latitude and loc.longitude:
+            lat = float(loc.latitude)
+            lng = float(loc.longitude)
+
     radius = payload.get("radius_km") or 50
     if lat is None or lng is None:
         return queryset
+
+    # Update payload for distance calculations in Try functions
+    payload["lat"] = lat
+    payload["lng"] = lng
 
     shop_ids = []
     for shop in queryset:
@@ -81,9 +94,6 @@ def _family_capability_queryset(queryset, family: str):
         return queryset.filter(
             materials__is_active=True,
             materials__selling_price__gt=0,
-            products__is_active=True,
-            products__is_public=True,
-            products__pricing_mode=PricingMode.LARGE_FORMAT,
         )
     if family == "booklet":
         return queryset.filter(
@@ -91,24 +101,17 @@ def _family_capability_queryset(queryset, family: str):
             papers__is_active=True,
             papers__selling_price__gt=0,
             machines__printing_rates__is_active=True,
-            products__is_active=True,
-            products__is_public=True,
-            products__pricing_mode=PricingMode.SHEET,
-            products__product_kind=ProductKind.BOOKLET,
         )
     return queryset.filter(
         machines__is_active=True,
         papers__is_active=True,
         papers__selling_price__gt=0,
         machines__printing_rates__is_active=True,
-        products__is_active=True,
-        products__is_public=True,
-        products__pricing_mode=PricingMode.SHEET,
-        products__product_kind=ProductKind.FLAT,
     )
 
 
 def _product_availability_score(shop: Shop, family: str) -> float:
+    # Product match is now a bonus, not a requirement.
     public_products = Product.objects.filter(shop=shop, is_active=True, is_public=True)
     if family == "large_format":
         exists = public_products.filter(pricing_mode=PricingMode.LARGE_FORMAT).exists()
@@ -116,7 +119,7 @@ def _product_availability_score(shop: Shop, family: str) -> float:
         exists = public_products.filter(pricing_mode=PricingMode.SHEET, product_kind=ProductKind.BOOKLET).exists()
     else:
         exists = public_products.filter(pricing_mode=PricingMode.SHEET, product_kind=ProductKind.FLAT).exists()
-    return 15.0 if exists else 0.0
+    return 5.0 if exists else 0.0
 
 
 def _pricing_readiness_score(shop: Shop) -> float:
@@ -148,8 +151,11 @@ def _build_marketplace_response(*, successful_rows: list[dict[str, Any]], failed
     missing_requirements = _unique_strings(field for row in failed_rows for field in row.get("missing_fields", []))
     unsupported_reasons = _unique_strings(row.get("reason") for row in failed_rows if row.get("reason"))
 
+    best_match = selected_rows[0] if selected_rows else (failed_rows[0] if failed_rows else None)
+
     return {
         "mode": mode,
+        "can_calculate": bool(successful_rows),
         "matches_count": len(successful_rows),
         "matches": selected_rows,
         "shops": selected_rows,
@@ -157,9 +163,12 @@ def _build_marketplace_response(*, successful_rows: list[dict[str, Any]], failed
         "min_price": _format_decimal(min(totals)) if totals else None,
         "max_price": _format_decimal(max(totals)) if totals else None,
         "currency": selected_rows[0]["currency"] if selected_rows else "KES",
+        "production_preview": best_match.get("production_preview") if best_match else None,
+        "pricing_breakdown": best_match.get("pricing_breakdown") if best_match else None,
         "missing_requirements": missing_requirements,
         "unsupported_reasons": unsupported_reasons,
         "summary": _build_marketplace_summary(successful_rows, failed_rows),
+        "suggestions": ["Detailed shop-spec matching is not fully connected yet."] if not successful_rows else [],
         "exact_or_estimated": bool(selected_rows) and all(row.get("exact_or_estimated", False) for row in selected_rows),
     }
 
@@ -176,20 +185,24 @@ def get_marketplace_matches(payload: dict[str, Any]) -> dict[str, Any]:
 
 def get_shop_specific_preview(shop: Shop, payload: dict[str, Any]) -> dict[str, Any]:
     row = try_preview_for_shop(shop, payload)
-    selected_rows = [row] if row else []
+    selected_rows = [row] if row and row["can_calculate"] else []
     return {
         "mode": "single-shop",
+        "can_calculate": row["can_calculate"] if row else False,
         "matches_count": 1 if row and row["can_calculate"] else 0,
         "matches": selected_rows,
         "shops": selected_rows,
         "selected_shops": selected_rows,
         "fixed_shop_preview": row,
+        "production_preview": row.get("production_preview") if row else None,
+        "pricing_breakdown": row.get("pricing_breakdown") if row else None,
         "min_price": row.get("total") if row and row["can_calculate"] else None,
         "max_price": row.get("total") if row and row["can_calculate"] else None,
         "currency": row.get("currency", getattr(shop, "currency", "KES")) if row else getattr(shop, "currency", "KES"),
         "missing_requirements": row.get("missing_fields", []) if row else [],
         "unsupported_reasons": [row["reason"]] if row and row.get("reason") and not row["can_calculate"] else [],
         "summary": row["reason"] if row and row.get("reason") else ("Preview ready." if row and row["can_calculate"] else "Preview unavailable."),
+        "suggestions": [],
         "exact_or_estimated": bool(row and row.get("exact_or_estimated")),
     }
 
@@ -202,6 +215,8 @@ def filter_candidate_shops(payload: dict[str, Any]):
         queryset = queryset.filter(supports_catalog_requests=True)
     else:
         queryset = queryset.filter(supports_custom_requests=True)
+        # We no longer strictly filter by product existence here.
+        # _family_capability_queryset will check for machines/papers/materials.
         queryset = _family_capability_queryset(queryset, family)
 
     queryset = _apply_radius_filter(queryset.distinct(), payload)
@@ -211,18 +226,37 @@ def filter_candidate_shops(payload: dict[str, Any]):
 def try_preview_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, Any] | None:
     if payload.get("pricing_mode") == "catalog":
         product_id = payload.get("product_id")
-        if not product_id:
+        product_slug = payload.get("product_slug")
+        if not product_id and not product_slug:
             return None
-        product = Product.objects.filter(
-            id=product_id,
-            shop=shop,
-            is_active=True,
-            is_public=True,
-        ).first()
+        
+        queryset = Product.objects.filter(shop=shop, is_active=True, is_public=True)
+        if product_id:
+            product = queryset.filter(id=product_id).first()
+        else:
+            product = queryset.filter(slug=product_slug).first()
+            
         if not product:
             return None
         return _preview_catalog_for_shop(shop, product, payload)
-    return _preview_custom_for_shop(shop, payload)
+    
+    # Check if shop has a matching product for this custom job to include it as a bonus match
+    product_match = _find_best_product_match(shop, payload)
+    return _preview_custom_for_shop(shop, payload, product_match=product_match)
+
+
+def _find_best_product_match(shop: Shop, payload: dict[str, Any]) -> Product | None:
+    family = _requested_family(payload)
+    products = Product.objects.filter(shop=shop, is_active=True, is_public=True)
+    if family == "large_format":
+        products = products.filter(pricing_mode=PricingMode.LARGE_FORMAT)
+    elif family == "booklet":
+        products = products.filter(pricing_mode=PricingMode.SHEET, product_kind=ProductKind.BOOKLET)
+    else:
+        products = products.filter(pricing_mode=PricingMode.SHEET, product_kind=ProductKind.FLAT)
+    
+    # Simple match by slug/title if available, or just return first active product of family
+    return products.first()
 
 
 def _turnaround_hours_for_payload(shop: Shop, payload: dict[str, Any], product: Product | None = None) -> int | None:
@@ -271,6 +305,8 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
                 reason="No compatible material is priced for this shop.",
                 missing_fields=["material", *missing_finishings],
                 similarity_score=_shop_similarity_score(shop, payload, False),
+                quote_basis="insufficient_data",
+                payload=payload,
             )
 
         width_mm = int(payload.get("width_mm") or product.default_finished_width_mm or 0)
@@ -282,6 +318,8 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
                 reason="Finished size is required for large-format pricing.",
                 missing_fields=["width_mm", "height_mm", *missing_finishings],
                 similarity_score=_shop_similarity_score(shop, payload, False),
+                quote_basis="insufficient_data",
+                payload=payload,
             )
 
         result = calculate_large_format_pricing(
@@ -303,6 +341,9 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
             selection={"material_id": material.id, "material_label": f"{material.material_type} ({material.unit})"},
             similarity_score=_shop_similarity_score(shop, payload, True, material=material),
             exact_or_estimated=True,
+            quote_basis="product_and_rate_card",
+            product_match=product,
+            payload=payload,
         ), payload, product)
 
     paper = _pick_paper(shop, payload, product=product)
@@ -313,6 +354,8 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
             reason="No compatible paper is priced for this shop.",
             missing_fields=["paper", *missing_finishings],
             similarity_score=_shop_similarity_score(shop, payload, False),
+            quote_basis="insufficient_data",
+            payload=payload,
         )
 
     machine = _pick_machine(shop, paper=paper, payload=payload, product=product)
@@ -324,6 +367,8 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
             missing_fields=["machine", *missing_finishings],
             selection={"paper_id": paper.id, "paper_label": _paper_label(paper)},
             similarity_score=_shop_similarity_score(shop, payload, False, paper=paper),
+            quote_basis="insufficient_data",
+            payload=payload,
         )
 
     result = calculate_sheet_pricing(
@@ -332,8 +377,8 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
         quantity=payload["quantity"],
         paper=paper,
         machine=machine,
-        color_mode=payload.get("colour_mode") or "COLOR",
-        sides=payload.get("print_sides") or "SIMPLEX",
+        color_mode=payload.get("color_mode") or payload.get("colour_mode") or "COLOR",
+        sides=payload.get("sides") or payload.get("print_sides") or "SIMPLEX",
         apply_duplex_surcharge=payload.get("apply_duplex_surcharge"),
         finishing_selections=finishing_selections,
         width_mm=int(payload.get("width_mm") or product.default_finished_width_mm or 0),
@@ -355,10 +400,13 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
         },
         similarity_score=_shop_similarity_score(shop, payload, True, paper=paper),
         exact_or_estimated=True,
+        quote_basis="product_and_rate_card",
+        product_match=product,
+        payload=payload,
     ), payload, product)
 
 
-def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, Any]:
+def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any], product_match: Product | None = None) -> dict[str, Any]:
     finishing_selections, missing_finishings = _resolve_finishings(shop, payload)
     product_pricing_mode = payload.get("product_pricing_mode") or _infer_product_pricing_mode(payload)
 
@@ -381,6 +429,9 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, A
                 missing_fields=missing_fields,
                 selection={"material_id": material.id, "material_label": f"{material.material_type} ({material.unit})"} if material else {},
                 similarity_score=_shop_similarity_score(shop, payload, False, material=material),
+                quote_basis="manual_quote" if not material else "insufficient_data",
+                product_match=product_match,
+                payload=payload,
             )
 
         result = calculate_large_format_pricing(
@@ -402,6 +453,9 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, A
             selection={"material_id": material.id, "material_label": f"{material.material_type} ({material.unit})"},
             similarity_score=_shop_similarity_score(shop, payload, True, material=material),
             exact_or_estimated=True,
+            quote_basis="rate_card",
+            product_match=product_match,
+            payload=payload,
         ), payload, None)
 
     paper = _pick_paper(shop, payload)
@@ -418,22 +472,25 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, A
     if paper and not machine:
         missing_fields.append("machine")
 
-    if missing_fields:
-        selection = {}
-        if paper:
-            selection["paper_id"] = paper.id
-            selection["paper_label"] = _paper_label(paper)
-        if machine:
-            selection["machine_id"] = machine.id
-            selection["machine_label"] = getattr(machine, "name", "")
-        return _build_shop_row(
-            shop,
-            can_calculate=False,
-            reason="Add paper and finished size to price this custom job exactly.",
-            missing_fields=missing_fields,
-            selection=selection,
-            similarity_score=_shop_similarity_score(shop, payload, False, paper=paper),
-        )
+        if missing_fields:
+            selection = {}
+            if paper:
+                selection["paper_id"] = paper.id
+                selection["paper_label"] = _paper_label(paper)
+            if machine:
+                selection["machine_id"] = machine.id
+                selection["machine_label"] = getattr(machine, "name", "")
+            return _build_shop_row(
+                shop,
+                can_calculate=False,
+                reason="Add paper and finished size to price this custom job exactly.",
+                missing_fields=missing_fields,
+                selection=selection,
+                similarity_score=_shop_similarity_score(shop, payload, False, paper=paper),
+                quote_basis="manual_quote" if not paper else "insufficient_data",
+                product_match=product_match,
+                payload=payload,
+            )
 
     result = calculate_sheet_pricing(
         shop=shop,
@@ -441,8 +498,8 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, A
         quantity=payload["quantity"],
         paper=paper,
         machine=machine,
-        color_mode=payload.get("colour_mode") or "COLOR",
-        sides=payload.get("print_sides") or "SIMPLEX",
+        color_mode=payload.get("color_mode") or payload.get("colour_mode") or "COLOR",
+        sides=payload.get("sides") or payload.get("print_sides") or "SIMPLEX",
         apply_duplex_surcharge=payload.get("apply_duplex_surcharge"),
         finishing_selections=finishing_selections,
         width_mm=width_mm,
@@ -464,6 +521,9 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, A
         },
         similarity_score=_shop_similarity_score(shop, payload, True, paper=paper),
         exact_or_estimated=True,
+        quote_basis="rate_card",
+        product_match=product_match,
+        payload=payload,
     ), payload, None)
 
 
@@ -575,8 +635,8 @@ def _pick_material(shop: Shop, payload: dict[str, Any]) -> Material | None:
 def _pick_machine(shop: Shop, paper: Paper | None, payload: dict[str, Any], product: Product | None = None) -> Machine | None:
     if paper is None:
         return None
-    colour_mode = payload.get("colour_mode") or "COLOR"
-    print_sides = payload.get("print_sides") or getattr(product, "default_sides", "SIMPLEX") or "SIMPLEX"
+    colour_mode = payload.get("color_mode") or payload.get("colour_mode") or "COLOR"
+    print_sides = payload.get("sides") or payload.get("print_sides") or getattr(product, "default_sides", "SIMPLEX") or "SIMPLEX"
 
     queryset = (
         Machine.objects.filter(shop=shop, is_active=True)
@@ -610,34 +670,53 @@ def _shop_similarity_score(
     paper: Paper | None = None,
     material: Material | None = None,
 ) -> float:
-    family = _requested_family(payload)
-    distance_km = _distance_km_for_payload(shop, payload)
     score = 0.0
-    score += 45.0 if can_calculate else 5.0
-    score += _pricing_readiness_score(shop)
-    score += _product_availability_score(shop, family)
-    requested_gsm = payload.get("paper_gsm")
-    if paper and requested_gsm:
-        gsm_gap = abs(int(paper.gsm) - int(requested_gsm))
-        score += max(0.0, 15.0 - float(gsm_gap) / 10.0)
-    requested_sheet_size = (payload.get("sheet_size") or "").strip().upper()
-    if paper and requested_sheet_size and (paper.sheet_size or "").upper() == requested_sheet_size:
-        score += 10.0
-    requested_type = (payload.get("paper_type") or "").strip().lower()
-    if paper and requested_type:
-        paper_type = (paper.get_paper_type_display() or paper.paper_type or "").strip().lower()
-        if requested_type in paper_type:
-            score += 10.0
-    if material and payload.get("material_id") and material.id == payload.get("material_id"):
-        score += 20.0
-    requested_material_type = (payload.get("material_type") or "").strip().lower()
-    if material and requested_material_type and requested_material_type in (material.material_type or "").strip().lower():
+    family = _requested_family(payload)
+    
+    # same product/category: +30
+    score += _product_availability_score(shop, family) * 2  # Product score is 5 or 0, so *6 to get ~30 bonus if exists
+    if can_calculate:
+        score += 30.0 # Base for being able to fulfill this family
+    
+    # paper/material exact/similar: +25
+    if paper:
+        requested_gsm = payload.get("paper_gsm")
+        if requested_gsm:
+            gsm_gap = abs(int(paper.gsm) - int(requested_gsm))
+            score += max(0.0, 15.0 - float(gsm_gap) / 10.0)
+        
+        requested_type = (payload.get("paper_type") or "").strip().lower()
+        if requested_type:
+            paper_type = (paper.get_paper_type_display() or paper.paper_type or "").strip().lower()
+            if requested_type in paper_type:
+                score += 10.0
+    elif material:
+        requested_material_type = (payload.get("material_type") or "").strip().lower()
+        if requested_material_type and requested_material_type in (material.material_type or "").strip().lower():
+            score += 25.0
+    
+    # finishing exact/similar: +20
+    if payload.get("finishing_ids") or payload.get("finishing_slugs") or payload.get("finishings"):
+        # If we reached here and can_calculate is True, it means finishings matched
+        if can_calculate:
+            score += 20.0
+        else:
+            score += 10.0 # Partial match
+            
+    # pricing rates available: +15
+    if getattr(shop, "pricing_ready", False):
         score += 15.0
-    if payload.get("finishing_ids") or payload.get("finishing_slugs"):
+        
+    # can handle quantity/dimensions: +10
+    if can_calculate:
         score += 10.0
+
+    # Distance bonus (extra)
+    distance_km = _distance_km_for_payload(shop, payload)
     if distance_km is not None:
-        score += max(0.0, 15.0 - min(distance_km, 30.0) / 2.0)
-    return round(score, 2)
+        score += max(0.0, 10.0 - min(distance_km, 50.0) / 5.0)
+
+    return round(min(score, 100.0), 2)
 
 
 def _infer_product_pricing_mode(payload: dict[str, Any]) -> str:
@@ -659,14 +738,67 @@ def _build_shop_row(
     similarity_score: float = 0.0,
     distance_km: float | None = None,
     exact_or_estimated: bool = False,
+    quote_basis: str = "manual_quote",
+    product_match: Product | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    matched_specs = []
+    if payload:
+        if payload.get("job_type"):
+            matched_specs.append(payload["job_type"].capitalize())
+        elif payload.get("product_family"):
+            matched_specs.append(payload["product_family"].replace("_", " ").capitalize())
+        
+        if payload.get("width_mm") and payload.get("height_mm"):
+            matched_specs.append(f"{payload['width_mm']} × {payload['height_mm']} mm")
+    
+    if selection:
+        if selection.get("paper_label"):
+            matched_specs.append("Similar paper available")
+        if selection.get("material_label"):
+            matched_specs.append("Material available")
+
+    needs_confirmation = []
+    closest_alternatives = []
+    if not can_calculate:
+        if "paper" in (missing_fields or []):
+            needs_confirmation.append("Exact paper stock needs confirmation")
+            if selection and selection.get("paper_label"):
+                closest_alternatives.append({
+                    "type": "paper",
+                    "requested": payload.get("paper_type") or (f"{payload.get('paper_gsm')}gsm" if payload.get("paper_gsm") else "requested stock"),
+                    "available": selection["paper_label"],
+                    "confidence": "similar",
+                    "message": "Similar paper found"
+                })
+        if "material" in (missing_fields or []):
+            needs_confirmation.append("Material needs confirmation")
+            if selection and selection.get("material_label"):
+                closest_alternatives.append({
+                    "type": "material",
+                    "requested": payload.get("material_type") or "requested material",
+                    "available": selection["material_label"],
+                    "confidence": "similar",
+                    "message": "Similar material found"
+                })
+        if "finishing" in (missing_fields or []):
+            needs_confirmation.append("Finishing price not listed yet")
+        if not exact_or_estimated:
+            needs_confirmation.append("Turnaround needs confirmation")
+
+    row = {
         "id": shop.id,
+        "shop_id": shop.id,
         "name": shop.name,
+        "shop_name": shop.name,
         "slug": shop.slug,
+        "shop_slug": shop.slug,
         "can_calculate": can_calculate,
+        "can_price_now": can_calculate,
+        "can_send_quote_request": True,
         "currency": currency or getattr(shop, "currency", "KES") or "KES",
         "reason": reason,
+        "summary": reason,
         "missing_fields": _unique_strings(missing_fields or []),
         "total": total,
         "preview": preview,
@@ -675,11 +807,80 @@ def _build_shop_row(
         "confidence_score": similarity_score,
         "distance_km": distance_km,
         "exact_or_estimated": exact_or_estimated,
+        "quote_basis": quote_basis,
+        "match_type": "exact" if similarity_score >= 80 else ("close" if similarity_score >= 50 else "needs_confirmation"),
+        "match_score": similarity_score,
+        "price_confidence": "high" if exact_or_estimated and similarity_score >= 80 else ("medium" if exact_or_estimated else "low"),
+        "product_match": {
+            "id": product_match.id,
+            "name": product_match.name,
+            "slug": product_match.slug,
+        } if product_match else None,
+        "matched_specs": matched_specs,
+        "needs_confirmation": needs_confirmation,
+        "closest_alternatives": closest_alternatives,
+        "production_preview": _extract_production_preview(preview) if preview else None,
+        "pricing_breakdown": _extract_pricing_breakdown(preview) if preview else None,
+        "missing_specs": _unique_strings(missing_fields or []),
+        "alternative_suggestions": closest_alternatives,
+        "estimated_price": _as_float(total),
+        "price_range": None,
+        "distance_label": f"{distance_km:.1f} km away" if distance_km is not None else None,
+    }
+    return row
+
+
+def _extract_production_preview(preview: dict[str, Any]) -> dict[str, Any]:
+    breakdown = preview.get("breakdown") or {}
+    imposition = breakdown.get("imposition") or {}
+    paper = breakdown.get("paper") or {}
+    
+    return {
+        "pieces_per_sheet": imposition.get("copies_per_sheet") or preview.get("copies_per_sheet"),
+        "sheets_required": imposition.get("good_sheets") or preview.get("good_sheets"),
+        "parent_sheet": imposition.get("sheet_size") or paper.get("sheet_size") or preview.get("parent_sheet_name"),
+        "imposition_label": imposition.get("explanation"),
+        "size_label": paper.get("label"),
+        "quantity": preview.get("quantity"),
+        "cutting_required": True if imposition.get("good_sheets") else False,
+        "selected_finishings": [f.get("name") for f in (breakdown.get("finishings") or [])],
+        "suggested_finishings": [],
+        "warnings": preview.get("explanations") or [],
     }
 
 
+def _extract_pricing_breakdown(preview: dict[str, Any]) -> dict[str, Any]:
+    totals = preview.get("totals") or {}
+    breakdown = preview.get("breakdown") or {}
+    per_sheet = breakdown.get("per_sheet_pricing") or {}
+    
+    return {
+        "currency": preview.get("currency") or "KES",
+        "paper_price": _as_float(per_sheet.get("paper_price")),
+        "print_price_front": _as_float(per_sheet.get("print_price_front")),
+        "print_price_back": _as_float(per_sheet.get("print_price_back")),
+        "total_per_sheet": _as_float(per_sheet.get("total_per_sheet")),
+        "estimated_total": _as_float(totals.get("grand_total")),
+        "price_range": None,
+        "formula": per_sheet.get("formula"),
+        "lines": [
+            {"label": item.get("label"), "amount": item.get("amount"), "formula": item.get("formula")}
+            for item in (preview.get("calculation_result", {}).get("line_items") or [])
+        ]
+    }
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value))
+    except (ValueError, TypeError):
+        return None
+
+
 def _paper_label(paper: Paper) -> str:
-    return f"{paper.sheet_size} {paper.gsm}gsm {paper.get_paper_type_display()}"
+    return paper.marketplace_label
 
 
 def _build_marketplace_summary(successful_rows: list[dict[str, Any]], failed_rows: list[dict[str, Any]]) -> str:
@@ -778,6 +979,8 @@ def _preview_booklet_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, 
             reason="Shop does not have papers set up for booklet printing." if not cover_paper or not insert_paper else "Booklet size is required.",
             missing_fields=missing_fields,
             similarity_score=_booklet_similarity_score(shop, payload, False),
+            quote_basis="insufficient_data",
+            payload=payload,
         )
 
     binding_type = payload.get("binding_type", "saddle_stitch")
@@ -816,6 +1019,8 @@ def _preview_booklet_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, 
             can_calculate=False,
             reason="Could not price this booklet spec for this shop.",
             similarity_score=_booklet_similarity_score(shop, payload, False, cover_paper=cover_paper, insert_paper=insert_paper),
+            quote_basis="manual_quote",
+            payload=payload,
         )
 
     if result.get("can_calculate") is False:
@@ -824,6 +1029,8 @@ def _preview_booklet_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, 
             can_calculate=False,
             reason=result.get("reason") or "Booklet pricing failed for this shop.",
             similarity_score=_booklet_similarity_score(shop, payload, False, cover_paper=cover_paper, insert_paper=insert_paper),
+            quote_basis="manual_quote",
+            payload=payload,
         )
 
     grand_total = result.get("totals", {}).get("grand_total")
@@ -847,6 +1054,8 @@ def _preview_booklet_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, 
         selection=selection,
         similarity_score=_booklet_similarity_score(shop, payload, True, cover_paper=cover_paper, insert_paper=insert_paper),
         exact_or_estimated=True,
+        quote_basis="rate_card",
+        payload=payload,
     )
     return _attach_turnaround(shop, row, payload)
 
@@ -886,28 +1095,51 @@ def _booklet_similarity_score(
     cover_paper: Paper | None = None,
     insert_paper: Paper | None = None,
 ) -> float:
+    score = 0.0
+    
+    # same product/category: +30
+    score += _product_availability_score(shop, "booklet") * 2
+    if can_calculate:
+        score += 30.0
+
+    # paper exact/similar: +25
+    if cover_paper:
+        requested_cover_gsm = payload.get("cover_paper_gsm")
+        if requested_cover_gsm:
+            gsm_gap = abs(int(cover_paper.gsm) - int(requested_cover_gsm))
+            score += max(0.0, 10.0 - float(gsm_gap) / 10.0)
+        requested_cover_type = (payload.get("cover_paper_type") or "").strip().lower()
+        if requested_cover_type:
+            paper_type = (cover_paper.get_paper_type_display() or cover_paper.paper_type or "").strip().lower()
+            if requested_cover_type in paper_type:
+                score += 5.0
+                
+    if insert_paper:
+        requested_insert_gsm = payload.get("insert_paper_gsm")
+        if requested_insert_gsm:
+            gsm_gap = abs(int(insert_paper.gsm) - int(requested_insert_gsm))
+            score += max(0.0, 5.0 - float(gsm_gap) / 10.0)
+        requested_insert_type = (payload.get("insert_paper_type") or "").strip().lower()
+        if requested_insert_type:
+            paper_type = (insert_paper.get_paper_type_display() or insert_paper.paper_type or "").strip().lower()
+            if requested_insert_type in paper_type:
+                score += 5.0
+
+    # finishing exact/similar: +20
+    if can_calculate:
+        score += 20.0
+    
+    # pricing rates available: +15
+    if getattr(shop, "pricing_ready", False):
+        score += 15.0
+        
+    # can handle quantity/dimensions: +10
+    if can_calculate:
+        score += 10.0
+
+    # Distance bonus
     distance_km = _distance_km_for_payload(shop, payload)
-    score = 45.0 if can_calculate else 5.0
-    score += _pricing_readiness_score(shop)
-    score += _product_availability_score(shop, "booklet")
-    requested_cover_gsm = payload.get("cover_paper_gsm")
-    if cover_paper and requested_cover_gsm:
-        gsm_gap = abs(int(cover_paper.gsm) - int(requested_cover_gsm))
-        score += max(0.0, 10.0 - float(gsm_gap) / 10.0)
-    requested_cover_type = (payload.get("cover_paper_type") or "").strip().lower()
-    if cover_paper and requested_cover_type:
-        paper_type = (cover_paper.get_paper_type_display() or cover_paper.paper_type or "").strip().lower()
-        if requested_cover_type in paper_type:
-            score += 10.0
-    requested_insert_gsm = payload.get("insert_paper_gsm")
-    if insert_paper and requested_insert_gsm:
-        gsm_gap = abs(int(insert_paper.gsm) - int(requested_insert_gsm))
-        score += max(0.0, 10.0 - float(gsm_gap) / 10.0)
-    requested_insert_type = (payload.get("insert_paper_type") or "").strip().lower()
-    if insert_paper and requested_insert_type:
-        paper_type = (insert_paper.get_paper_type_display() or insert_paper.paper_type or "").strip().lower()
-        if requested_insert_type in paper_type:
-            score += 10.0
     if distance_km is not None:
-        score += max(0.0, 15.0 - min(distance_km, 30.0) / 2.0)
-    return round(score, 2)
+        score += max(0.0, 10.0 - min(distance_km, 50.0) / 5.0)
+
+    return round(min(score, 100.0), 2)

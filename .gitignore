@@ -7,6 +7,15 @@ env/
 .env
 .env.local
 .env.*.local
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+secret/
+credentials/
+credentials.*
 
 # Byte-compiled
 __pycache__/

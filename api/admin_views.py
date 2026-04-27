@@ -3,6 +3,7 @@ Base views for super admin analytics endpoints.
 
 Any analytics endpoint added here should remain superuser-only.
 """
+from collections import Counter
 from datetime import timedelta
 
 from django.db.models import Case, CharField, Count, F, Max, Q, Value, When
@@ -68,6 +69,25 @@ def get_search_term_expression():
         Value(""),
         output_field=CharField(),
     )
+
+
+def _safe_json_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _first_non_empty(*values):
+    for value in values:
+        normalized = str(value or "").strip()
+        if normalized:
+            return normalized
+    return ""
+
+
+def _top_counter_rows(counter, *, limit):
+    return [
+        {"label": label, "count": count}
+        for label, count in sorted(counter.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    ]
 
 
 class SuperAdminAnalyticsAPIView(APIView):
@@ -150,14 +170,21 @@ class AnalyticsDashboardSummaryView(SuperAdminAnalyticsAPIView):
             .order_by("-count", "label")[:10]
         )
 
-        top_searches = list(
-            AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.SEARCH)
-            .annotate(search_term=get_search_term_expression())
-            .exclude(search_term="")
-            .values(label=F("search_term"))
-            .annotate(count=Count("id"))
-            .order_by("-count", "label")[:10]
-        )
+        search_counter = Counter()
+        for row in AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.SEARCH).values("metadata", "query_params"):
+            metadata = _safe_json_dict(row.get("metadata"))
+            query_params = _safe_json_dict(row.get("query_params"))
+            label = _first_non_empty(
+                metadata.get("search_term"),
+                metadata.get("search"),
+                metadata.get("query"),
+                metadata.get("q"),
+                query_params.get("q"),
+                query_params.get("query"),
+            )
+            if label:
+                search_counter[label] += 1
+        top_searches = _top_counter_rows(search_counter, limit=10)
 
         payload = {
             "total_visits_today": visits_today.count(),
@@ -280,78 +307,55 @@ class AnalyticsTopMetricsView(SuperAdminAnalyticsAPIView):
     """Top viewed entities and high-signal discovery metrics."""
 
     def get(self, request):
-        top_viewed_products = list(
-            {
-                "label": row["label"],
-                "slug": row["slug"],
-                "path": row["path_value"],
-                "count": row["count"],
-            }
-            for row in (
-                AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.PRODUCT_VIEW)
-                .annotate(
-                    label=Coalesce(
-                        F("metadata__product_name"),
-                        F("metadata__name"),
-                        F("path"),
-                        Value(""),
-                        output_field=CharField(),
-                    ),
-                    slug=Coalesce(
-                        F("metadata__product_slug"),
-                        F("metadata__slug"),
-                        Value(""),
-                        output_field=CharField(),
-                    ),
-                    path_value=Coalesce(F("path"), Value(""), output_field=CharField()),
-                )
-                .exclude(label="")
-                .values("label", "slug", "path_value")
-                .annotate(count=Count("id"))
-                .order_by("-count", "label")[:10]
-            )
-        )
+        product_counter = Counter()
+        product_rows = {}
+        for row in AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.PRODUCT_VIEW).values("metadata", "path"):
+            metadata = _safe_json_dict(row.get("metadata"))
+            path_value = _first_non_empty(row.get("path"))
+            label = _first_non_empty(metadata.get("product_name"), metadata.get("name"), path_value)
+            if not label:
+                continue
+            slug = _first_non_empty(metadata.get("product_slug"), metadata.get("slug"))
+            key = (label, slug, path_value)
+            product_counter[key] += 1
+            product_rows[key] = {"label": label, "slug": slug, "path": path_value}
+        top_viewed_products = [
+            {**product_rows[key], "count": count}
+            for key, count in sorted(product_counter.items(), key=lambda item: (-item[1], item[0][0]))[:10]
+        ]
 
-        top_viewed_shops = list(
-            {
-                "label": row["label"],
-                "slug": row["slug"],
-                "path": row["path_value"],
-                "count": row["count"],
-            }
-            for row in (
-                AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.SHOP_VIEW)
-                .annotate(
-                    label=Coalesce(
-                        F("metadata__shop_name"),
-                        F("metadata__name"),
-                        F("path"),
-                        Value(""),
-                        output_field=CharField(),
-                    ),
-                    slug=Coalesce(
-                        F("metadata__shop_slug"),
-                        F("metadata__slug"),
-                        Value(""),
-                        output_field=CharField(),
-                    ),
-                    path_value=Coalesce(F("path"), Value(""), output_field=CharField()),
-                )
-                .exclude(label="")
-                .values("label", "slug", "path_value")
-                .annotate(count=Count("id"))
-                .order_by("-count", "label")[:10]
-            )
-        )
+        shop_counter = Counter()
+        shop_rows = {}
+        for row in AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.SHOP_VIEW).values("metadata", "path"):
+            metadata = _safe_json_dict(row.get("metadata"))
+            path_value = _first_non_empty(row.get("path"))
+            label = _first_non_empty(metadata.get("shop_name"), metadata.get("name"), path_value)
+            if not label:
+                continue
+            slug = _first_non_empty(metadata.get("shop_slug"), metadata.get("slug"))
+            key = (label, slug, path_value)
+            shop_counter[key] += 1
+            shop_rows[key] = {"label": label, "slug": slug, "path": path_value}
+        top_viewed_shops = [
+            {**shop_rows[key], "count": count}
+            for key, count in sorted(shop_counter.items(), key=lambda item: (-item[1], item[0][0]))[:10]
+        ]
 
-        top_searched_keywords = list(
-            AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.SEARCH)
-            .annotate(label=get_search_term_expression())
-            .exclude(label="")
-            .values("label")
-            .annotate(count=Count("id"))
-            .order_by("-count", "label")[:10]
-        )
+        search_counter = Counter()
+        for row in AnalyticsEvent.objects.filter(event_type=AnalyticsEvent.EventType.SEARCH).values("metadata", "query_params"):
+            metadata = _safe_json_dict(row.get("metadata"))
+            query_params = _safe_json_dict(row.get("query_params"))
+            label = _first_non_empty(
+                metadata.get("search_term"),
+                metadata.get("search"),
+                metadata.get("query"),
+                metadata.get("q"),
+                query_params.get("q"),
+                query_params.get("query"),
+            )
+            if label:
+                search_counter[label] += 1
+        top_searched_keywords = _top_counter_rows(search_counter, limit=10)
 
         current_host = request.get_host().split(":")[0].strip().lower()
         landing_page_filter = Q(referer="") | Q(referer__isnull=True)

@@ -1,11 +1,15 @@
 from django.db.models import Count, OuterRef, Q, Subquery
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.services.roles import is_client
+from notifications.models import Notification
+from notifications.services import notify_quote_event
+from quotes.choices import ShopQuoteStatus
 from quotes.models import QuoteDraft, QuoteRequest, ShopQuote
 from quotes.services_workflow import (
     create_quote_response,
@@ -17,6 +21,8 @@ from quotes.services_workflow import (
 from services.pricing.quote_builder import build_quote_preview
 from services.pricing.booklet_builder import build_booklet_preview
 from services.pricing.large_format_builder import build_large_format_preview
+from services.pricing.calculator_config import get_calculator_config
+from services.pricing.calculator_preview import build_public_calculator_preview
 from setup.services import get_setup_status_for_shop, get_setup_status_for_user
 from shops.models import Shop
 from shops.services import can_manage_quotes, can_manage_shop
@@ -24,6 +30,7 @@ from shops.services import can_manage_quotes, can_manage_shop
 from .workflow_serializers import (
     CalculatorPreviewSerializer,
     BookletCalculatorPreviewSerializer,
+    CalculatorConfigPreviewSerializer,
     DashboardQuoteRequestSummarySerializer,
     LargeFormatCalculatorPreviewSerializer,
     QuoteDraftCreateSerializer,
@@ -35,6 +42,7 @@ from .workflow_serializers import (
     QuoteResponseReadSerializer,
     QuoteResponseUpdateSerializer,
 )
+from .public_matching_serializers import PublicCalculatorResponseSerializer
 
 
 class SetupStatusCompatView(APIView):
@@ -77,6 +85,38 @@ class CalculatorPreviewView(APIView):
         return Response(pricing)
 
 
+class CalculatorConfigView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        return Response(get_calculator_config())
+
+
+class CalculatorConfigPreviewView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        """
+        Public homepage calculator preview.
+
+        Example payload for DRF/curl:
+        {
+          "product_type": "business_card",
+          "quantity": 100,
+          "finished_size": "85x55mm",
+          "print_sides": "DUPLEX",
+          "color_mode": "COLOR",
+          "requested_paper_category": "matt",
+          "requested_gsm": 300,
+          "lamination": "matt-lamination"
+        }
+        """
+        serializer = CalculatorConfigPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        response = build_public_calculator_preview(serializer.validated_data)
+        return Response(PublicCalculatorResponseSerializer(response).data)
+
+
 class BookletCalculatorPreviewView(APIView):
     permission_classes = [AllowAny]
 
@@ -89,10 +129,10 @@ class BookletCalculatorPreviewView(APIView):
             quantity=validated["quantity"],
             width_mm=validated["width_mm"],
             height_mm=validated["height_mm"],
-            total_pages=validated["total_pages"],
+            total_pages=validated.get("total_pages"),
             binding_type=validated["binding_type"],
-            cover_paper=validated["cover_paper"],
-            insert_paper=validated["insert_paper"],
+            cover_paper=validated.get("cover_paper"),
+            insert_paper=validated.get("insert_paper"),
             cover_sides=validated["cover_sides"],
             insert_sides=validated["insert_sides"],
             cover_color_mode=validated["cover_color_mode"],
@@ -235,6 +275,8 @@ class QuoteResponseListCreateView(APIView):
         if not is_owner and not can_manage:
             return Response({"detail": "You cannot access responses for this quote request."}, status=status.HTTP_403_FORBIDDEN)
         responses = quote_request.shop_quotes.order_by("-created_at")
+        if is_owner and not can_manage:
+            responses = responses.exclude(status=ShopQuoteStatus.PENDING)
         return Response(QuoteResponseReadSerializer(responses, many=True).data)
 
     def post(self, request, request_id):
@@ -254,6 +296,19 @@ class QuoteResponseListCreateView(APIView):
             note=serializer.validated_data.get("note", ""),
             turnaround_days=serializer.validated_data.get("turnaround_days"),
         )
+        if (
+            response.status != ShopQuoteStatus.PENDING
+            and quote_request.created_by_id
+            and quote_request.created_by_id != request.user.id
+        ):
+            notify_quote_event(
+                recipient=quote_request.created_by,
+                notification_type=Notification.SHOP_QUOTE_SENT,
+                message=f"{quote_request.shop.name} sent a quote for request #{quote_request.id}.",
+                object_type="quote_request",
+                object_id=quote_request.id,
+                actor=request.user,
+            )
         return Response(QuoteResponseReadSerializer(response).data, status=status.HTTP_201_CREATED)
 
 
@@ -280,6 +335,19 @@ class QuoteResponseDetailView(APIView):
             updated = update_quote_response(response=response, **serializer.validated_data)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        if (
+            updated.status != ShopQuoteStatus.PENDING
+            and updated.quote_request.created_by_id
+            and updated.quote_request.created_by_id != request.user.id
+        ):
+            notify_quote_event(
+                recipient=updated.quote_request.created_by,
+                notification_type=Notification.SHOP_QUOTE_REVISED,
+                message=f"{updated.shop.name} revised the quote for request #{updated.quote_request.id}.",
+                object_type="shop_quote",
+                object_id=updated.id,
+                actor=request.user,
+            )
         return Response(QuoteResponseReadSerializer(updated).data)
 
 
@@ -311,14 +379,39 @@ class ShopHomeDashboardView(APIView):
             accepted=Count("id", filter=Q(latest_response_status="accepted")),
             rejected=Count("id", filter=Q(latest_response_status="rejected")),
         )
+        responded_requests = received.exclude(latest_response_id__isnull=True)
+        response_durations_hours = []
+        for request_row in responded_requests:
+            response_at = getattr(request_row, "latest_response_sent_at", None) or getattr(request_row, "latest_response_created_at", None)
+            created_at = getattr(request_row, "created_at", None)
+            if not response_at or not created_at:
+                continue
+            response_durations_hours.append(max((response_at - created_at).total_seconds(), 0) / 3600)
+
+        average_response_hours = (
+            round(sum(response_durations_hours) / len(response_durations_hours), 2)
+            if response_durations_hours
+            else None
+        )
+        stale_requests_count = received.filter(
+            latest_response_id__isnull=True,
+            created_at__lt=timezone.now() - timezone.timedelta(hours=24),
+        ).count()
 
         return Response(
             {
                 "shop": {"id": shop.id, "name": shop.name, "slug": shop.slug},
+                "new_quote_requests": received.count(),
                 "received_quote_requests": received.count(),
+                "pending_responses_count": status_buckets["pending"],
+                "responded_requests_count": responded_requests.count(),
+                "accepted_quotes_count": status_buckets["accepted"],
+                "average_response_hours": average_response_hours,
+                "stale_requests_count": stale_requests_count,
                 "status_counts": {
                     "pending": status_buckets["pending"],
                     "modified": status_buckets["modified"],
+                    "responded": responded_requests.count(),
                     "accepted": status_buckets["accepted"],
                     "rejected": status_buckets["rejected"],
                 },

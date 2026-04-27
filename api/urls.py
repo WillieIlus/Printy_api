@@ -71,6 +71,8 @@ notifications_router.register(r"", NotificationViewSet, basename="notification")
 urlpatterns = [
     path("setup-status/", workflow_views.SetupStatusCompatView.as_view(), name="setup-status-compat"),
     path("shops/<slug:shop_slug>/setup-status/", workflow_views.ShopSetupStatusCompatView.as_view(), name="shop-setup-status-compat"),
+    path("calculator/config/", workflow_views.CalculatorConfigView.as_view(), name="calculator-config"),
+    path("calculator/public-preview/", workflow_views.CalculatorConfigPreviewView.as_view(), name="calculator-public-preview"),
     path("calculator/preview/", workflow_views.CalculatorPreviewView.as_view(), name="calculator-preview"),
     path("calculator/booklet-preview/", workflow_views.BookletCalculatorPreviewView.as_view(), name="calculator-booklet-preview"),
     path("calculator/large-format-preview/", workflow_views.LargeFormatCalculatorPreviewView.as_view(), name="calculator-large-format-preview"),
@@ -96,6 +98,7 @@ urlpatterns = [
     path("", include(finishing_category_router.urls)),
     path("public/products/", views.PublicAllProductsView.as_view(), name="public-all-products"),
     path("public/match-shops/", public_matching_views.PublicMatchShopsView.as_view(), name="public-match-shops"),
+    path("public/calculator/preview/", public_matching_views.PublicMatchShopsView.as_view(), name="public-calculator-preview"),
     path("public/match-shops/booklet/", public_matching_views.PublicMatchBookletShopsView.as_view(), name="public-match-booklet-shops"),
     # SEO (public, no auth — for sitemap and dynamic pages)
     path("seo/locations/", SEOLocationsView.as_view(), name="seo-locations"),

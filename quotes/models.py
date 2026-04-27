@@ -123,22 +123,14 @@ class QuoteRequest(TimeStampedModel):
     Lifecycle: draft → submitted → [viewed] → quoted → accepted | closed | cancelled.
     """
 
-    DRAFT = "draft"
-    SUBMITTED = "submitted"
-    VIEWED = "viewed"
-    QUOTED = "quoted"
-    ACCEPTED = "accepted"
-    CLOSED = "closed"
-    CANCELLED = "cancelled"
-    STATUS_CHOICES = [
-        (DRAFT, "Draft"),
-        (SUBMITTED, "Submitted"),
-        (VIEWED, "Viewed"),
-        (QUOTED, "Quoted"),
-        (ACCEPTED, "Accepted"),
-        (CLOSED, "Closed"),
-        (CANCELLED, "Cancelled"),
-    ]
+    DRAFT = QuoteStatus.DRAFT
+    SUBMITTED = QuoteStatus.SUBMITTED
+    VIEWED = QuoteStatus.VIEWED
+    QUOTED = QuoteStatus.QUOTED
+    ACCEPTED = QuoteStatus.ACCEPTED
+    CLOSED = QuoteStatus.CLOSED
+    CANCELLED = QuoteStatus.CANCELLED
+    STATUS_CHOICES = QuoteStatus.choices
 
     objects = QuoteRequestQuerySet.as_manager()
     shop = models.ForeignKey(
@@ -176,7 +168,7 @@ class QuoteRequest(TimeStampedModel):
         help_text=_("Phone number of the customer."),
     )
     status = models.CharField(
-        max_length=20,
+        max_length=32,
         choices=STATUS_CHOICES,
         default=DRAFT,
         verbose_name=_("status"),
@@ -286,7 +278,7 @@ class QuoteRequest(TimeStampedModel):
         ).order_by("-sent_at", "-created_at").first()
 
     def get_latest_response(self):
-        return self.shop_quotes.order_by("-created_at", "-id").first()
+        return self.shop_quotes.exclude(status=ShopQuote.PENDING).order_by("-created_at", "-id").first()
 
 
 class ShopQuote(TimeStampedModel):

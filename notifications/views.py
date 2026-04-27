@@ -79,7 +79,10 @@ class NotificationViewSet(ReadOnlyModelViewSet):
         my_request_ids = list(my_requests.values_list("id", flat=True))
 
         shop_unread_request_notifications = unread_notifications.filter(
-            notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+            notification_type__in=[
+                Notification.QUOTE_REQUEST_SUBMITTED,
+                Notification.BUYER_CLARIFICATION_SENT,
+            ],
             object_id__in=submitted_shop_request_ids + awaiting_shop_action_ids,
         )
 
@@ -112,11 +115,12 @@ class NotificationViewSet(ReadOnlyModelViewSet):
                     ]
                 ).values("object_id").distinct().count(),
                 "shop_replies": client_unread_request_notifications.filter(
-                    notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+                    notification_type=Notification.SHOP_QUESTION_ASKED,
                     object_id__in=awaiting_client_reply_ids,
                 ).values("object_id").distinct().count(),
                 "request_updates": client_unread_request_notifications.filter(
                     notification_type__in=[
+                        Notification.QUOTE_REQUEST_SENT,
                         Notification.REQUEST_DECLINED,
                         Notification.QUOTE_REQUEST_CANCELLED,
                     ]

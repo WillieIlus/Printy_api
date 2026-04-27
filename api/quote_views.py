@@ -5,6 +5,7 @@ A. Customer: /quote-requests/ — create, list, retrieve, submit, accept, cancel
 B. Shop: /shops/<slug>/incoming-requests/ — list, retrieve, send-quote, mark-viewed, decline
 C. Shop: /sent-quotes/<id>/ — retrieve, partial_update (revise), create-job
 """
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -14,8 +15,11 @@ from .permissions import IsQuoteRequestBuyer, IsQuoteRequestSeller, IsShopQuoteO
 from rest_framework.response import Response
 
 from notifications.models import Notification
+from notifications.services import notify_quote_event
 from quotes.choices import QuoteStatus, ShopQuoteStatus
 from quotes.models import QuoteRequest, QuoteRequestAttachment, QuoteRequestMessage, ShopQuote, ShopQuoteAttachment
+from quotes.draft_pdf import render_quote_draft_pdf
+from quotes.request_brief import build_quote_request_brief, build_quote_request_whatsapp_handoff
 from shops.models import Shop
 
 from .quote_serializers import (
@@ -48,6 +52,27 @@ def _create_request_message(*, quote_request, sender=None, sender_role="system",
         shop_quote=shop_quote,
         metadata=metadata or {},
     )
+
+
+def _quote_request_brief_response(*, quote_request, viewer_role: str, include_buyer_contact: bool):
+    return Response(
+        build_quote_request_brief(
+            quote_request,
+            include_buyer_contact=include_buyer_contact,
+            viewer_role=viewer_role,
+        )
+    )
+
+
+def _quote_request_whatsapp_response(*, quote_request, viewer_role: str):
+    return Response(build_quote_request_whatsapp_handoff(quote_request, viewer_role=viewer_role))
+
+
+def _quote_request_pdf_response(*, quote_request):
+    pdf_bytes = render_quote_draft_pdf(quote_request)
+    response = HttpResponse(pdf_bytes, content_type="application/pdf")
+    response["Content-Disposition"] = f'attachment; filename="quote-request-{quote_request.id}.pdf"'
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -111,10 +136,28 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             )
         return super().update(request, *args, **kwargs)
 
+    @action(detail=True, methods=["get"], url_path="brief")
+    def brief(self, request, pk=None):
+        qr = self.get_object()
+        return _quote_request_brief_response(
+            quote_request=qr,
+            viewer_role="buyer",
+            include_buyer_contact=True,
+        )
+
+    @action(detail=True, methods=["get"], url_path="whatsapp-handoff")
+    def whatsapp_handoff(self, request, pk=None):
+        qr = self.get_object()
+        return _quote_request_whatsapp_response(quote_request=qr, viewer_role="buyer")
+
+    @action(detail=True, methods=["get"], url_path="download-pdf")
+    def download_pdf(self, request, pk=None):
+        qr = self.get_object()
+        return _quote_request_pdf_response(quote_request=qr)
+
     @action(detail=True, methods=["post"], url_path="submit")
     def submit(self, request, pk=None):
         """Submit draft (status -> submitted)."""
-        from notifications.services import notify
 
         qr = self.get_object()
         if qr.status != QuoteStatus.DRAFT:
@@ -133,14 +176,22 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             metadata={"status": QuoteStatus.SUBMITTED},
         )
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
-            notify(
+            notify_quote_event(
                 recipient=qr.shop.owner,
                 notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
-                message=f"New quote request #{qr.id} from {qr.customer_name or 'customer'}",
+                message=f"New quote request #{qr.id} from {qr.customer_name or 'customer'}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
             )
+        notify_quote_event(
+            recipient=request.user,
+            notification_type=Notification.QUOTE_REQUEST_SENT,
+            message=f"Your quote request #{qr.id} was sent to {qr.shop.name}.",
+            object_type="quote_request",
+            object_id=qr.id,
+            actor=request.user,
+        )
         return Response(QuoteRequestCustomerDetailSerializer(qr).data)
 
     @action(detail=True, methods=["post"], url_path="accept")
@@ -179,12 +230,10 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             metadata={"quote_status": ShopQuoteStatus.ACCEPTED},
         )
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
-            from notifications.services import notify
-
-            notify(
+            notify_quote_event(
                 recipient=qr.shop.owner,
                 notification_type=Notification.SHOP_QUOTE_ACCEPTED,
-                message=f"Your quote for request #{qr.id} was accepted",
+                message=f"Your quote for request #{qr.id} was accepted.",
                 object_type="shop_quote",
                 object_id=shop_quote.id,
                 actor=request.user,
@@ -212,12 +261,10 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
         qr.status = QuoteStatus.AWAITING_SHOP_ACTION
         qr.save(update_fields=["status", "updated_at"])
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
-            from notifications.services import notify
-
-            notify(
+            notify_quote_event(
                 recipient=qr.shop.owner,
-                notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
-                message=f"{qr.customer_name or 'Client'} replied to request #{qr.id}",
+                notification_type=Notification.BUYER_CLARIFICATION_SENT,
+                message=f"{qr.customer_name or 'Client'} replied to request #{qr.id}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -249,12 +296,10 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             metadata={"status": QuoteStatus.CANCELLED},
         )
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
-            from notifications.services import notify
-
-            notify(
+            notify_quote_event(
                 recipient=qr.shop.owner,
                 notification_type=Notification.QUOTE_REQUEST_CANCELLED,
-                message=f"Quote request #{qr.id} was cancelled",
+                message=f"Quote request #{qr.id} was cancelled.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -316,6 +361,31 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
             return Response({"detail": "Not your shop."}, status=status.HTTP_403_FORBIDDEN)
         return super().retrieve(request, *args, **kwargs)
 
+    @action(detail=True, methods=["get"], url_path="brief")
+    def brief(self, request, shop_slug=None, request_id=None):
+        if not self.check_shop_owner():
+            return Response({"detail": "Not your shop."}, status=status.HTTP_403_FORBIDDEN)
+        qr = self.get_object()
+        return _quote_request_brief_response(
+            quote_request=qr,
+            viewer_role="shop",
+            include_buyer_contact=True,
+        )
+
+    @action(detail=True, methods=["get"], url_path="whatsapp-handoff")
+    def whatsapp_handoff(self, request, shop_slug=None, request_id=None):
+        if not self.check_shop_owner():
+            return Response({"detail": "Not your shop."}, status=status.HTTP_403_FORBIDDEN)
+        qr = self.get_object()
+        return _quote_request_whatsapp_response(quote_request=qr, viewer_role="shop")
+
+    @action(detail=True, methods=["get"], url_path="download-pdf")
+    def download_pdf(self, request, shop_slug=None, request_id=None):
+        if not self.check_shop_owner():
+            return Response({"detail": "Not your shop."}, status=status.HTTP_403_FORBIDDEN)
+        qr = self.get_object()
+        return _quote_request_pdf_response(quote_request=qr)
+
     @action(detail=True, methods=["post"], url_path="accept-request")
     def accept_request(self, request, shop_slug=None, request_id=None):
         if not self.check_shop_owner():
@@ -355,12 +425,10 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
             metadata={"status": QuoteStatus.AWAITING_CLIENT_REPLY},
         )
         if qr.created_by_id and qr.created_by_id != request.user.id:
-            from notifications.services import notify
-
-            notify(
+            notify_quote_event(
                 recipient=qr.created_by,
-                notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
-                message=f"{qr.shop.name} asked a question about request #{qr.id}",
+                notification_type=Notification.SHOP_QUESTION_ASKED,
+                message=f"{qr.shop.name} asked a question about request #{qr.id}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -387,12 +455,10 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
             metadata={"status": QuoteStatus.REJECTED},
         )
         if qr.created_by_id and qr.created_by_id != request.user.id:
-            from notifications.services import notify
-
-            notify(
+            notify_quote_event(
                 recipient=qr.created_by,
                 notification_type=Notification.REQUEST_DECLINED,
-                message=f"{qr.shop.name} rejected your quote request #{qr.id}",
+                message=f"{qr.shop.name} declined request #{qr.id}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -430,42 +496,59 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
             total = serializer.validated_data.get("total")
             if total is None:
                 total = sum((i.line_total or 0) for i in qr.items.all())
+            quote_status = serializer.validated_data.get("status", ShopQuoteStatus.SENT)
             now = timezone.now()
-            shop_quote = serializer.save()
+            pending_quote = qr.shop_quotes.filter(status=ShopQuoteStatus.PENDING).order_by("-created_at").first()
+            if pending_quote:
+                update_serializer = ShopQuoteUpdateSerializer(
+                    pending_quote,
+                    data={**request.data, "total": total},
+                    partial=True,
+                )
+                update_serializer.is_valid(raise_exception=True)
+                shop_quote = update_serializer.save(status=quote_status)
+            else:
+                shop_quote = serializer.save()
             from quotes.summary_service import get_shop_quote_summary_text
 
             shop_quote.total = total
-            shop_quote.sent_at = now
-            shop_quote.pricing_locked_at = now
+            if quote_status != ShopQuoteStatus.PENDING:
+                shop_quote.sent_at = now
+                shop_quote.pricing_locked_at = now
             shop_quote.whatsapp_message = get_shop_quote_summary_text(shop_quote)
-            shop_quote.save(update_fields=["total", "sent_at", "pricing_locked_at", "whatsapp_message", "updated_at"])
-            qr.items.update(shop_quote=shop_quote)
-            qr.status = QuoteStatus.QUOTED
-            qr.save(update_fields=["status", "updated_at"])
-            _create_request_message(
-                quote_request=qr,
-                sender=request.user,
-                sender_role="shop",
-                message_kind="quote",
-                body=serializer.validated_data.get("note", "") or "The shop sent a quote.",
-                shop_quote=shop_quote,
-                metadata={
-                    "status": QuoteStatus.QUOTED,
-                    "quote_status": shop_quote.status,
-                    "total": str(total),
-                    "turnaround_days": shop_quote.turnaround_days,
-                    "turnaround_hours": shop_quote.turnaround_hours,
-                    "estimated_ready_at": shop_quote.estimated_ready_at.isoformat() if shop_quote.estimated_ready_at else None,
-                    "human_ready_text": shop_quote.human_ready_text,
-                },
-            )
-        if qr.created_by_id and qr.created_by_id != request.user.id:
-            from notifications.services import notify
-
-            notify(
+            update_fields = ["total", "whatsapp_message", "updated_at"]
+            if quote_status != ShopQuoteStatus.PENDING:
+                update_fields.extend(["sent_at", "pricing_locked_at"])
+            shop_quote.save(update_fields=update_fields)
+            if quote_status != ShopQuoteStatus.PENDING:
+                qr.items.update(shop_quote=shop_quote)
+                qr.status = QuoteStatus.QUOTED
+                qr.save(update_fields=["status", "updated_at"])
+                _create_request_message(
+                    quote_request=qr,
+                    sender=request.user,
+                    sender_role="shop",
+                    message_kind="quote",
+                    body=serializer.validated_data.get("note", "") or "The shop sent a quote.",
+                    shop_quote=shop_quote,
+                    metadata={
+                        "status": QuoteStatus.QUOTED,
+                        "quote_status": shop_quote.status,
+                        "total": str(total),
+                        "turnaround_days": shop_quote.turnaround_days,
+                        "turnaround_hours": shop_quote.turnaround_hours,
+                        "estimated_ready_at": shop_quote.estimated_ready_at.isoformat() if shop_quote.estimated_ready_at else None,
+                        "human_ready_text": shop_quote.human_ready_text,
+                    },
+                )
+            else:
+                qr.status = QuoteStatus.AWAITING_SHOP_ACTION
+                qr.save(update_fields=["status", "updated_at"])
+        if quote_status != ShopQuoteStatus.PENDING and qr.created_by_id and qr.created_by_id != request.user.id:
+            notify_quote_event(
                 recipient=qr.created_by,
                 notification_type=Notification.SHOP_QUOTE_SENT,
-                message=f"{qr.shop.name} sent you a quote for request #{qr.id}",
+                message=f"{qr.shop.name} sent a quote for request #{qr.id}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -529,13 +612,17 @@ class ShopQuoteViewSet(viewsets.ModelViewSet):
         return ShopQuoteDetailSerializer
 
     def partial_update(self, request, *args, **kwargs):
-        from notifications.services import notify
-
         quote = self.get_object()
         if quote.shop.owner_id != request.user.id:
             return Response({"detail": "Not your shop quote."}, status=status.HTTP_403_FORBIDDEN)
         response = super().partial_update(request, *args, **kwargs)
         quote.refresh_from_db()
+        requested_status = request.data.get("status")
+        is_pending = quote.status == ShopQuoteStatus.PENDING or requested_status == ShopQuoteStatus.PENDING
+        if is_pending:
+            quote.quote_request.status = QuoteStatus.AWAITING_SHOP_ACTION
+            quote.quote_request.save(update_fields=["status", "updated_at"])
+            return response
         if quote.status != ShopQuoteStatus.REVISED:
             quote.status = ShopQuoteStatus.REVISED
         from quotes.summary_service import get_shop_quote_summary_text
@@ -563,10 +650,10 @@ class ShopQuoteViewSet(viewsets.ModelViewSet):
         qr.status = QuoteStatus.QUOTED
         qr.save(update_fields=["status", "updated_at"])
         if qr.created_by_id and qr.created_by_id != request.user.id:
-            notify(
+            notify_quote_event(
                 recipient=qr.created_by,
                 notification_type=Notification.SHOP_QUOTE_REVISED,
-                message=f"{quote.shop.name} revised their quote for request #{qr.id}",
+                message=f"{quote.shop.name} revised the quote for request #{qr.id}.",
                 object_type="shop_quote",
                 object_id=quote.id,
                 actor=request.user,

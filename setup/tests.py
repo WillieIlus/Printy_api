@@ -5,7 +5,7 @@ from django.test import TestCase
 from accounts.models import User
 from catalog.models import Product
 from inventory.models import Machine, Paper
-from pricing.models import PrintingRate
+from pricing.models import FinishingRate, PrintingRate
 from shops.models import Shop
 
 from .services import get_setup_status, get_setup_status_for_shop, pricing_exists, get_product_publish_check
@@ -24,14 +24,34 @@ class SetupStatusTests(TestCase):
         Shop.objects.create(name="Test Shop", owner=self.user, currency="KES")
         status = get_setup_status(self.user)
         self.assertTrue(status["has_shop"])
-        self.assertEqual(status["next_step"], "machines")
+        self.assertEqual(status["next_step"], "profile")
 
     def test_full_setup_returns_done(self):
-        shop = Shop.objects.create(name="Test Shop", owner=self.user, currency="KES")
+        shop = Shop.objects.create(
+            name="Test Shop",
+            owner=self.user,
+            currency="KES",
+            description="Commercial print shop in Nairobi.",
+            business_email="hello@testshop.com",
+            phone_number="+254711111111",
+            address_line="Kimathi Street",
+            city="Nairobi",
+            country="Kenya",
+            is_public=True,
+        )
         machine = Machine.objects.create(name="Konica", shop=shop, machine_type="DIGITAL", max_width_mm=320, max_height_mm=450)
         Paper.objects.create(shop=shop, sheet_size="SRA3", gsm=300, paper_type="GLOSS", buying_price=Decimal("15"), selling_price=Decimal("24"), width_mm=320, height_mm=450)
         PrintingRate.objects.create(machine=machine, sheet_size="SRA3", color_mode="COLOR", single_price=Decimal("45"), double_price=Decimal("75"))
-        Product.objects.create(shop=shop, name="Business Card", pricing_mode="SHEET", default_finished_width_mm=90, default_finished_height_mm=54, status="PUBLISHED")
+        FinishingRate.objects.create(shop=shop, name="Gloss Lamination", slug="lamination", price=Decimal("12.00"))
+        Product.objects.create(
+            shop=shop,
+            name="Business Card",
+            pricing_mode="SHEET",
+            default_finished_width_mm=90,
+            default_finished_height_mm=54,
+            status="PUBLISHED",
+            standard_turnaround_hours=24,
+        )
         status = get_setup_status(self.user)
         self.assertEqual(status["next_step"], "done")
         self.assertTrue(status["pricing_ready"])
@@ -42,12 +62,58 @@ class SetupStatusTests(TestCase):
         status = get_setup_status_for_shop(shop)
         self.assertFalse(status["has_machines"])
         self.assertFalse(status["has_papers"])
-        self.assertEqual(status["next_step"], "machines")
+        self.assertFalse(status["shop_profile_complete"])
+        self.assertEqual(status["next_step"], "profile")
+        self.assertTrue(status["steps"])
+        self.assertEqual(status["steps"][0]["key"], "profile")
+        self.assertFalse(status["steps"][0]["done"])
+        self.assertTrue(status["steps"][1]["accessible"])
+        self.assertEqual(status["steps"][0]["cta_label"], "Complete now")
 
         Machine.objects.create(name="Konica", shop=shop, machine_type="DIGITAL", max_width_mm=320, max_height_mm=450)
+        shop.description = "Busy commercial printer."
+        shop.business_email = "team@prereq-shop.com"
+        shop.phone_number = "+254722222222"
+        shop.address_line = "Moi Avenue"
+        shop.save(update_fields=["description", "business_email", "phone_number", "address_line"])
         status = get_setup_status_for_shop(shop)
         self.assertTrue(status["has_machines"])
-        self.assertEqual(status["next_step"], "papers")
+        self.assertEqual(status["next_step"], "materials")
+        self.assertEqual(status["steps"][1]["key"], "materials")
+        self.assertTrue(status["steps"][1]["accessible"])
+        self.assertEqual(status["steps"][1]["cta_url"], "/dashboard/shop/materials")
+
+    def test_rate_card_readiness_fields_are_exposed(self):
+        shop = Shop.objects.create(
+            name="Ready Shop",
+            owner=self.user,
+            slug="ready-shop",
+            currency="KES",
+            description="Offset and digital printing.",
+            business_email="sales@ready-shop.com",
+            phone_number="+254733333333",
+            address_line="Westlands",
+            city="Nairobi",
+            country="Kenya",
+            is_public=True,
+        )
+        machine = Machine.objects.create(name="Konica", shop=shop, machine_type="DIGITAL", max_width_mm=320, max_height_mm=450)
+        Paper.objects.create(shop=shop, sheet_size="SRA3", gsm=300, paper_type="GLOSS", buying_price=Decimal("15"), selling_price=Decimal("24"), width_mm=320, height_mm=450)
+        PrintingRate.objects.create(machine=machine, sheet_size="SRA3", color_mode="COLOR", single_price=Decimal("45"), double_price=Decimal("75"))
+
+        status = get_setup_status_for_shop(shop)
+        self.assertTrue(status["shop_profile_complete"])
+        self.assertTrue(status["has_materials"])
+        self.assertEqual(status["materials_count"], 1)
+        self.assertTrue(status["has_pricing_rules"])
+        self.assertEqual(status["pricing_rules_count"], 1)
+        self.assertFalse(status["has_finishing_rates"])
+        self.assertFalse(status["turnaround_configured"])
+        self.assertTrue(status["shop_published"])
+        self.assertTrue(status["can_receive_requests"])
+        self.assertTrue(status["can_price_requests"])
+        self.assertEqual(status["rate_card_completeness"], 70)
+        self.assertIn("finishing rates", " ".join(status["warnings"]).lower())
 
 
 class PricingExistsTests(TestCase):

@@ -17,6 +17,12 @@ from .pricing.quote_builder import build_quote_preview
 from .pricing.engine import calculate_sheet_pricing
 from .quote_calculator import calculate_quote_item
 from .pricing.finishings import compute_finishing_line
+from .pricing.booklet import (
+    calculate_booklet_pricing,
+    cover_up_per_sheet,
+    insert_up_per_sheet,
+    normalize_pages,
+)
 
 
 class QuoteCalculatorTestCase(TestCase):
@@ -489,3 +495,129 @@ class QuoteCalculatorTestCase(TestCase):
         self.assertFalse(result.breakdown["printing"]["duplex_surcharge_applied"])
         self.assertEqual(result.breakdown["printing"]["total_per_sheet"], "75.00")
         self.assertEqual(result.totals["total_per_sheet"], "99.00")  # paper(24) + print(75)
+
+    def test_booklet_normalize_pages_helper(self):
+        self.assertEqual(normalize_pages(100), 100)
+        self.assertEqual(normalize_pages(98), 100)
+        self.assertEqual(normalize_pages(101), 104)
+
+    def test_booklet_imposition_helpers_match_sra3_rules(self):
+        self.assertEqual(cover_up_per_sheet("A4"), 1)
+        self.assertEqual(cover_up_per_sheet("A5"), 2)
+        self.assertEqual(insert_up_per_sheet("A4"), 2)
+        self.assertEqual(insert_up_per_sheet("A5"), 4)
+
+    def test_booklet_pricing_returns_backend_owned_page_and_sheet_fields(self):
+        lamination = FinishingRate.objects.create(
+            shop=self.shop,
+            name="Gloss Lamination",
+            slug="gloss-lamination",
+            charge_unit=ChargeUnit.PER_SHEET,
+            billing_basis=FinishingBillingBasis.PER_SHEET,
+            side_mode=FinishingSideMode.PER_SELECTED_SIDE,
+            price=Decimal("10.00"),
+            is_active=True,
+        )
+        stitching = FinishingRate.objects.create(
+            shop=self.shop,
+            name="Saddle stitch binding",
+            slug="saddle-stitch-binding",
+            charge_unit=ChargeUnit.PER_PIECE,
+            billing_basis=FinishingBillingBasis.PER_PIECE,
+            side_mode=FinishingSideMode.IGNORE_SIDES,
+            price=Decimal("20.00"),
+            is_active=True,
+        )
+        cutting = FinishingRate.objects.create(
+            shop=self.shop,
+            name="Cutting",
+            slug="cutting",
+            charge_unit=ChargeUnit.FLAT,
+            billing_basis=FinishingBillingBasis.FLAT_PER_JOB,
+            side_mode=FinishingSideMode.IGNORE_SIDES,
+            price=Decimal("50.00"),
+            is_active=True,
+        )
+
+        result = calculate_booklet_pricing(
+            shop=self.shop,
+            quantity=100,
+            width_mm=210,
+            height_mm=297,
+            total_pages=100,
+            binding_type="saddle_stitch",
+            cover_paper=self.paper,
+            insert_paper=self.paper,
+            cover_sides="DUPLEX",
+            insert_sides="DUPLEX",
+            cover_color_mode="COLOR",
+            insert_color_mode="COLOR",
+            cover_lamination_mode="front",
+            cover_lamination_finishing_rate=lamination,
+            binding_finishing_rate=stitching,
+            finishing_selections=[{"finishing_rate": cutting, "selected_side": "both"}],
+        )
+
+        self.assertTrue(result["can_calculate"])
+        self.assertEqual(result["normalized_pages"], 100)
+        self.assertEqual(result["cover_pages"], 4)
+        self.assertEqual(result["insert_pages"], 96)
+        self.assertEqual(result["cover_sheets"], 100)
+        self.assertEqual(result["insert_sheets"], 2400)
+        self.assertEqual(result["breakdown"]["lamination"], "1000.00")
+        self.assertEqual(result["breakdown"]["stitching"], "2000.00")
+        self.assertEqual(result["breakdown"]["cutting"], "50.00")
+        self.assertEqual(result["breakdown"]["booklet"]["cover_sheets"], 100)
+        self.assertEqual(result["breakdown"]["booklet"]["insert_sheets"], 2400)
+
+    def test_booklet_pricing_reports_blank_pages_added(self):
+        result = calculate_booklet_pricing(
+            shop=self.shop,
+            quantity=10,
+            width_mm=210,
+            height_mm=297,
+            total_pages=98,
+            binding_type="saddle_stitch",
+            cover_paper=self.paper,
+            insert_paper=self.paper,
+            cover_sides="DUPLEX",
+            insert_sides="DUPLEX",
+        )
+
+        self.assertTrue(result["can_calculate"])
+        self.assertEqual(result["normalized_pages"], 100)
+        self.assertEqual(result["blank_pages_added"], 2)
+        self.assertIn("rounded up to the next multiple of 4", " ".join(result["warnings"]).lower())
+
+        result = calculate_booklet_pricing(
+            shop=self.shop,
+            quantity=10,
+            width_mm=210,
+            height_mm=297,
+            total_pages=101,
+            binding_type="saddle_stitch",
+            cover_paper=self.paper,
+            insert_paper=self.paper,
+            cover_sides="DUPLEX",
+            insert_sides="DUPLEX",
+        )
+
+        self.assertEqual(result["normalized_pages"], 104)
+        self.assertEqual(result["blank_pages_added"], 3)
+
+    def test_booklet_pricing_handles_missing_cover_stock(self):
+        result = calculate_booklet_pricing(
+            shop=self.shop,
+            quantity=10,
+            width_mm=210,
+            height_mm=297,
+            total_pages=12,
+            binding_type="saddle_stitch",
+            cover_paper=None,
+            insert_paper=self.paper,
+            cover_sides="DUPLEX",
+            insert_sides="DUPLEX",
+        )
+
+        self.assertFalse(result["can_calculate"])
+        self.assertIn("cover_stock", result["missing_fields"])

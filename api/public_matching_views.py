@@ -19,6 +19,19 @@ from .public_matching_serializers import (
 
 
 class PublicMatchShopsView(APIView):
+    """
+    Public endpoint for marketplace shop matching and preview.
+    Sample payload:
+    {
+        "job_type": "business_cards",
+        "quantity": 100,
+        "width_mm": 85,
+        "height_mm": 55,
+        "paper_preference": "300gsm matt",
+        "print_sides": "SIMPLEX",
+        "location_slug": "westlands"
+    }
+    """
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -40,6 +53,17 @@ class PublicMatchBookletShopsView(APIView):
 
 
 class PublicShopCalculatorPreviewView(APIView):
+    """
+    Public endpoint for a single shop's calculator preview.
+    Sample payload:
+    {
+        "quantity": 500,
+        "width_mm": 210,
+        "height_mm": 297,
+        "paper_type": "art",
+        "paper_gsm": 150
+    }
+    """
     permission_classes = [AllowAny]
 
     def post(self, request, slug):

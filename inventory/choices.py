@@ -28,6 +28,20 @@ class PaperType(models.TextChoices):
     OTHER = "OTHER", "Other"
 
 
+class PaperCategory(models.TextChoices):
+    MATTE = "matt", "Matt"
+    GLOSS = "gloss", "Gloss"
+    BOND = "bond", "Bond"
+    IVORY = "ivory", "Ivory"
+    TICTAC = "tictac", "Tictac"
+    CONQUEROR = "conqueror", "Conqueror"
+    ARTCARD = "artcard", "Art Card"
+    COVER_BOARD = "cover_board", "Cover Board"
+    KRAFT = "kraft", "Kraft"
+    SPECIAL = "special", "Special Paper"
+    OTHER = "other", "Other"
+
+
 # Standard dimensions in mm (width, height) for auto-fill
 SHEET_SIZE_DIMENSIONS = {
     SheetSize.A4: (210, 297),

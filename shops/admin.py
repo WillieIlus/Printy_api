@@ -34,7 +34,22 @@ class MachineInline(admin.TabularInline):
 class PaperInline(admin.TabularInline):
     model = Paper
     extra = 1
-    fields = ["sheet_size", "gsm", "paper_type", "buying_price", "selling_price", "quantity_in_stock", "is_active", "is_default"]
+    fields = [
+        "display_name",
+        "sheet_size",
+        "gsm",
+        "category",
+        "paper_type",
+        "is_cover_stock",
+        "is_insert_stock",
+        "is_sticker_stock",
+        "is_specialty",
+        "buying_price",
+        "selling_price",
+        "quantity_in_stock",
+        "is_active",
+        "is_default",
+    ]
     show_change_link = True
     verbose_name_plural = "Paper stock"
 

@@ -18,6 +18,13 @@ from quotes.models import (
     ShopQuote,
     ShopQuoteAttachment,
 )
+from quotes.request_brief import build_quote_request_whatsapp_handoff
+from quotes.status_normalization import (
+    normalize_quote_request_status,
+    normalize_quote_response_status,
+    quote_request_status_label,
+    quote_response_status_label,
+)
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours, humanize_working_hours
 
 
@@ -159,12 +166,20 @@ class ShopQuoteSummarySerializer(serializers.ModelSerializer):
     """Minimal shop quote for embedding in QuoteRequest responses."""
 
     estimated_working_hours = serializers.IntegerField(source="turnaround_hours", read_only=True)
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
+    whatsapp_available = serializers.SerializerMethodField()
+    whatsapp_url = serializers.SerializerMethodField()
+    whatsapp_label = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopQuote
         fields = [
             "id",
             "status",
+            "raw_status",
+            "status_label",
             "total",
             "turnaround_days",
             "turnaround_hours",
@@ -176,7 +191,34 @@ class ShopQuoteSummarySerializer(serializers.ModelSerializer):
             "revision_number",
             "sent_at",
             "created_at",
+            "whatsapp_available",
+            "whatsapp_url",
+            "whatsapp_label",
         ]
+
+    def get_status(self, obj):
+        return normalize_quote_response_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_response_status_label(self.get_status(obj))
+
+    def _viewer_role(self, obj):
+        request = self.context.get("request")
+        if request and getattr(request.user, "id", None) == obj.shop.owner_id:
+            return "shop"
+        return "buyer"
+
+    def _whatsapp_handoff(self, obj):
+        return build_quote_request_whatsapp_handoff(obj.quote_request, viewer_role=self._viewer_role(obj))
+
+    def get_whatsapp_available(self, obj):
+        return self._whatsapp_handoff(obj).get("available", False)
+
+    def get_whatsapp_url(self, obj):
+        return self._whatsapp_handoff(obj).get("url", "")
+
+    def get_whatsapp_label(self, obj):
+        return self._whatsapp_handoff(obj).get("label", "")
 
 
 class QuoteRequestServiceReadSerializer(serializers.ModelSerializer):
@@ -316,6 +358,9 @@ class QuoteRequestCustomerListSerializer(serializers.ModelSerializer):
     quote_draft_file_id = serializers.IntegerField(read_only=True)
     items_count = serializers.SerializerMethodField()
     latest_sent_quote = serializers.SerializerMethodField()
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = QuoteRequest
@@ -327,6 +372,8 @@ class QuoteRequestCustomerListSerializer(serializers.ModelSerializer):
             "shop_currency",
             "quote_draft_file_id",
             "status",
+            "raw_status",
+            "status_label",
             "items_count",
             "latest_sent_quote",
             "created_at",
@@ -340,7 +387,13 @@ class QuoteRequestCustomerListSerializer(serializers.ModelSerializer):
         sq = obj.get_latest_shop_quote()
         if not sq:
             return None
-        return ShopQuoteSummarySerializer(sq).data
+        return ShopQuoteSummarySerializer(sq, context=self.context).data
+
+    def get_status(self, obj):
+        return normalize_quote_request_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_request_status_label(self.get_status(obj))
 
 
 class QuoteRequestCustomerDetailSerializer(serializers.ModelSerializer):
@@ -357,6 +410,9 @@ class QuoteRequestCustomerDetailSerializer(serializers.ModelSerializer):
     messages = QuoteRequestMessageSerializer(many=True, read_only=True)
     latest_sent_quote = serializers.SerializerMethodField()
     whatsapp_summary = serializers.SerializerMethodField()
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = QuoteRequest
@@ -371,6 +427,8 @@ class QuoteRequestCustomerDetailSerializer(serializers.ModelSerializer):
             "customer_email",
             "customer_phone",
             "status",
+            "raw_status",
+            "status_label",
             "notes",
             "delivery_preference",
             "delivery_address",
@@ -394,7 +452,13 @@ class QuoteRequestCustomerDetailSerializer(serializers.ModelSerializer):
         sq = obj.get_latest_shop_quote()
         if not sq:
             return None
-        return ShopQuoteSummarySerializer(sq).data
+        return ShopQuoteSummarySerializer(sq, context=self.context).data
+
+    def get_status(self, obj):
+        return normalize_quote_request_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_request_status_label(self.get_status(obj))
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +472,9 @@ class QuoteRequestShopListSerializer(serializers.ModelSerializer):
     shop_name = serializers.CharField(source="shop.name", read_only=True)
     items_count = serializers.SerializerMethodField()
     has_sent_quote = serializers.SerializerMethodField()
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = QuoteRequest
@@ -419,6 +486,8 @@ class QuoteRequestShopListSerializer(serializers.ModelSerializer):
             "customer_email",
             "customer_phone",
             "status",
+            "raw_status",
+            "status_label",
             "delivery_preference",
             "delivery_address",
             "items_count",
@@ -431,6 +500,12 @@ class QuoteRequestShopListSerializer(serializers.ModelSerializer):
 
     def get_has_sent_quote(self, obj):
         return obj.shop_quotes.filter(status__in=[ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED, ShopQuoteStatus.ACCEPTED]).exists()
+
+    def get_status(self, obj):
+        return normalize_quote_request_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_request_status_label(self.get_status(obj))
 
 
 class QuoteRequestShopDetailSerializer(serializers.ModelSerializer):
@@ -446,6 +521,9 @@ class QuoteRequestShopDetailSerializer(serializers.ModelSerializer):
     messages = QuoteRequestMessageSerializer(many=True, read_only=True)
     sent_quotes = ShopQuoteSummarySerializer(source="shop_quotes", many=True, read_only=True)
     whatsapp_summary = serializers.SerializerMethodField()
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = QuoteRequest
@@ -461,6 +539,8 @@ class QuoteRequestShopDetailSerializer(serializers.ModelSerializer):
             "customer_phone",
             "customer_inquiry",
             "status",
+            "raw_status",
+            "status_label",
             "notes",
             "delivery_preference",
             "delivery_address",
@@ -480,6 +560,12 @@ class QuoteRequestShopDetailSerializer(serializers.ModelSerializer):
         from quotes.summary_service import get_quote_request_summary_text
         return get_quote_request_summary_text(obj)
 
+    def get_status(self, obj):
+        return normalize_quote_request_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_request_status_label(self.get_status(obj))
+
 
 # ---------------------------------------------------------------------------
 # ShopQuote
@@ -490,14 +576,44 @@ class ShopQuoteCreateSerializer(serializers.ModelSerializer):
     """Shop: create or send quote (quote_request from context)."""
 
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    status = serializers.ChoiceField(
+        choices=[ShopQuoteStatus.PENDING, ShopQuoteStatus.SENT],
+        required=False,
+        default=ShopQuoteStatus.SENT,
+    )
+    price_min = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    price_max = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    confirmed_specs = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=False,
+        allow_empty=True,
+    )
+    needs_buyer_confirmation = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=False,
+        allow_empty=True,
+    )
+    alternative_suggestion = serializers.CharField(required=False, allow_blank=True)
+    availability_status = serializers.CharField(required=False, allow_blank=True)
+    response_snapshot = serializers.JSONField(required=False)
+    revised_pricing_snapshot = serializers.JSONField(required=False)
 
     class Meta:
         model = ShopQuote
         fields = [
+            "status",
             "total",
+            "price_min",
+            "price_max",
             "note",
             "turnaround_days",
             "turnaround_hours",
+            "confirmed_specs",
+            "needs_buyer_confirmation",
+            "alternative_suggestion",
+            "availability_status",
+            "response_snapshot",
+            "revised_pricing_snapshot",
         ]
         extra_kwargs = {"total": {"required": False, "allow_null": True}}
 
@@ -512,16 +628,74 @@ class ShopQuoteCreateSerializer(serializers.ModelSerializer):
         turnaround_days = attrs.get("turnaround_days")
         if turnaround_hours is None and turnaround_days:
             attrs["turnaround_hours"] = turnaround_days * 8
+        if attrs.get("price_min") is not None and attrs.get("price_min") < 0:
+            raise serializers.ValidationError({"price_min": "Price minimum must be non-negative."})
+        if attrs.get("price_max") is not None and attrs.get("price_max") < 0:
+            raise serializers.ValidationError({"price_max": "Price maximum must be non-negative."})
+        if (
+            attrs.get("price_min") is not None
+            and attrs.get("price_max") is not None
+            and attrs["price_min"] > attrs["price_max"]
+        ):
+            raise serializers.ValidationError({"price_max": "Price maximum must be greater than or equal to price minimum."})
         return attrs
+
+    def _build_response_snapshot(self, quote_request, attrs, *, estimate=None, existing_snapshot=None):
+        request_snapshot = quote_request.request_snapshot or {}
+        pricing_preview = request_snapshot.get("pricing_preview_snapshot") or {}
+        production_preview = request_snapshot.get("production_preview_snapshot") or {}
+        selected_shop_preview = request_snapshot.get("selected_shop_preview") or {}
+        response_snapshot = dict(existing_snapshot or {})
+        response_snapshot.update(attrs.get("response_snapshot") or {})
+        response_snapshot.update(
+            {
+                "shop_name": quote_request.shop.name,
+                "shop_slug": quote_request.shop.slug,
+                "currency": quote_request.shop.currency or "KES",
+                "price": attrs.get("total"),
+                "price_min": attrs.get("price_min"),
+                "price_max": attrs.get("price_max"),
+                "turnaround_label": estimate.label if estimate else response_snapshot.get("turnaround_label", ""),
+                "confirmed_specs": attrs.get("confirmed_specs") or [],
+                "included_items": attrs.get("confirmed_specs") or [],
+                "needs_confirmation": attrs.get("needs_buyer_confirmation") or [],
+                "shop_note": attrs.get("note", "") or "",
+                "alternative_suggestion": attrs.get("alternative_suggestion", "") or "",
+                "availability_status": attrs.get("availability_status", "") or "",
+                "estimated_price": pricing_preview.get("total")
+                or (pricing_preview.get("totals") or {}).get("grand_total")
+                or selected_shop_preview.get("total"),
+                "pricing_preview_lines": pricing_preview.get("line_items")
+                or pricing_preview.get("lines")
+                or [],
+                "paper_line": pricing_preview.get("paper_line"),
+                "printing_line": pricing_preview.get("printing_line"),
+                "finishing_lines": pricing_preview.get("finishing_lines") or [],
+                "production_preview": production_preview,
+                "missing_specs": request_snapshot.get("needs_confirmation")
+                or selected_shop_preview.get("needs_confirmation")
+                or [],
+            }
+        )
+        return response_snapshot
 
     def create(self, validated_data):
         quote_request = self.context["quote_request"]
         request = self.context["request"]
         shop = quote_request.shop
+        quote_status = validated_data.pop("status", ShopQuoteStatus.SENT)
+        validated_data.pop("price_min", None)
+        validated_data.pop("price_max", None)
+        validated_data.pop("confirmed_specs", None)
+        validated_data.pop("needs_buyer_confirmation", None)
+        validated_data.pop("alternative_suggestion", None)
+        validated_data.pop("availability_status", None)
+        revised_pricing_snapshot = validated_data.pop("revised_pricing_snapshot", None)
 
         # Revision number: count existing + 1
         rev = quote_request.shop_quotes.count() + 1
         turnaround_hours = validated_data.get("turnaround_hours")
+        estimate = None
         if turnaround_hours:
             estimate = estimate_turnaround(shop=shop, working_hours=turnaround_hours)
             if estimate:
@@ -529,12 +703,19 @@ class ShopQuoteCreateSerializer(serializers.ModelSerializer):
                 validated_data["estimated_ready_at"] = estimate.ready_at
                 validated_data["human_ready_text"] = estimate.human_ready_text
                 validated_data["turnaround_label"] = estimate.label
+        validated_data["response_snapshot"] = self._build_response_snapshot(
+            quote_request,
+            self.validated_data,
+            estimate=estimate,
+        )
+        if revised_pricing_snapshot is not None:
+            validated_data["revised_pricing_snapshot"] = revised_pricing_snapshot
 
         return ShopQuote.objects.create(
             quote_request=quote_request,
             shop=shop,
             created_by=request.user,
-            status=ShopQuoteStatus.SENT,
+            status=quote_status,
             revision_number=rev,
             **validated_data,
         )
@@ -544,21 +725,50 @@ class ShopQuoteUpdateSerializer(serializers.ModelSerializer):
     """Shop: revise quote (update note, turnaround, total)."""
 
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    status = serializers.ChoiceField(
+        choices=[ShopQuoteStatus.PENDING, ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED],
+        required=False,
+    )
+    price_min = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    price_max = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    confirmed_specs = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=False,
+        allow_empty=True,
+    )
+    needs_buyer_confirmation = serializers.ListField(
+        child=serializers.CharField(allow_blank=False),
+        required=False,
+        allow_empty=True,
+    )
+    alternative_suggestion = serializers.CharField(required=False, allow_blank=True)
+    availability_status = serializers.CharField(required=False, allow_blank=True)
+    response_snapshot = serializers.JSONField(required=False)
+    revised_pricing_snapshot = serializers.JSONField(required=False)
 
     class Meta:
         model = ShopQuote
         fields = [
+            "status",
             "note",
             "turnaround_days",
             "turnaround_hours",
             "total",
+            "price_min",
+            "price_max",
+            "confirmed_specs",
+            "needs_buyer_confirmation",
+            "alternative_suggestion",
+            "availability_status",
+            "response_snapshot",
+            "revised_pricing_snapshot",
         ]
 
     def validate(self, attrs):
         instance = self.instance
-        if instance and instance.status not in (ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED):
+        if instance and instance.status not in (ShopQuoteStatus.PENDING, ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED):
             raise serializers.ValidationError(
-                "Only sent or revised quotes can be updated."
+                "Only pending, sent, or revised quotes can be updated."
             )
         turnaround_hours = attrs.get("turnaround_hours")
         turnaround_days = attrs.get("turnaround_days")
@@ -571,7 +781,59 @@ class ShopQuoteUpdateSerializer(serializers.ModelSerializer):
                 attrs["estimated_ready_at"] = estimate.ready_at
                 attrs["human_ready_text"] = estimate.human_ready_text
                 attrs["turnaround_label"] = estimate.label
+        if attrs.get("price_min") is not None and attrs.get("price_min") < 0:
+            raise serializers.ValidationError({"price_min": "Price minimum must be non-negative."})
+        if attrs.get("price_max") is not None and attrs.get("price_max") < 0:
+            raise serializers.ValidationError({"price_max": "Price maximum must be non-negative."})
+        if (
+            attrs.get("price_min") is not None
+            and attrs.get("price_max") is not None
+            and attrs["price_min"] > attrs["price_max"]
+        ):
+            raise serializers.ValidationError({"price_max": "Price maximum must be greater than or equal to price minimum."})
         return attrs
+
+    def update(self, instance, validated_data):
+        price_min = validated_data.pop("price_min", None) if "price_min" in validated_data else None
+        price_max = validated_data.pop("price_max", None) if "price_max" in validated_data else None
+        confirmed_specs = validated_data.pop("confirmed_specs", None)
+        needs_buyer_confirmation = validated_data.pop("needs_buyer_confirmation", None)
+        alternative_suggestion = validated_data.pop("alternative_suggestion", None)
+        availability_status = validated_data.pop("availability_status", None)
+        custom_snapshot = validated_data.pop("response_snapshot", None) or {}
+        revised_pricing_snapshot = validated_data.pop("revised_pricing_snapshot", None)
+        explicit_status = validated_data.pop("status", None)
+
+        instance = super().update(instance, validated_data)
+
+        snapshot = dict(instance.response_snapshot or {})
+        snapshot.update(custom_snapshot)
+        if "total" in self.validated_data:
+            snapshot["price"] = self.validated_data.get("total")
+        if price_min is not None:
+            snapshot["price_min"] = price_min
+        if price_max is not None:
+            snapshot["price_max"] = price_max
+        if confirmed_specs is not None:
+            snapshot["confirmed_specs"] = confirmed_specs
+            snapshot["included_items"] = confirmed_specs
+        if needs_buyer_confirmation is not None:
+            snapshot["needs_confirmation"] = needs_buyer_confirmation
+        if alternative_suggestion is not None:
+            snapshot["alternative_suggestion"] = alternative_suggestion
+        if availability_status is not None:
+            snapshot["availability_status"] = availability_status
+        if "note" in self.validated_data:
+            snapshot["shop_note"] = self.validated_data.get("note", "") or ""
+        if getattr(instance, "turnaround_label", ""):
+            snapshot["turnaround_label"] = instance.turnaround_label
+        instance.response_snapshot = snapshot
+        if revised_pricing_snapshot is not None:
+            instance.revised_pricing_snapshot = revised_pricing_snapshot
+        if explicit_status:
+            instance.status = explicit_status
+        instance.save()
+        return instance
 
 
 class QuoteRequestReplySerializer(serializers.Serializer):
@@ -589,6 +851,9 @@ class ShopQuoteListSerializer(serializers.ModelSerializer):
     shop_name = serializers.CharField(source="shop.name", read_only=True)
     customer_name = serializers.CharField(source="quote_request.customer_name", read_only=True)
     estimated_working_hours = serializers.IntegerField(source="turnaround_hours", read_only=True)
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopQuote
@@ -599,6 +864,8 @@ class ShopQuoteListSerializer(serializers.ModelSerializer):
             "shop_name",
             "customer_name",
             "status",
+            "raw_status",
+            "status_label",
             "total",
             "turnaround_days",
             "turnaround_hours",
@@ -610,6 +877,12 @@ class ShopQuoteListSerializer(serializers.ModelSerializer):
             "sent_at",
             "created_at",
         ]
+
+    def get_status(self, obj):
+        return normalize_quote_response_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_response_status_label(self.get_status(obj))
 
 
 class ShopQuoteDetailSerializer(serializers.ModelSerializer):
@@ -623,6 +896,9 @@ class ShopQuoteDetailSerializer(serializers.ModelSerializer):
     whatsapp_summary = serializers.SerializerMethodField()
     estimated_working_hours = serializers.IntegerField(source="turnaround_hours", read_only=True)
     turnaround_text = serializers.SerializerMethodField()
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopQuote
@@ -634,6 +910,8 @@ class ShopQuoteDetailSerializer(serializers.ModelSerializer):
             "shop_name",
             "shop_currency",
             "status",
+            "raw_status",
+            "status_label",
             "total",
             "note",
             "turnaround_days",
@@ -660,12 +938,15 @@ class ShopQuoteDetailSerializer(serializers.ModelSerializer):
 
     def get_quote_request_summary(self, obj):
         qr = obj.quote_request
+        normalized_status = normalize_quote_request_status(qr.status)
         return {
             "id": qr.id,
             "customer_name": qr.customer_name,
             "customer_email": qr.customer_email,
             "customer_phone": qr.customer_phone,
-            "status": qr.status,
+            "status": normalized_status,
+            "raw_status": qr.status,
+            "status_label": quote_request_status_label(normalized_status),
         }
 
     def get_items(self, obj):
@@ -677,6 +958,12 @@ class ShopQuoteDetailSerializer(serializers.ModelSerializer):
 
     def get_turnaround_text(self, obj):
         return humanize_working_hours(obj.turnaround_hours)
+
+    def get_status(self, obj):
+        return normalize_quote_response_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_response_status_label(self.get_status(obj))
 
 
 # ---------------------------------------------------------------------------

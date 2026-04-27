@@ -1,95 +1,297 @@
-"""Backend truth for shop onboarding/setup progression."""
+"""Backend truth for shop setup and rate-card readiness."""
 
 from catalog.models import Product
 from inventory.models import Machine, Paper
 from pricing.models import FinishingRate, Material, PrintingRate
 from shops.models import Shop
 
-SETUP_STEPS = [
-    ("shop", "create shop"),
-    ("machines", "add machines"),
-    ("papers", "add papers/materials"),
-    ("pricing", "add pricing rules"),
-    ("finishing", "add finishing rules"),
-    ("products", "add first product"),
-    ("complete", "setup complete"),
+PROFILE_PLACEHOLDERS = {
+    "description": "Business description for the shop.",
+    "business_email": "shop@example.com",
+    "phone_number": "+254 700 000 000",
+    "address_line": "Street address",
+}
+
+READINESS_STEPS = [
+    ("profile", "Shop profile", "Review profile"),
+    ("materials", "Materials", "Add materials"),
+    ("pricing", "Print pricing", "Add pricing"),
+    ("finishing", "Finishing", "Add finishing"),
+    ("turnaround", "Turnaround", "Add turnaround"),
+    ("publish", "Publishing", "Review shop visibility"),
 ]
+
+
+def _dashboard_url(shop: Shop | None, step: str) -> str:
+    if not shop:
+        return "/dashboard/shops/create"
+    mapping = {
+        "profile": "/dashboard/shop/profile",
+        "materials": "/dashboard/shop/materials",
+        "pricing": "/dashboard/shop/pricing",
+        "finishing": "/dashboard/shop/finishing",
+        "turnaround": "/dashboard/shop/products",
+        "publish": "/dashboard/shop/profile",
+        "complete": "/dashboard/shop",
+        "shop": "/dashboard/shop",
+        "machines": "/dashboard/shop/pricing",
+        "papers": "/dashboard/shop/materials",
+        "products": "/dashboard/shop/products",
+    }
+    return mapping.get(step, "/dashboard/shop")
+
+
+def _has_real_text(value: str | None, placeholder: str | None = None) -> bool:
+    normalized = (value or "").strip()
+    if not normalized:
+        return False
+    if placeholder and normalized == placeholder:
+        return False
+    return True
+
+
+def _shop_profile_complete(shop: Shop) -> bool:
+    return all(
+        [
+            _has_real_text(shop.name),
+            _has_real_text(shop.description, PROFILE_PLACEHOLDERS["description"]),
+            (
+                _has_real_text(shop.business_email, PROFILE_PLACEHOLDERS["business_email"])
+                or _has_real_text(shop.phone_number, PROFILE_PLACEHOLDERS["phone_number"])
+            ),
+            _has_real_text(shop.address_line, PROFILE_PLACEHOLDERS["address_line"]),
+            _has_real_text(shop.city),
+            _has_real_text(shop.country),
+        ]
+    )
+
+
+def _turnaround_configured(shop: Shop) -> bool:
+    return Product.objects.filter(
+        shop=shop,
+        is_active=True,
+    ).filter(
+        standard_turnaround_hours__isnull=False,
+    ).exists() or Product.objects.filter(
+        shop=shop,
+        is_active=True,
+    ).filter(
+        rush_turnaround_hours__isnull=False,
+    ).exists() or Product.objects.filter(
+        shop=shop,
+        is_active=True,
+    ).filter(
+        turnaround_days__isnull=False,
+    ).exists()
+
+
+def _build_steps_payload(*, shop: Shop | None, state: dict, next_step: str) -> list[dict]:
+    if not shop:
+        return [
+            {
+                "key": "shop",
+                "label": "Shop",
+                "done": False,
+                "accessible": True,
+                "cta_label": "Create shop",
+                "cta_url": "/dashboard/shops/create",
+                "blocking_reason": "Create your shop first so Printy can track pricing readiness.",
+            },
+        ]
+
+    step_done = {
+        "profile": state["shop_profile_complete"],
+        "materials": state["has_materials"],
+        "pricing": state["has_pricing_rules"],
+        "finishing": state["has_finishing_rates"],
+        "turnaround": state["turnaround_configured"],
+        "publish": state["shop_published"],
+        "papers": state["has_materials"],
+        "products": state["turnaround_configured"],
+        "machines": state["has_pricing_rules"],
+    }
+    helpers = {
+        "profile": "Add real contact and business details buyers can trust.",
+        "materials": "List paper stocks or materials so Printy can match jobs to your rate card.",
+        "pricing": "To price more jobs automatically, add print pricing rules.",
+        "finishing": "Your shop can receive requests, but exact pricing needs finishing rates.",
+        "turnaround": "Add turnaround on at least one active product so request responses can show expected timing.",
+        "publish": "Make the shop public when you are ready to receive marketplace traffic.",
+    }
+
+    steps = []
+    for key, label, cta_label in READINESS_STEPS:
+        done = step_done[key]
+        is_current = key == next_step
+        steps.append(
+            {
+                "key": key,
+                "label": label,
+                "done": done,
+                "accessible": True,
+                "cta_label": "Review" if done else ("Complete now" if is_current else cta_label),
+                "cta_url": _dashboard_url(shop, key),
+                "blocking_reason": "" if done else helpers[key],
+            }
+        )
+    return steps
 
 
 def _build_status_for_shop(shop: Shop | None) -> dict:
     if not shop:
+        recommendations = [
+            "Create a shop first so you can start building a rate card.",
+        ]
         return {
             "has_shop": False,
             "has_machines": False,
             "has_papers": False,
             "has_materials": False,
+            "materials_count": 0,
             "has_pricing": False,
+            "has_pricing_rules": False,
+            "pricing_rules_count": 0,
             "has_finishing": False,
+            "has_finishing_rates": False,
+            "finishing_rates_count": 0,
             "has_products": False,
+            "shop_profile_complete": False,
+            "turnaround_configured": False,
+            "shop_published": False,
+            "can_receive_requests": False,
+            "can_price_requests": False,
+            "rate_card_completeness": 0,
+            "setup_percent": 0,
             "next_step": "shop",
             "next_url": "/dashboard/shops/create",
+            "warnings": [],
+            "recommendations": recommendations,
+            "blocking_reason": recommendations[0],
             "completed_steps": [],
-            "pending_steps": [step for step, _ in SETUP_STEPS[:-1]],
-            "blocking_reason": "Create a shop before you can add machines, stock, pricing, or products.",
+            "pending_steps": ["shop"],
+            "steps": _build_steps_payload(shop=None, state={}, next_step="shop"),
         }
 
-    has_papers = Paper.objects.filter(shop=shop, is_active=True).exists()
-    has_materials = has_papers or Material.objects.filter(shop=shop, is_active=True).exists()
-    has_machines = Machine.objects.filter(shop=shop, is_active=True).exists()
-    has_pricing = pricing_exists(shop)
-    has_finishing = FinishingRate.objects.filter(shop=shop, is_active=True).exists()
-    has_products = Product.objects.filter(shop=shop, is_active=True).exists()
+    machine_count = Machine.objects.filter(shop=shop, is_active=True).count()
+    paper_count = Paper.objects.filter(shop=shop, is_active=True).count()
+    material_count = Material.objects.filter(shop=shop, is_active=True).count()
+    pricing_rules_count = PrintingRate.objects.filter(machine__shop=shop, is_active=True).count()
+    finishing_rates_count = FinishingRate.objects.filter(shop=shop, is_active=True).count()
+    products_count = Product.objects.filter(shop=shop, is_active=True).count()
 
-    if not has_machines:
-        next_step = "machines"
-        blocking_reason = "Add at least one machine before configuring backend pricing."
-    elif not has_papers:
-        next_step = "papers"
-        blocking_reason = "Add paper stock before backend pricing can calculate sheet jobs."
+    has_machines = machine_count > 0
+    has_papers = paper_count > 0
+    has_materials = (paper_count + material_count) > 0
+    has_pricing_rules = pricing_rules_count > 0 and has_papers
+    has_finishing_rates = finishing_rates_count > 0
+    has_products = products_count > 0
+    shop_profile_complete = _shop_profile_complete(shop)
+    turnaround_configured = _turnaround_configured(shop)
+    shop_published = bool(shop.is_active and shop.is_public)
+    can_receive_requests = bool(shop_published and (shop.supports_custom_requests or shop.supports_catalog_requests))
+    can_price_requests = bool(can_receive_requests and has_materials and has_pricing_rules)
+
+    rate_card_completeness = (
+        (35 if has_materials else 0)
+        + (35 if has_pricing_rules else 0)
+        + (20 if has_finishing_rates else 0)
+        + (10 if turnaround_configured else 0)
+    )
+    setup_percent = (
+        (25 if shop_profile_complete else 0)
+        + (25 if has_materials else 0)
+        + (20 if has_pricing_rules else 0)
+        + (10 if has_finishing_rates else 0)
+        + (10 if turnaround_configured else 0)
+        + (10 if shop_published else 0)
+    )
+
+    warnings: list[str] = []
+    recommendations: list[str] = []
+
+    if not shop_profile_complete:
+        recommendations.append("Add clear business details so buyers know who is pricing their job.")
+    if not has_materials:
+        recommendations.append("Add paper stocks or materials so Printy can match jobs against real production inputs.")
+    if not has_pricing_rules:
+        recommendations.append("To price more jobs automatically, add print pricing rules.")
+    if can_receive_requests and not has_finishing_rates:
+        warnings.append("Your shop can receive requests, but exact pricing needs finishing rates.")
+    elif not has_finishing_rates:
+        recommendations.append("Add finishing rates so lamination, cutting, binding, and other add-ons can be priced instantly.")
+    if not turnaround_configured:
+        recommendations.append("Add turnaround on at least one active product so buyers can see expected timing.")
+    if not shop_published:
+        recommendations.append("Make the shop public when you are ready for marketplace visibility.")
+
+    if not shop_profile_complete:
+        next_step = "profile"
     elif not has_materials:
-        next_step = "papers"
-        blocking_reason = "Add paper or material stock before finishing and product setup."
-    elif not has_pricing:
+        next_step = "materials"
+    elif not has_pricing_rules:
         next_step = "pricing"
-        blocking_reason = "Add printing rates after machine and paper setup so the calculator can return totals."
-    elif not has_finishing:
+    elif not has_finishing_rates:
         next_step = "finishing"
-        blocking_reason = "Add finishing rules so backend quotes can include post-press pricing."
-    elif not has_products:
-        next_step = "products"
-        blocking_reason = "Add at least one product so clients can request quotes from the public shop catalog."
+    elif not turnaround_configured:
+        next_step = "turnaround"
+    elif not shop_published:
+        next_step = "publish"
     else:
         next_step = "complete"
-        blocking_reason = ""
 
-    pending_steps = [code for code, _ in SETUP_STEPS if code not in {"complete"}]
-    completed_steps = ["shop"]
-    if has_machines:
-        completed_steps.append("machines")
-    if has_papers:
-        completed_steps.append("papers")
-    if has_pricing:
-        completed_steps.append("pricing")
-    if has_finishing:
-        completed_steps.append("finishing")
-    if has_products:
-        completed_steps.append("products")
+    completed_steps = [
+        key for key, done in [
+            ("profile", shop_profile_complete),
+            ("materials", has_materials),
+            ("pricing", has_pricing_rules),
+            ("finishing", has_finishing_rates),
+            ("turnaround", turnaround_configured),
+            ("publish", shop_published),
+        ] if done
+    ]
+
+    pending_steps = [
+        key for key, _label, _cta in READINESS_STEPS if key not in completed_steps
+    ]
+
+    state = {
+        "shop_profile_complete": shop_profile_complete,
+        "has_materials": has_materials,
+        "has_pricing_rules": has_pricing_rules,
+        "has_finishing_rates": has_finishing_rates,
+        "turnaround_configured": turnaround_configured,
+        "shop_published": shop_published,
+    }
+    steps = _build_steps_payload(shop=shop, state=state, next_step=next_step)
 
     return {
         "has_shop": True,
         "has_machines": has_machines,
         "has_papers": has_papers,
         "has_materials": has_materials,
-        "has_pricing": has_pricing,
-        "has_finishing": has_finishing,
+        "materials_count": paper_count + material_count,
+        "has_pricing": has_pricing_rules,
+        "has_pricing_rules": has_pricing_rules,
+        "pricing_rules_count": pricing_rules_count,
+        "has_finishing": has_finishing_rates,
+        "has_finishing_rates": has_finishing_rates,
+        "finishing_rates_count": finishing_rates_count,
         "has_products": has_products,
+        "shop_profile_complete": shop_profile_complete,
+        "turnaround_configured": turnaround_configured,
+        "shop_published": shop_published,
+        "can_receive_requests": can_receive_requests,
+        "can_price_requests": can_price_requests,
+        "rate_card_completeness": rate_card_completeness,
+        "setup_percent": setup_percent,
         "next_step": next_step,
-        "next_url": (
-            f"/dashboard/shops/{shop.slug}" if next_step == "complete" else f"/dashboard/shops/{shop.slug}/{next_step}"
-        ),
+        "next_url": _dashboard_url(shop, next_step),
+        "warnings": warnings,
+        "recommendations": recommendations,
+        "blocking_reason": recommendations[0] if recommendations else (warnings[0] if warnings else ""),
         "completed_steps": completed_steps,
-        "pending_steps": [step for step in pending_steps if step not in completed_steps],
-        "blocking_reason": blocking_reason,
+        "pending_steps": pending_steps,
+        "steps": steps,
     }
 
 
@@ -102,47 +304,16 @@ def get_setup_status_for_shop(shop: Shop) -> dict:
 
 
 def get_setup_status(user) -> dict:
-    shop = Shop.objects.filter(owner=user).order_by("id").first()
-    if not shop:
-        return {
-            "has_shop": False,
-            "has_papers": False,
-            "has_machines": False,
-            "has_pricing": False,
-            "has_finishing": False,
-            "has_published_products": False,
-            "pricing_ready": False,
-            "next_step": "shop",
-        }
-
-    has_papers = Paper.objects.filter(shop=shop, is_active=True).exists()
-    has_machines = Machine.objects.filter(shop=shop, is_active=True).exists()
-    has_pricing = pricing_exists(shop)
-    has_finishing = FinishingRate.objects.filter(shop=shop, is_active=True).exists()
-    has_published_products = Product.objects.filter(shop=shop, is_public=True, is_active=True).exists()
-
-    if not has_machines:
-        next_step = "machines"
-    elif not has_papers:
-        next_step = "papers"
-    elif not has_pricing:
-        next_step = "pricing"
-    elif not has_published_products and not has_finishing:
-        next_step = "finishing"
-    elif not has_published_products:
-        next_step = "products"
-    else:
-        next_step = "done"
-
+    status = get_setup_status_for_user(user)
     return {
-        "has_shop": True,
-        "has_papers": has_papers,
-        "has_machines": has_machines,
-        "has_pricing": has_pricing,
-        "has_finishing": has_finishing,
-        "has_published_products": has_published_products,
-        "pricing_ready": has_pricing,
-        "next_step": next_step,
+        "has_shop": status["has_shop"],
+        "has_papers": status["has_papers"],
+        "has_machines": status["has_machines"],
+        "has_pricing": status["has_pricing"],
+        "has_finishing": status["has_finishing"],
+        "has_published_products": status["shop_published"],
+        "pricing_ready": status["can_price_requests"],
+        "next_step": "done" if status["next_step"] == "complete" else status["next_step"],
     }
 
 
