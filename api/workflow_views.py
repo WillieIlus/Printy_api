@@ -1,3 +1,6 @@
+import logging
+
+from django.db import OperationalError, ProgrammingError
 from django.db.models import Count, OuterRef, Q, Subquery
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -89,7 +92,21 @@ class CalculatorConfigView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        return Response(get_calculator_config())
+        logger = logging.getLogger(__name__)
+        try:
+            return Response(get_calculator_config())
+        except (OperationalError, ProgrammingError) as exc:
+            logger.error("calculator/config DB error (run migrations): %s", exc)
+            return Response(
+                {"detail": "Calculator configuration unavailable. Pending database migration."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except Exception as exc:
+            logger.exception("calculator/config unexpected error: %s", exc)
+            return Response(
+                {"detail": "Calculator configuration unavailable."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class CalculatorConfigPreviewView(APIView):
