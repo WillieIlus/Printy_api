@@ -8,6 +8,15 @@ from services.public_matching import get_booklet_marketplace_matches, get_market
 from .calculator_config import get_product_definition, resolve_finished_size, resolve_stock_option
 
 
+def _parse_tier_gsm(raw: str | None) -> int | None:
+    if not raw or not raw.endswith("gsm"):
+        return None
+    try:
+        return int(raw[:-3])
+    except ValueError:
+        return None
+
+
 PRODUCT_FAMILY_BY_TYPE = {
     "business_card": "flat",
     "flyer": "flat",
@@ -166,7 +175,7 @@ def _extract_production_preview(matches: list[dict[str, Any]], product_type: str
     finishing_rows = breakdown.get("finishings") or preview_data.get("finishings") or []
     warnings = preview_data.get("explanations") or preview_data.get("warnings") or []
 
-    return {
+    result: dict[str, Any] = {
         "pieces_per_sheet": imposition.get("copies_per_sheet") or preview_data.get("copies_per_sheet"),
         "sheets_required": imposition.get("good_sheets") or preview_data.get("good_sheets"),
         "parent_sheet": imposition.get("sheet_size") or imposition.get("sheet_name") or paper.get("sheet_size") or preview_data.get("parent_sheet_name"),
@@ -178,6 +187,25 @@ def _extract_production_preview(matches: list[dict[str, Any]], product_type: str
         "suggested_finishings": [],
         "warnings": warnings,
     }
+
+    if product_type == "booklet":
+        booklet_bd = breakdown.get("booklet") or {}
+        cover_bd = breakdown.get("cover") or {}
+        insert_bd = breakdown.get("inserts") or {}
+        result.update({
+            "booklet_input_pages": preview_data.get("input_pages") or booklet_bd.get("requested_pages"),
+            "booklet_normalized_pages": preview_data.get("normalized_pages") or booklet_bd.get("normalized_pages"),
+            "booklet_blank_pages_added": preview_data.get("blank_pages_added") or booklet_bd.get("blank_pages_added"),
+            "booklet_cover_pages": preview_data.get("cover_pages") or booklet_bd.get("cover_pages"),
+            "booklet_insert_pages": preview_data.get("insert_pages") or booklet_bd.get("insert_pages"),
+            "booklet_cover_sheets": preview_data.get("cover_sheets") or booklet_bd.get("cover_sheets"),
+            "booklet_insert_sheets": preview_data.get("insert_sheets") or booklet_bd.get("insert_sheets"),
+            "booklet_binding_label": booklet_bd.get("binding_label"),
+            "booklet_cover_paper_label": (cover_bd.get("paper") or {}).get("label"),
+            "booklet_insert_paper_label": (insert_bd.get("paper") or {}).get("label"),
+        })
+
+    return result
 
 
 def _extract_pricing_breakdown(matches: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -249,17 +277,21 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         return _build_missing_response(product_type, ["finished_size"])
 
     if product_type == "booklet":
-        cover_stock = resolve_stock_option(payload.get("cover_stock"), usage="cover")
-        insert_stock = resolve_stock_option(payload.get("insert_stock"), usage="insert")
+        cover_stock_raw = payload.get("cover_stock") or ""
+        insert_stock_raw = payload.get("insert_stock") or ""
+        cover_stock = resolve_stock_option(cover_stock_raw, usage="cover")
+        insert_stock = resolve_stock_option(insert_stock_raw, usage="insert")
+        cover_tier_gsm = _parse_tier_gsm(cover_stock_raw) if not cover_stock else None
+        insert_tier_gsm = _parse_tier_gsm(insert_stock_raw) if not insert_stock else None
         request_payload = {
             "product_family": "booklet",
             "quantity": payload.get("quantity"),
             "total_pages": payload.get("total_pages"),
             "binding_type": payload.get("binding_type") or definition["defaults"].get("binding_type"),
             "cover_paper_type": payload.get("requested_cover_paper_category") or (cover_stock or {}).get("category"),
-            "cover_paper_gsm": payload.get("requested_cover_gsm") or (cover_stock or {}).get("gsm"),
+            "cover_paper_gsm": payload.get("requested_cover_gsm") or (cover_stock or {}).get("gsm") or cover_tier_gsm,
             "insert_paper_type": payload.get("requested_insert_paper_category") or (insert_stock or {}).get("category"),
-            "insert_paper_gsm": payload.get("requested_insert_gsm") or (insert_stock or {}).get("gsm"),
+            "insert_paper_gsm": payload.get("requested_insert_gsm") or (insert_stock or {}).get("gsm") or insert_tier_gsm,
             "cover_lamination_mode": payload.get("cover_lamination") or definition["defaults"].get("cover_lamination"),
             "width_mm": size["width_mm"],
             "height_mm": size["height_mm"],
@@ -278,7 +310,14 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         
         return _attach_booklet_match_metadata(response, request_payload)
 
-    stock = resolve_stock_option(payload.get("paper_stock"), usage="sticker" if product_type == "label_sticker" else "")
+    paper_stock_raw = payload.get("paper_stock") or ""
+    stock = resolve_stock_option(paper_stock_raw, usage="sticker" if product_type == "label_sticker" else "")
+    tier_gsm: int | None = None
+    if stock is None and paper_stock_raw.endswith("gsm"):
+        try:
+            tier_gsm = int(paper_stock_raw[:-3])
+        except ValueError:
+            pass
     request_payload = {
         "calculator_mode": "marketplace",
         "product_family": PRODUCT_FAMILY_BY_TYPE[product_type],
@@ -292,7 +331,7 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         "sides": payload.get("print_sides") or definition["defaults"].get("print_sides"),
         "color_mode": payload.get("color_mode") or definition["defaults"].get("color_mode"),
         "paper_type": payload.get("requested_paper_category") or (stock or {}).get("category"),
-        "paper_gsm": payload.get("requested_gsm") or (stock or {}).get("gsm"),
+        "paper_gsm": payload.get("requested_gsm") or (stock or {}).get("gsm") or tier_gsm,
         "finishing_slugs": [
             value
             for value in [

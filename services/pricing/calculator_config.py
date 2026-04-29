@@ -165,6 +165,79 @@ PRODUCT_DEFINITIONS = OrderedDict(
 )
 
 
+SIZE_OPTION_METADATA: dict[str, list[dict[str, Any]]] = {
+    "business_card": [
+        {"id": "90x55mm", "label": "Standard Card", "description": "Most common size", "recommended": True},
+        {"id": "85x55mm", "label": "Euro Card", "description": "Slightly narrower", "recommended": False},
+    ],
+    "flyer": [
+        {"id": "A6", "label": "A6", "description": "Quarter-page flyer", "recommended": False},
+        {"id": "A5", "label": "A5", "description": "Half-page flyer", "recommended": True},
+        {"id": "A4", "label": "A4", "description": "Full-page flyer", "recommended": False},
+        {"id": "A3", "label": "A3", "description": "Large format flyer", "recommended": False},
+    ],
+    "label_sticker": [
+        {"id": "100x50mm", "label": "100 × 50 mm", "description": "Standard label size", "recommended": True},
+        {"id": "A6", "label": "A6", "description": "Small label sheet", "recommended": False},
+        {"id": "A5", "label": "A5", "description": "Medium label sheet", "recommended": False},
+        {"id": "A4", "label": "A4", "description": "Full sheet labels", "recommended": False},
+    ],
+    "letterhead": [
+        {"id": "A4", "label": "A4", "description": "Standard letterhead", "recommended": True},
+        {"id": "A5", "label": "A5", "description": "Half-page letterhead", "recommended": False},
+    ],
+    "booklet": [
+        {"id": "A5", "label": "A5", "description": "Compact booklet", "recommended": True},
+        {"id": "A4", "label": "A4", "description": "Full-size booklet", "recommended": False},
+    ],
+}
+
+
+def _size_options_for_product(product_key: str) -> list[dict[str, Any]]:
+    meta_map = {m["id"]: m for m in SIZE_OPTION_METADATA.get(product_key, [])}
+    options = []
+    for size in SIZE_LIBRARY.get(product_key, []):
+        value = size["value"]
+        meta = meta_map.get(value, {})
+        options.append({
+            "id": value,
+            "label": meta.get("label") or size["label"],
+            "description": meta.get("description", ""),
+            "recommended": meta.get("recommended", False),
+            "width_mm": size["width_mm"],
+            "height_mm": size["height_mm"],
+        })
+    return options
+
+
+BOOKLET_COVER_TIER_DEFINITIONS: list[dict[str, Any]] = [
+    {"id": "250gsm", "label": "Economy", "description": "Light cover stock", "gsm": 250, "recommended": False},
+    {"id": "300gsm", "label": "Standard", "description": "Most common cover", "gsm": 300, "recommended": True},
+    {"id": "350gsm", "label": "Premium", "description": "Thick, premium feel", "gsm": 350, "recommended": False},
+]
+
+BOOKLET_INSERT_TIER_DEFINITIONS: list[dict[str, Any]] = [
+    {"id": "80gsm", "label": "Bond", "description": "Standard office weight", "gsm": 80, "recommended": True},
+    {"id": "100gsm", "label": "Quality", "description": "Heavier inside pages", "gsm": 100, "recommended": False},
+    {"id": "130gsm", "label": "Premium", "description": "Magazine-quality inserts", "gsm": 130, "recommended": False},
+]
+
+
+PAPER_TIER_DEFINITIONS: dict[str, list[dict[str, Any]]] = {
+    "business_card": [
+        {"id": "250gsm", "label": "Budget", "description": "Lower cost, lighter feel", "gsm": 250, "recommended": False},
+        {"id": "300gsm", "label": "Standard", "description": "Most common choice", "gsm": 300, "recommended": True},
+        {"id": "350gsm", "label": "Premium", "description": "Thicker, high-end feel", "gsm": 350, "recommended": False},
+    ],
+    "flyer": [
+        {"id": "130gsm", "label": "Budget", "description": "Everyday handouts", "gsm": 130, "recommended": False},
+        {"id": "150gsm", "label": "Standard", "description": "Most common choice", "gsm": 150, "recommended": True},
+        {"id": "170gsm", "label": "Quality", "description": "Heavier, more durable", "gsm": 170, "recommended": False},
+        {"id": "200gsm", "label": "Premium", "description": "Thick, high-end feel", "gsm": 200, "recommended": False},
+    ],
+}
+
+
 def _paper_queryset():
     public_shop_ids = Shop.objects.filter(is_active=True, is_public=True).values_list("id", flat=True)
     return Paper.objects.filter(shop_id__in=public_shop_ids, is_active=True, selling_price__gt=0)
@@ -316,6 +389,11 @@ def get_calculator_config() -> dict[str, Any]:
                 "allowed_print_sides": definition["allowed_print_sides"],
                 "sizes": SIZE_LIBRARY[product_key],
                 "fields": fields,
+                "paper_options": PAPER_TIER_DEFINITIONS.get(product_key, []),
+                "cover_paper_options": BOOKLET_COVER_TIER_DEFINITIONS if product_key == "booklet" else [],
+                "insert_paper_options": BOOKLET_INSERT_TIER_DEFINITIONS if product_key == "booklet" else [],
+                "size_options": _size_options_for_product(product_key),
+                "allow_custom_size": False,
             }
         )
     return {

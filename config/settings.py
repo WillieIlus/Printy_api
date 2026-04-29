@@ -95,6 +95,7 @@ INSTALLED_APPS = [
     "subscriptions",
     "production",
     "billing",
+    "artwork",
 ]
 
 AUTH_USER_MODEL = "accounts.User"

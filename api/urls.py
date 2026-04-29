@@ -71,6 +71,7 @@ notifications_router.register(r"", NotificationViewSet, basename="notification")
 urlpatterns = [
     path("setup-status/", workflow_views.SetupStatusCompatView.as_view(), name="setup-status-compat"),
     path("shops/<slug:shop_slug>/setup-status/", workflow_views.ShopSetupStatusCompatView.as_view(), name="shop-setup-status-compat"),
+    path("artwork/", include("artwork.urls")),
     path("calculator/config/", workflow_views.CalculatorConfigView.as_view(), name="calculator-config"),
     path("calculator/public-preview/", workflow_views.CalculatorConfigPreviewView.as_view(), name="calculator-public-preview"),
     path("calculator/preview/", workflow_views.CalculatorPreviewView.as_view(), name="calculator-preview"),
