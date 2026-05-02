@@ -72,9 +72,43 @@ class Shop(AutoSlugMixin, models.Model):
         verbose_name=_("description"),
         help_text=_("Business description for the shop."),
     )
+    service_area = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("service area"),
+        help_text=_("Public-facing areas or delivery coverage for this shop."),
+    )
+    turnaround_statement = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("turnaround statement"),
+        help_text=_("Short public-facing turnaround summary shown to buyers."),
+    )
+    opening_hours_text = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("opening hours text"),
+        help_text=_("Optional public summary such as Mon-Sat, 8am-6pm."),
+    )
+    public_whatsapp_number = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        verbose_name=_("public WhatsApp number"),
+        help_text=_("Optional WhatsApp/business number intentionally shared with buyers."),
+    )
+    public_email = models.EmailField(
+        blank=True,
+        default="",
+        verbose_name=_("public email"),
+        help_text=_("Optional public contact email intentionally shared with buyers."),
+    )
     business_email = models.EmailField(
         blank=True,
-        default="shop@example.com",
+        default="shop@printy.ke",
         verbose_name=_("business email"),
         help_text=_("Contact email for the shop."),
     )

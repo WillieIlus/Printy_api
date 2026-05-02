@@ -160,6 +160,11 @@ class PublicShopListSerializer(serializers.ModelSerializer):
     opening_hours = OpeningHoursSerializer(many=True, read_only=True)
     status = serializers.SerializerMethodField()
     description = serializers.CharField(read_only=True)
+    service_area = serializers.CharField(read_only=True)
+    turnaround_statement = serializers.CharField(read_only=True)
+    opening_hours_text = serializers.CharField(read_only=True)
+    public_whatsapp_number = serializers.CharField(read_only=True)
+    public_email = serializers.CharField(read_only=True)
     logo = serializers.SerializerMethodField()
     social_links = serializers.SerializerMethodField()
     schedule_summary = serializers.SerializerMethodField()
@@ -191,6 +196,11 @@ class PublicShopListSerializer(serializers.ModelSerializer):
             "slug",
             "currency",
             "description",
+            "service_area",
+            "turnaround_statement",
+            "opening_hours_text",
+            "public_whatsapp_number",
+            "public_email",
             "logo",
             "city",
             "state",
@@ -1102,6 +1112,11 @@ class ShopSerializer(serializers.ModelSerializer):
             "is_active",
             "owner",
             "description",
+            "service_area",
+            "turnaround_statement",
+            "opening_hours_text",
+            "public_whatsapp_number",
+            "public_email",
             "business_email",
             "phone_number",
             "address_line",
@@ -1117,12 +1132,18 @@ class ShopSerializer(serializers.ModelSerializer):
             "closing_soon_minutes",
             "timezone",
             "same_day_cutoff_time",
+            "is_public",
             "schedule_summary",
         ]
         read_only_fields = ["slug", "owner"]
         extra_kwargs = {
             # Coerce null to "" — model uses blank=True, default="" but no null=True
             "description": {"allow_null": True, "default": ""},
+            "service_area": {"allow_null": True, "default": ""},
+            "turnaround_statement": {"allow_null": True, "default": ""},
+            "opening_hours_text": {"allow_null": True, "default": ""},
+            "public_whatsapp_number": {"allow_null": True, "default": ""},
+            "public_email": {"allow_null": True, "default": ""},
             "business_email": {"allow_null": True, "default": ""},
             "phone_number": {"allow_null": True, "default": ""},
             "address_line": {"allow_null": True, "default": ""},
@@ -1151,6 +1172,21 @@ class ShopSerializer(serializers.ModelSerializer):
         return attrs
 
     def validate_description(self, value):
+        return value or ""
+
+    def validate_service_area(self, value):
+        return value or ""
+
+    def validate_turnaround_statement(self, value):
+        return value or ""
+
+    def validate_opening_hours_text(self, value):
+        return value or ""
+
+    def validate_public_whatsapp_number(self, value):
+        return value or ""
+
+    def validate_public_email(self, value):
         return value or ""
 
     def validate_business_email(self, value):
@@ -1214,6 +1250,12 @@ class PaperSerializer(serializers.ModelSerializer):
     """CRUD for shop papers."""
 
     production_size_detail = ProductionPaperSizeSerializer(source="production_size", read_only=True)
+    display_name = serializers.CharField(read_only=True)
+    available_for_quoting = serializers.BooleanField(source="is_active", required=False)
+    use_for_flat_jobs = serializers.SerializerMethodField()
+    use_for_booklet_covers = serializers.BooleanField(source="is_cover_stock", required=False)
+    use_for_booklet_inserts = serializers.BooleanField(source="is_insert_stock", required=False)
+    use_for_stickers_labels = serializers.BooleanField(source="is_sticker_stock", required=False)
 
     class Meta:
         model = Paper
@@ -1221,12 +1263,17 @@ class PaperSerializer(serializers.ModelSerializer):
             "id",
             "name",
             "display_name",
+            "available_for_quoting",
             "production_size",
             "production_size_detail",
             "sheet_size",
             "gsm",
             "category",
             "paper_type",
+            "use_for_flat_jobs",
+            "use_for_booklet_covers",
+            "use_for_booklet_inserts",
+            "use_for_stickers_labels",
             "is_cover_stock",
             "is_insert_stock",
             "is_sticker_stock",
@@ -1240,6 +1287,13 @@ class PaperSerializer(serializers.ModelSerializer):
             "is_active",
             "is_default",
         ]
+        extra_kwargs = {
+            "name": {"required": False, "allow_blank": True},
+            "paper_type": {"required": False},
+        }
+
+    def get_use_for_flat_jobs(self, obj):
+        return True
 
 
 class PrintingRateSerializer(serializers.ModelSerializer):

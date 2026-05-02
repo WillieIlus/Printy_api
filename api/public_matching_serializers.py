@@ -213,6 +213,18 @@ class ProductionPreviewSerializer(serializers.Serializer):
     selected_finishings = serializers.ListField(child=serializers.CharField(), default=list)
     suggested_finishings = serializers.ListField(child=serializers.CharField(), default=list)
     warnings = serializers.ListField(child=serializers.CharField(), default=list)
+    roll_width_m = serializers.FloatField(required=False, allow_null=True)
+    roll_width_mm = serializers.FloatField(required=False, allow_null=True)
+    items_per_row = serializers.IntegerField(required=False, allow_null=True)
+    rows = serializers.IntegerField(required=False, allow_null=True)
+    used_length_m = serializers.FloatField(required=False, allow_null=True)
+    orientation = serializers.CharField(required=False, allow_null=True)
+    input_size_m = serializers.JSONField(required=False, allow_null=True)
+    charged_area_m2 = serializers.FloatField(required=False, allow_null=True)
+    printed_area_m2 = serializers.FloatField(required=False, allow_null=True)
+    waste_area_m2 = serializers.FloatField(required=False, allow_null=True)
+    overlap_area_m2 = serializers.FloatField(required=False, allow_null=True)
+    tiling = serializers.JSONField(required=False, allow_null=True)
 
 
 class PricingBreakdownLineSerializer(serializers.Serializer):
@@ -230,6 +242,12 @@ class PricingBreakdownSerializer(serializers.Serializer):
     estimated_total = serializers.FloatField(required=False, allow_null=True)
     price_range = serializers.JSONField(required=False, allow_null=True)
     formula = serializers.CharField(required=False, allow_null=True)
+    method = serializers.CharField(required=False, allow_null=True)
+    rate = serializers.FloatField(required=False, allow_null=True)
+    charged_area_m2 = serializers.FloatField(required=False, allow_null=True)
+    charged_length_m = serializers.FloatField(required=False, allow_null=True)
+    minimum_charge = serializers.FloatField(required=False, allow_null=True)
+    minimum_charge_applied = serializers.BooleanField(required=False, allow_null=True)
     lines = PricingBreakdownLineSerializer(many=True, default=list)
 
 
@@ -279,6 +297,9 @@ class PublicMatchShopSerializer(serializers.Serializer):
 class PublicCalculatorResponseSerializer(serializers.Serializer):
     mode = serializers.CharField()
     can_calculate = serializers.BooleanField(required=False, default=True)
+    product_type = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    price_mode = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    total = serializers.CharField(required=False, allow_null=True)
     matches_count = serializers.IntegerField()
     min_price = serializers.CharField(required=False, allow_null=True)
     max_price = serializers.CharField(required=False, allow_null=True)

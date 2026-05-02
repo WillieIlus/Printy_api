@@ -36,6 +36,75 @@ def _resolve_subtype(product_subtype: str) -> dict[str, object]:
     return LARGE_FORMAT_SUBTYPES.get(product_subtype, LARGE_FORMAT_SUBTYPES["banner"])
 
 
+def _sqm(mm2: Decimal | float) -> Decimal:
+    return (Decimal(str(mm2)) / Decimal("1000000")).quantize(Decimal("0.0001"))
+
+
+def _roll_area_sqm(width_mm: float, length_mm: float) -> Decimal:
+    return _sqm(Decimal(str(width_mm)) * Decimal(str(length_mm)))
+
+
+def _pricing_method_for_material(material) -> str:
+    unit = (getattr(material, "unit", "") or "").strip().upper()
+    if unit in {"LM", "LINEAR_METER", "LINEAR_METRE"}:
+        return "per_linear_meter"
+    return "per_square_meter"
+
+
+def _build_panel_sizes(total_size_mm: float, max_tile_size_mm: float, overlap_mm: float) -> list[float]:
+    if total_size_mm <= 0 or max_tile_size_mm <= 0:
+        return []
+    if total_size_mm <= max_tile_size_mm:
+        return [float(total_size_mm)]
+
+    panels: list[float] = []
+    remaining = float(total_size_mm)
+    while remaining > max_tile_size_mm:
+        panels.append(float(max_tile_size_mm))
+        remaining -= max_tile_size_mm - overlap_mm
+    panels.append(float(remaining))
+    return panels
+
+
+def _build_tiling_payload(layout_result: dict | None, width_mm: int, height_mm: int) -> tuple[dict, Decimal]:
+    if not layout_result:
+        return {"required": False, "panels": []}, Decimal("0")
+
+    overlap_mm = float(layout_result.get("overlap_mm") or 0)
+    tile_width_limit = float(layout_result.get("printable_width_mm") or width_mm)
+    tile_height_limit = float(layout_result.get("tile_height_mm") or height_mm)
+    tiles_x = int(layout_result.get("tiles_x") or 1)
+    tiles_y = int(layout_result.get("tiles_y") or 1)
+
+    panel_widths = _build_panel_sizes(float(width_mm), tile_width_limit, overlap_mm if tiles_x > 1 else 0)
+    panel_heights = _build_panel_sizes(float(height_mm), tile_height_limit, overlap_mm if tiles_y > 1 else 0)
+    panels = [
+        {
+            "width_m": round(panel_width / 1000, 3),
+            "height_m": round(panel_height / 1000, 3),
+        }
+        for panel_width in panel_widths
+        for panel_height in panel_heights
+    ]
+
+    tiled_panel_area_mm2 = sum(
+        Decimal(str(panel["width_m"])) * Decimal("1000") * Decimal(str(panel["height_m"])) * Decimal("1000")
+        for panel in panels
+    )
+    artwork_area_mm2 = Decimal(width_mm) * Decimal(height_mm)
+    overlap_area_m2 = _sqm(max(tiled_panel_area_mm2 - artwork_area_mm2, Decimal("0")))
+
+    return (
+        {
+            "required": bool(layout_result.get("needs_tiling")),
+            "overlap_m": round(overlap_mm / 1000, 3) if layout_result.get("needs_tiling") else 0,
+            "panel_count": len(panels),
+            "panels": panels,
+        },
+        overlap_area_m2,
+    )
+
+
 def _build_roll_layout(*, product_subtype: str, width_mm: int, height_mm: int, quantity: int, material):
     media = build_media_spec_from_material(material)
     if not media:
@@ -80,17 +149,32 @@ def calculate_large_format_preview(
     subtype = _resolve_subtype(product_subtype)
     currency = getattr(shop, "currency", "KES") or "KES"
     area_per_piece = _area_per_piece_sqm(width_mm, height_mm)
-    total_area = (area_per_piece * Decimal(quantity)).quantize(Decimal("0.0001"))
+    printed_area = (area_per_piece * Decimal(quantity)).quantize(Decimal("0.0001"))
     material_rate = _decimal(getattr(material, "selling_price", 0))
     print_rate = _decimal(getattr(material, "print_price_per_sqm", 0))
-    material_cost = material_rate * total_area
-    print_cost = print_rate * total_area
+    layout_result, layout_warnings, layout_assumptions = _build_roll_layout(
+        product_subtype=product_subtype,
+        width_mm=width_mm,
+        height_mm=height_mm,
+        quantity=quantity,
+        material=material,
+    )
+    pricing_method = _pricing_method_for_material(material)
+    printable_roll_width_mm = Decimal(str(layout_result.get("printable_width_mm"))) if layout_result else Decimal(str(width_mm))
+    used_length_mm = Decimal(str(layout_result.get("roll_length_mm"))) if layout_result else Decimal(str(height_mm * quantity))
+    charged_area = _roll_area_sqm(float(printable_roll_width_mm), float(used_length_mm)) if layout_result else printed_area
+    charged_length_m = (used_length_mm / Decimal("1000")).quantize(Decimal("0.001"))
+    pricing_base_area = charged_area if pricing_method == "per_square_meter" else printed_area
+    tiling_payload, overlap_area = _build_tiling_payload(layout_result, width_mm, height_mm)
+    waste_area = max(charged_area - printed_area - overlap_area, Decimal("0")).quantize(Decimal("0.0001"))
+    material_cost = material_rate * (charged_area if pricing_method == "per_square_meter" else charged_length_m)
+    print_cost = print_rate * pricing_base_area
 
     finishing_total, finishing_lines = compute_finishing_total(
         finishing_selections,
         quantity=quantity,
         good_sheets=0,
-        area_sqm=total_area,
+        area_sqm=charged_area,
     )
 
     hardware_total = Decimal("0")
@@ -100,23 +184,18 @@ def calculate_large_format_preview(
             hardware_finishing_rate,
             quantity=quantity,
             good_sheets=0,
-            area_sqm=total_area,
+            area_sqm=charged_area,
             selected_side="both",
         ).to_dict()
         hardware_total = _decimal(hardware_line["total"])
 
-    subtotal = material_cost + print_cost + finishing_total + hardware_total
+    minimum_charge = _decimal(getattr(material, "minimum_charge", None), "0")
+    raw_subtotal = material_cost + print_cost + finishing_total + hardware_total
+    minimum_charge_applied = bool(minimum_charge and raw_subtotal < minimum_charge)
+    subtotal = max(raw_subtotal, minimum_charge) if minimum_charge else raw_subtotal
     vat_summary = _resolve_vat_summary(shop, subtotal)
     grand_total = vat_summary["grand_total"]
     unit_price = grand_total / Decimal(quantity) if quantity else Decimal("0")
-
-    layout_result, layout_warnings, layout_assumptions = _build_roll_layout(
-        product_subtype=product_subtype,
-        width_mm=width_mm,
-        height_mm=height_mm,
-        quantity=quantity,
-        material=material,
-    )
 
     resolved_turnaround_hours = turnaround_hours or int(subtype["default_turnaround_hours"])
     turnaround_estimate = estimate_turnaround(shop=shop, working_hours=resolved_turnaround_hours)
@@ -124,16 +203,23 @@ def calculate_large_format_preview(
     warnings = list(layout_warnings)
     assumptions = [
         f"Subtype pricing uses the {str(subtype['label']).lower()} profile.",
-        "Large-format pricing is area-based: material sqm + print sqm + selected charges.",
+        "Large-format pricing is calculated in the backend from roll usage, material pricing, and selected charges.",
         *layout_assumptions,
     ]
 
     explanations = [
         f"Area per piece: {area_per_piece.quantize(Decimal('0.0001'))} sqm.",
-        f"Total area: {total_area} sqm for {quantity} piece(s).",
-        f"Material: {currency} {_format_money(material_rate)} x {total_area} sqm = {_format_money(material_cost)}.",
-        f"Printing: {currency} {_format_money(print_rate)} x {total_area} sqm = {_format_money(print_cost)}.",
+        f"Printed area: {printed_area} sqm for {quantity} piece(s).",
+        f"Charged area: {charged_area} sqm.",
+        f"Used roll length: {charged_length_m} m.",
     ]
+    if pricing_method == "per_linear_meter":
+        explanations.append(f"Material: {currency} {_format_money(material_rate)} x {charged_length_m} linear metres = {_format_money(material_cost)}.")
+    else:
+        explanations.append(f"Material: {currency} {_format_money(material_rate)} x {charged_area} sqm = {_format_money(material_cost)}.")
+    explanations.append(f"Printing: {currency} {_format_money(print_rate)} x {pricing_base_area} sqm = {_format_money(print_cost)}.")
+    if minimum_charge_applied:
+        explanations.append(f"Minimum charge applied: {currency} {_format_money(minimum_charge)}.")
     explanations.extend(line.get("explanation") or "" for line in finishing_lines if line.get("explanation"))
     if hardware_line and hardware_line.get("explanation"):
         explanations.append(str(hardware_line["explanation"]))
@@ -152,18 +238,23 @@ def calculate_large_format_preview(
             "code": "material",
             "label": "Material",
             "amount": _format_money(material_cost),
-            "formula": f"{total_area} sqm x {_format_money(material_rate)}",
+            "formula": (
+                f"{charged_length_m} lm x {_format_money(material_rate)}"
+                if pricing_method == "per_linear_meter"
+                else f"{charged_area} sqm x {_format_money(material_rate)}"
+            ),
             "metadata": {
                 "material_id": material.id,
                 "material_label": f"{material.material_type} ({material.unit})",
                 "unit": material.unit,
+                "pricing_method": pricing_method,
             },
         },
         {
             "code": "printing",
             "label": "Printing",
             "amount": _format_money(print_cost),
-            "formula": f"{total_area} sqm x {_format_money(print_rate)}",
+            "formula": f"{pricing_base_area} sqm x {_format_money(print_rate)}",
             "metadata": {
                 "print_price_per_sqm": _format_money(print_rate),
             },
@@ -221,14 +312,16 @@ def calculate_large_format_preview(
                 "id": material.id,
                 "label": f"{material.material_type} ({material.unit})",
                 "rate_per_sqm": _format_money(material_rate),
+                "rate_per_unit": _format_money(material_rate),
                 "print_price_per_sqm": _format_money(print_rate),
                 "unit": material.unit,
+                "pricing_method": pricing_method,
             },
             "dimensions": {
                 "width_mm": width_mm,
                 "height_mm": height_mm,
                 "area_per_piece_sqm": str(area_per_piece.quantize(Decimal("0.0001"))),
-                "area_sqm": str(total_area),
+                "area_sqm": str(printed_area),
             },
             "layout_result": layout_result,
             "turnaround": turnaround_breakdown,
@@ -270,24 +363,48 @@ def calculate_large_format_preview(
                 "width_mm": width_mm,
                 "height_mm": height_mm,
                 "area_per_piece_sqm": str(area_per_piece.quantize(Decimal("0.0001"))),
-                "area_sqm": str(total_area),
+                "area_sqm": str(printed_area),
             },
             "material": {
                 "id": material.id,
                 "label": f"{material.material_type} ({material.unit})",
                 "unit": material.unit,
                 "rate_per_sqm": _format_money(material_rate),
+                "rate_per_unit": _format_money(material_rate),
                 "total": _format_money(material_cost),
+                "pricing_method": pricing_method,
             },
             "printing": {
                 "rate_per_sqm": _format_money(print_rate),
                 "total": _format_money(print_cost),
-                "formula": f"area_sqm x {_format_money(print_rate)}",
-                "explanation": f"{total_area} sqm x {currency} {_format_money(print_rate)}",
+                "formula": f"charged_area_sqm x {_format_money(print_rate)}",
+                "explanation": f"{pricing_base_area} sqm x {currency} {_format_money(print_rate)}",
             },
             "finishings": finishing_lines,
             "hardware": hardware_line,
             "layout": layout_result,
+            "roll_usage": {
+                "roll_width_mm": float(printable_roll_width_mm),
+                "used_length_mm": float(used_length_mm),
+                "charged_area_sqm": str(charged_area),
+                "printed_area_sqm": str(printed_area),
+                "overlap_area_sqm": str(overlap_area),
+                "waste_area_sqm": str(waste_area),
+                "items_per_row": layout_result.get("items_across") if layout_result else 1,
+                "rows": layout_result.get("total_rows") if layout_result else quantity,
+                "orientation": "rotated" if layout_result and layout_result.get("rotated") else "normal",
+            },
+            "tiling": tiling_payload,
+            "pricing": {
+                "method": pricing_method,
+                "rate": float(material_rate),
+                "print_rate": float(print_rate),
+                "charged_area_m2": float(charged_area),
+                "charged_length_m": float(charged_length_m),
+                "minimum_charge": float(minimum_charge) if minimum_charge else None,
+                "minimum_charge_applied": minimum_charge_applied,
+                "subtotal": float(subtotal),
+            },
             "turnaround": turnaround_breakdown,
             "vat": vat_summary["vat"],
         },
@@ -306,4 +423,20 @@ def calculate_large_format_preview(
         "tiles_x": layout_result.get("tiles_x") if layout_result else None,
         "tiles_y": layout_result.get("tiles_y") if layout_result else None,
         "total_tiles": layout_result.get("total_tiles") if layout_result else None,
+        "items_per_row": layout_result.get("items_across") if layout_result else 1,
+        "rows": layout_result.get("total_rows") if layout_result else quantity,
+        "orientation": "rotated" if layout_result and layout_result.get("rotated") else "normal",
+        "used_length_m": float(charged_length_m),
+        "charged_area_m2": float(charged_area),
+        "printed_area_m2": float(printed_area),
+        "waste_area_m2": float(waste_area),
+        "overlap_area_m2": float(overlap_area),
+        "tiling": tiling_payload,
+        "pricing": {
+            "method": pricing_method,
+            "rate": float(material_rate),
+            "print_rate": float(print_rate),
+            "subtotal": float(subtotal),
+            "minimum_charge_applied": minimum_charge_applied,
+        },
     }

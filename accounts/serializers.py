@@ -158,14 +158,18 @@ class UserCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         user = User.objects.create_user(**validated_data)
         from allauth.account.models import EmailAddress
+        from django.conf import settings as django_settings
+        email_verification = getattr(django_settings, "ACCOUNT_EMAIL_VERIFICATION", "none")
+        verified = email_verification == "none"
         email_address = EmailAddress.objects.create(
             user=user,
             email=user.email,
             primary=True,
-            verified=False,
+            verified=verified,
         )
-        request = self.context.get("request")
-        email_address.send_confirmation(request, signup=True)
+        if not verified:
+            request = self.context.get("request")
+            email_address.send_confirmation(request, signup=True)
         return user
 
 

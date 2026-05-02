@@ -4,6 +4,9 @@ Quote marketplace serializers — customer vs shop separation.
 Customer-facing: minimal shop internals, focus on request status and quote response.
 Shop-facing: full request details, delivery info, services — everything to respond quickly.
 """
+import json
+
+from django.core.serializers.json import DjangoJSONEncoder
 from rest_framework import serializers
 
 from quotes.choices import QuoteStatus, ShopQuoteStatus
@@ -271,6 +274,66 @@ class QuoteRequestMessageSerializer(serializers.ModelSerializer):
         if not sender:
             return "System"
         return getattr(sender, "name", "") or getattr(sender, "email", "") or "User"
+
+
+class QuoteInboxMessageSerializer(serializers.ModelSerializer):
+    quote_request_id = serializers.IntegerField(read_only=True)
+    quote_response_id = serializers.IntegerField(source="shop_quote_id", read_only=True)
+    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    client_name = serializers.SerializerMethodField()
+    snippet = serializers.SerializerMethodField()
+    has_attachment = serializers.SerializerMethodField()
+    attachments_summary = serializers.SerializerMethodField()
+    action_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = QuoteRequestMessage
+        fields = [
+            "id",
+            "subject",
+            "body",
+            "snippet",
+            "message_type",
+            "direction",
+            "quote_request_id",
+            "quote_response_id",
+            "shop_name",
+            "client_name",
+            "read_at",
+            "created_at",
+            "sent_at",
+            "email_status",
+            "has_attachment",
+            "attachments_summary",
+            "action_url",
+        ]
+
+    def get_client_name(self, obj):
+        request = self.context.get("request")
+        if request and getattr(request.user, "id", None) == obj.quote_request.created_by_id:
+            return ""
+        return obj.quote_request.customer_name or ""
+
+    def get_snippet(self, obj):
+        return (obj.body or "").strip()[:140]
+
+    def get_has_attachment(self, obj):
+        return bool(self._attachments(obj))
+
+    def get_attachments_summary(self, obj):
+        return [
+            {"id": attachment.id, "name": attachment.name or attachment.file.name.rsplit("/", 1)[-1]}
+            for attachment in self._attachments(obj)[:5]
+        ]
+
+    def get_action_url(self, obj):
+        metadata = obj.metadata or {}
+        return metadata.get("action_url", "")
+
+    def _attachments(self, obj):
+        if obj.shop_quote_id:
+            return list(obj.shop_quote.attachments.all())
+        return list(obj.quote_request.attachments.all())
 
 
 class ShopQuoteAttachmentSerializer(serializers.ModelSerializer):
@@ -546,6 +609,7 @@ class QuoteRequestShopDetailSerializer(serializers.ModelSerializer):
             "delivery_address",
             "delivery_location",
             "delivery_location_name",
+            "request_snapshot",
             "items",
             "services",
             "attachments",
@@ -707,6 +771,9 @@ class ShopQuoteCreateSerializer(serializers.ModelSerializer):
             quote_request,
             self.validated_data,
             estimate=estimate,
+        )
+        validated_data["response_snapshot"] = json.loads(
+            json.dumps(validated_data["response_snapshot"], cls=DjangoJSONEncoder)
         )
         if revised_pricing_snapshot is not None:
             validated_data["revised_pricing_snapshot"] = revised_pricing_snapshot

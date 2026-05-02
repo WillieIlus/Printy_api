@@ -344,9 +344,10 @@ class Paper(TimeStampedModel):
         # When setting is_default=True, clear it on other papers in the same shop
         if self.is_default and self.shop_id:
             Paper.objects.filter(shop_id=self.shop_id).exclude(pk=self.pk).update(is_default=False)
-        if not self.display_name:
-            fallback_name = (self.name or "").strip()
-            self.display_name = fallback_name or f"{self.get_category_display() or self.get_paper_type_display()} {self.gsm}gsm"
+        # Keep the persisted label aligned with the editable name/category/gsm inputs.
+        fallback_name = (self.name or "").strip()
+        self.name = fallback_name
+        self.display_name = fallback_name or f"{self.get_category_display() or self.get_paper_type_display()} {self.gsm}gsm"
         # Prefer production_size for dimensions; fallback to sheet_size lookup
         if self.production_size_id:
             if self.width_mm is None:

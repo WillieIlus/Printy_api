@@ -9,7 +9,8 @@ from common.geo import haversine_km
 from inventory.models import Machine, Paper
 from locations.models import Location
 from pricing.models import FinishingRate, Material, PrintingRate
-from services.pricing.engine import calculate_large_format_pricing, calculate_sheet_pricing
+from services.pricing.engine import calculate_sheet_pricing
+from services.pricing.large_format import calculate_large_format_preview
 from quotes.turnaround import derive_product_turnaround_hours, estimate_turnaround, humanize_working_hours
 from shops.models import Shop
 
@@ -322,15 +323,16 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
                 payload=payload,
             )
 
-        result = calculate_large_format_pricing(
+        result = calculate_large_format_preview(
             shop=shop,
-            product=product,
+            product_subtype=payload.get("product_subtype") or "banner",
             quantity=payload["quantity"],
-            material=material,
             width_mm=width_mm,
             height_mm=height_mm,
+            material=material,
             finishing_selections=finishing_selections,
-        ).to_dict()
+            turnaround_hours=payload.get("turnaround_hours"),
+        )
         return _attach_turnaround(shop, _build_shop_row(
             shop,
             can_calculate=True,
@@ -434,15 +436,16 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any], product_match:
                 payload=payload,
             )
 
-        result = calculate_large_format_pricing(
+        result = calculate_large_format_preview(
             shop=shop,
-            product=None,
+            product_subtype=payload.get("product_subtype") or "banner",
             quantity=payload["quantity"],
-            material=material,
             width_mm=width_mm,
             height_mm=height_mm,
+            material=material,
             finishing_selections=finishing_selections,
-        ).to_dict()
+            turnaround_hours=payload.get("turnaround_hours"),
+        )
         return _attach_turnaround(shop, _build_shop_row(
             shop,
             can_calculate=True,
@@ -834,7 +837,43 @@ def _extract_production_preview(preview: dict[str, Any]) -> dict[str, Any]:
     breakdown = preview.get("breakdown") or {}
     imposition = breakdown.get("imposition") or {}
     paper = breakdown.get("paper") or {}
-    
+    roll_usage = breakdown.get("roll_usage") or {}
+    dimensions = breakdown.get("dimensions") or {}
+    pricing = breakdown.get("pricing") or {}
+
+    if preview.get("quote_type") == "large_format":
+        return {
+            "pieces_per_sheet": None,
+            "sheets_required": None,
+            "parent_sheet": None,
+            "imposition_label": None,
+            "size_label": preview.get("size_label"),
+            "quantity": preview.get("quantity"),
+            "cutting_required": False,
+            "selected_finishings": [f.get("name") for f in (breakdown.get("finishings") or []) if f.get("name")],
+            "suggested_finishings": [],
+            "warnings": preview.get("explanations") or [],
+            "roll_width_m": (
+                round(float(roll_usage.get("roll_width_mm")) / 1000, 3)
+                if roll_usage.get("roll_width_mm") not in (None, "")
+                else None
+            ),
+            "roll_width_mm": roll_usage.get("roll_width_mm"),
+            "items_per_row": roll_usage.get("items_per_row") or preview.get("items_per_row"),
+            "rows": roll_usage.get("rows") or preview.get("rows"),
+            "used_length_m": preview.get("used_length_m"),
+            "orientation": roll_usage.get("orientation") or preview.get("orientation"),
+            "input_size_m": {
+                "width": round(float(dimensions.get("width_mm")) / 1000, 3),
+                "height": round(float(dimensions.get("height_mm")) / 1000, 3),
+            } if dimensions.get("width_mm") and dimensions.get("height_mm") else None,
+            "charged_area_m2": preview.get("charged_area_m2") or pricing.get("charged_area_m2"),
+            "printed_area_m2": preview.get("printed_area_m2"),
+            "waste_area_m2": preview.get("waste_area_m2"),
+            "overlap_area_m2": preview.get("overlap_area_m2"),
+            "tiling": preview.get("tiling") or breakdown.get("tiling"),
+        }
+
     return {
         "pieces_per_sheet": imposition.get("copies_per_sheet") or preview.get("copies_per_sheet"),
         "sheets_required": imposition.get("good_sheets") or preview.get("good_sheets"),
@@ -853,7 +892,9 @@ def _extract_pricing_breakdown(preview: dict[str, Any]) -> dict[str, Any]:
     totals = preview.get("totals") or {}
     breakdown = preview.get("breakdown") or {}
     per_sheet = breakdown.get("per_sheet_pricing") or {}
-    
+    pricing = breakdown.get("pricing") or preview.get("pricing") or {}
+    material = breakdown.get("material") or {}
+
     return {
         "currency": preview.get("currency") or "KES",
         "paper_price": _as_float(per_sheet.get("paper_price")),
@@ -863,6 +904,12 @@ def _extract_pricing_breakdown(preview: dict[str, Any]) -> dict[str, Any]:
         "estimated_total": _as_float(totals.get("grand_total")),
         "price_range": None,
         "formula": per_sheet.get("formula"),
+        "method": pricing.get("method"),
+        "rate": _as_float(pricing.get("rate") if pricing.get("rate") is not None else material.get("rate_per_unit")),
+        "charged_area_m2": _as_float(pricing.get("charged_area_m2")),
+        "charged_length_m": _as_float(pricing.get("charged_length_m")),
+        "minimum_charge": _as_float(pricing.get("minimum_charge")),
+        "minimum_charge_applied": pricing.get("minimum_charge_applied"),
         "lines": [
             {"label": item.get("label"), "amount": item.get("amount"), "formula": item.get("formula")}
             for item in (preview.get("calculation_result", {}).get("line_items") or [])

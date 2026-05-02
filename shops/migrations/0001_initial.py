@@ -27,7 +27,7 @@ class Migration(migrations.Migration):
                 ('vat_mode', models.CharField(choices=[('inclusive', 'Inclusive'), ('exclusive', 'Exclusive')], default='exclusive', help_text='Whether prices returned by the pricing engine are VAT-inclusive or VAT-exclusive.', max_length=20, verbose_name='VAT mode')),
                 ('is_active', models.BooleanField(default=True, help_text='Whether the shop is active and visible.', verbose_name='is active')),
                 ('description', models.TextField(blank=True, default='Business description for the shop.', help_text='Business description for the shop.', verbose_name='description')),
-                ('business_email', models.EmailField(blank=True, default='shop@example.com', help_text='Contact email for the shop.', max_length=254, verbose_name='business email')),
+                ('business_email', models.EmailField(blank=True, default='shop@printy.ke', help_text='Contact email for the shop.', max_length=254, verbose_name='business email')),
                 ('phone_number', models.CharField(blank=True, default='+254 700 000 000', help_text='Contact phone for the shop.', max_length=32, verbose_name='phone number')),
                 ('address_line', models.CharField(blank=True, default='Street address', help_text='Street address.', max_length=255, verbose_name='address')),
                 ('city', models.CharField(blank=True, default='Nairobi', help_text='City.', max_length=100, verbose_name='city')),

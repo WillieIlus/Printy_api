@@ -4,6 +4,7 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     ConfirmEmailView,
     CustomTokenObtainPairView,
+    GoogleSocialLoginView,
     RegisterView,
     ResendEmailConfirmationView,
     UserDetailView,
@@ -18,4 +19,5 @@ urlpatterns = [
     path("email/verify/", ConfirmEmailView.as_view(), name="email_verify"),
     path("resend-confirmation/", ResendEmailConfirmationView.as_view(), name="resend_confirmation"),
     path("email/resend/", ResendEmailConfirmationView.as_view(), name="email_resend"),
+    path("social/google/", GoogleSocialLoginView.as_view(), name="social_google_login"),
 ]

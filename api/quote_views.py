@@ -7,6 +7,8 @@ C. Shop: /sent-quotes/<id>/ — retrieve, partial_update (revise), create-job
 """
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
+from django.db.models import Q
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -17,12 +19,14 @@ from rest_framework.response import Response
 from notifications.models import Notification
 from notifications.services import notify_quote_event
 from quotes.choices import QuoteStatus, ShopQuoteStatus
+from quotes.messaging import create_quote_message, mark_message_read, mark_messages_read
 from quotes.models import QuoteRequest, QuoteRequestAttachment, QuoteRequestMessage, ShopQuote, ShopQuoteAttachment
 from quotes.draft_pdf import render_quote_draft_pdf
 from quotes.request_brief import build_quote_request_brief, build_quote_request_whatsapp_handoff
 from shops.models import Shop
 
 from .quote_serializers import (
+    QuoteInboxMessageSerializer,
     QuoteRequestAttachmentSerializer,
     QuoteRequestAttachmentUploadSerializer,
     QuoteRequestCustomerCreateSerializer,
@@ -43,14 +47,40 @@ from .quote_serializers import (
 
 
 def _create_request_message(*, quote_request, sender=None, sender_role="system", message_kind="note", body="", shop_quote=None, metadata=None):
-    return QuoteRequestMessage.objects.create(
+    recipient = quote_request.created_by if sender_role == "shop" else quote_request.shop.owner
+    recipient_role = (
+        QuoteRequestMessage.RecipientRole.CLIENT
+        if sender_role == "shop"
+        else QuoteRequestMessage.RecipientRole.SHOP_OWNER
+    )
+    message_type = QuoteRequestMessage.MessageType.SYSTEM_NOTICE
+    if sender_role == "client" and message_kind == "status" and not shop_quote:
+        message_type = QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED
+    elif sender_role == "shop" and message_kind == "question":
+        message_type = QuoteRequestMessage.MessageType.QUOTE_QUESTION
+    elif sender_role == "client" and message_kind == "reply":
+        message_type = QuoteRequestMessage.MessageType.QUOTE_QUESTION
+    elif sender_role == "shop" and message_kind == "quote":
+        message_type = QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT
+    elif sender_role == "shop" and message_kind == "rejection":
+        message_type = QuoteRequestMessage.MessageType.QUOTE_REJECTED
+    elif sender_role == "client" and message_kind == "status" and shop_quote:
+        message_type = QuoteRequestMessage.MessageType.QUOTE_ACCEPTED
+    return create_quote_message(
         quote_request=quote_request,
         sender=sender,
+        recipient=recipient,
+        recipient_email=getattr(recipient, "email", "") if recipient else "",
         sender_role=sender_role,
+        recipient_role=recipient_role,
         message_kind=message_kind,
+        message_type=message_type,
+        direction=QuoteRequestMessage.Direction.INBOUND,
         body=body or "",
         shop_quote=shop_quote,
         metadata=metadata or {},
+        send_email_copy=bool(getattr(recipient, "email", "") if recipient else ""),
+        create_failure_notice=True,
     )
 
 
@@ -175,6 +205,19 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             body="Request submitted to the shop.",
             metadata={"status": QuoteStatus.SUBMITTED},
         )
+        create_quote_message(
+            quote_request=qr,
+            sender=request.user,
+            recipient=request.user,
+            sender_role=QuoteRequestMessage.SenderRole.CLIENT,
+            recipient_role=QuoteRequestMessage.RecipientRole.CLIENT,
+            message_kind=QuoteRequestMessage.MessageKind.STATUS,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED,
+            direction=QuoteRequestMessage.Direction.OUTBOUND,
+            subject=f"Quote request sent to {qr.shop.name}",
+            body="Your quote request was sent successfully.",
+            metadata={"status": QuoteStatus.SUBMITTED},
+        )
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
             notify_quote_event(
                 recipient=qr.shop.owner,
@@ -214,11 +257,24 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         shop_quote.status = ShopQuoteStatus.ACCEPTED
-        shop_quote.save(update_fields=["status", "updated_at"])
+        shop_quote.accepted_at = timezone.now()
+        shop_quote.rejected_at = None
+        shop_quote.rejection_reason = ""
+        shop_quote.rejection_message = ""
+        shop_quote.save(
+            update_fields=[
+                "status",
+                "accepted_at",
+                "rejected_at",
+                "rejection_reason",
+                "rejection_message",
+                "updated_at",
+            ]
+        )
         if qr.status in (QuoteStatus.REJECTED, QuoteStatus.CANCELLED, QuoteStatus.EXPIRED):
             return Response({"detail": "This request can no longer be accepted."}, status=status.HTTP_400_BAD_REQUEST)
-        if qr.status != QuoteStatus.QUOTED:
-            qr.status = QuoteStatus.QUOTED
+        if qr.status != QuoteStatus.CLOSED:
+            qr.status = QuoteStatus.CLOSED
             qr.save(update_fields=["status", "updated_at"])
         _create_request_message(
             quote_request=qr,
@@ -226,6 +282,20 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             sender_role="client",
             message_kind="status",
             body="Client accepted the quote.",
+            shop_quote=shop_quote,
+            metadata={"quote_status": ShopQuoteStatus.ACCEPTED},
+        )
+        create_quote_message(
+            quote_request=qr,
+            sender=request.user,
+            recipient=request.user,
+            sender_role=QuoteRequestMessage.SenderRole.CLIENT,
+            recipient_role=QuoteRequestMessage.RecipientRole.CLIENT,
+            message_kind=QuoteRequestMessage.MessageKind.STATUS,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_ACCEPTED,
+            direction=QuoteRequestMessage.Direction.OUTBOUND,
+            subject=f"Accepted quote from {qr.shop.name}",
+            body="You accepted this quote in Printy.",
             shop_quote=shop_quote,
             metadata={"quote_status": ShopQuoteStatus.ACCEPTED},
         )
@@ -349,7 +419,9 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
         shop = self.get_shop()
         if self.request.user.is_staff:
             return True
-        return shop.owner_id == self.request.user.id
+        if shop.owner_id == self.request.user.id:
+            return True
+        return shop.memberships.filter(user=self.request.user, is_active=True).exists()
 
     def list(self, request, *args, **kwargs):
         if not self.check_shop_owner():
@@ -541,6 +613,25 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
                         "human_ready_text": shop_quote.human_ready_text,
                     },
                 )
+                create_quote_message(
+                    quote_request=qr,
+                    shop_quote=shop_quote,
+                    sender=request.user,
+                    recipient=request.user,
+                    sender_role=QuoteRequestMessage.SenderRole.SHOP,
+                    recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+                    message_kind=QuoteRequestMessage.MessageKind.QUOTE,
+                    message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
+                    direction=QuoteRequestMessage.Direction.OUTBOUND,
+                    subject=f"Quote sent to {qr.customer_name or 'client'}",
+                    body=serializer.validated_data.get("note", "") or "The shop sent a quote.",
+                    metadata={
+                        "status": QuoteStatus.QUOTED,
+                        "quote_status": shop_quote.status,
+                        "total": str(total),
+                        "turnaround_days": shop_quote.turnaround_days,
+                    },
+                )
             else:
                 qr.status = QuoteStatus.AWAITING_SHOP_ACTION
                 qr.save(update_fields=["status", "updated_at"])
@@ -644,6 +735,25 @@ class ShopQuoteViewSet(viewsets.ModelViewSet):
                 "turnaround_hours": quote.turnaround_hours,
                 "estimated_ready_at": quote.estimated_ready_at.isoformat() if quote.estimated_ready_at else None,
                 "human_ready_text": quote.human_ready_text,
+            },
+        )
+        create_quote_message(
+            quote_request=quote.quote_request,
+            shop_quote=quote,
+            sender=request.user,
+            recipient=request.user,
+            sender_role=QuoteRequestMessage.SenderRole.SHOP,
+            recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+            message_kind=QuoteRequestMessage.MessageKind.QUOTE,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
+            direction=QuoteRequestMessage.Direction.OUTBOUND,
+            subject=f"Quote sent to {quote.quote_request.customer_name or 'client'}",
+            body=quote.note or "The shop revised the quote.",
+            metadata={
+                "status": QuoteStatus.QUOTED,
+                "quote_status": quote.status,
+                "total": str(quote.total or ""),
+                "turnaround_days": quote.turnaround_days,
             },
         )
         qr = quote.quote_request
@@ -808,3 +918,98 @@ class ShopQuoteAttachmentViewSet(viewsets.ModelViewSet):
             ShopQuoteAttachmentSerializer(serializer.instance).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+class ClientMessageInboxViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
+
+    def _base_queryset(self, request):
+        return QuoteRequestMessage.objects.filter(
+            quote_request__created_by=request.user,
+            recipient_role=QuoteRequestMessage.RecipientRole.CLIENT,
+        ).select_related("quote_request", "shop", "shop_quote")
+
+    def list(self, request):
+        queryset = self._base_queryset(request).filter(
+            direction=QuoteRequestMessage.Direction.INBOUND,
+        ).order_by("-sent_at", "-created_at", "-id")
+        return Response(QuoteInboxMessageSerializer(queryset, many=True, context={"request": request}).data)
+
+    @action(detail=False, methods=["get"], url_path="outbox")
+    def outbox(self, request):
+        queryset = self._base_queryset(request).filter(
+            direction=QuoteRequestMessage.Direction.OUTBOUND,
+        ).order_by("-sent_at", "-created_at", "-id")
+        return Response(QuoteInboxMessageSerializer(queryset, many=True, context={"request": request}).data)
+
+    @action(detail=False, methods=["get"], url_path="unread-count")
+    def unread_count(self, request):
+        count = self._base_queryset(request).filter(
+            direction=QuoteRequestMessage.Direction.INBOUND,
+            read_at__isnull=True,
+        ).count()
+        return Response({"unread_count": count})
+
+    @action(detail=True, methods=["post"], url_path="read")
+    def read(self, request, pk=None):
+        message = get_object_or_404(self._base_queryset(request), pk=pk)
+        mark_message_read(message)
+        return Response(QuoteInboxMessageSerializer(message, context={"request": request}).data)
+
+    @action(detail=False, methods=["post"], url_path="mark-all-read")
+    def mark_all_read(self, request):
+        updated = mark_messages_read(
+            self._base_queryset(request).filter(direction=QuoteRequestMessage.Direction.INBOUND)
+        )
+        return Response({"marked_read": updated})
+
+
+class ShopMessageInboxViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
+
+    def _accessible_shop_ids(self, request):
+        return list(
+            Shop.objects.filter(
+                Q(owner=request.user) | Q(memberships__user=request.user, memberships__is_active=True)
+            ).values_list("id", flat=True).distinct()
+        )
+
+    def _base_queryset(self, request):
+        return QuoteRequestMessage.objects.filter(
+            shop_id__in=self._accessible_shop_ids(request),
+            recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+        ).select_related("quote_request", "shop", "shop_quote")
+
+    def list(self, request):
+        queryset = self._base_queryset(request).filter(
+            direction=QuoteRequestMessage.Direction.INBOUND,
+        ).order_by("-sent_at", "-created_at", "-id")
+        return Response(QuoteInboxMessageSerializer(queryset, many=True, context={"request": request}).data)
+
+    @action(detail=False, methods=["get"], url_path="outbox")
+    def outbox(self, request):
+        queryset = self._base_queryset(request).filter(
+            direction=QuoteRequestMessage.Direction.OUTBOUND,
+        ).order_by("-sent_at", "-created_at", "-id")
+        return Response(QuoteInboxMessageSerializer(queryset, many=True, context={"request": request}).data)
+
+    @action(detail=False, methods=["get"], url_path="unread-count")
+    def unread_count(self, request):
+        count = self._base_queryset(request).filter(
+            direction=QuoteRequestMessage.Direction.INBOUND,
+            read_at__isnull=True,
+        ).count()
+        return Response({"unread_count": count})
+
+    @action(detail=True, methods=["post"], url_path="read")
+    def read(self, request, pk=None):
+        message = get_object_or_404(self._base_queryset(request), pk=pk)
+        mark_message_read(message)
+        return Response(QuoteInboxMessageSerializer(message, context={"request": request}).data)
+
+    @action(detail=False, methods=["post"], url_path="mark-all-read")
+    def mark_all_read(self, request):
+        updated = mark_messages_read(
+            self._base_queryset(request).filter(direction=QuoteRequestMessage.Direction.INBOUND)
+        )
+        return Response({"marked_read": updated})

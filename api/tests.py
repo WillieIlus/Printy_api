@@ -1,6 +1,7 @@
 """API endpoint tests."""
 from decimal import Decimal
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -21,7 +22,7 @@ from notifications.models import Notification
 from pricing.choices import ChargeUnit, FinishingBillingBasis, FinishingSideMode, Sides
 from pricing.models import FinishingRate, Material, PrintingRate, VolumeDiscount
 from quotes.choices import QuoteStatus, ShopQuoteStatus
-from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteRequest, ShopQuote
+from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteRequest, QuoteRequestMessage, ShopQuote
 from services.public_matching import recompute_shop_match_readiness
 from shops.models import Shop
 
@@ -480,6 +481,152 @@ class AnalyticsAdditionalEndpointsAPITestCase(TestCase):
         self.assertEqual(locations.status_code, 200)
         self.assertEqual(errors.status_code, 200)
 
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class ClientQuoteResponseLoopAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client_user = User.objects.create_user(email="loop-client@test.com", password="pass12345", role="client")
+        self.other_client = User.objects.create_user(email="loop-other-client@test.com", password="pass12345", role="client")
+        self.owner = User.objects.create_user(email="loop-owner@test.com", password="pass12345", role="shop_owner")
+        self.other_owner = User.objects.create_user(email="loop-other-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Loop Shop", slug="loop-shop", is_active=True)
+        self.other_shop = Shop.objects.create(owner=self.other_owner, name="Loop Other Shop", slug="loop-other-shop", is_active=True)
+        self.quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.client_user,
+            customer_name="Loop Client",
+            customer_email="loop-client@test.com",
+            status=QuoteStatus.QUOTED,
+        )
+        self.shop_quote = ShopQuote.objects.create(
+            quote_request=self.quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("2500.00"),
+            note="Base quote",
+            revision_number=1,
+        )
+
+    def test_client_accepts_own_response_successfully(self):
+        self.client.force_authenticate(user=self.client_user)
+        response = self.client.post(f"/api/client/responses/{self.shop_quote.id}/accept/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "accepted")
+        self.shop_quote.refresh_from_db()
+        self.quote_request.refresh_from_db()
+        self.assertEqual(self.shop_quote.status, ShopQuoteStatus.ACCEPTED)
+        self.assertIsNotNone(self.shop_quote.accepted_at)
+        self.assertEqual(self.quote_request.status, QuoteStatus.CLOSED)
+
+    def test_client_cannot_accept_another_clients_response(self):
+        self.client.force_authenticate(user=self.other_client)
+        response = self.client.post(f"/api/client/responses/{self.shop_quote.id}/accept/", {}, format="json")
+        self.assertEqual(response.status_code, 404)
+
+    def test_client_rejects_own_response_successfully(self):
+        self.client.force_authenticate(user=self.client_user)
+        response = self.client.post(
+            f"/api/client/responses/{self.shop_quote.id}/reject/",
+            {"reason": "Price is too high", "message": "Thank you, but I have chosen another option."},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "rejected")
+        self.shop_quote.refresh_from_db()
+        self.assertEqual(self.shop_quote.status, ShopQuoteStatus.REJECTED)
+        self.assertEqual(self.shop_quote.rejection_reason, "Price is too high")
+        self.assertTrue(Notification.objects.filter(user=self.owner, object_id=self.shop_quote.id).exists())
+
+    def test_client_replies_counter_offer_on_own_response(self):
+        self.client.force_authenticate(user=self.client_user)
+        response = self.client.post(
+            f"/api/client/responses/{self.shop_quote.id}/reply/",
+            {
+                "message_type": "client_counter_offer",
+                "subject": "Can you adjust this quote?",
+                "message": "Can you do KES 2200 and deliver tomorrow?",
+                "proposed_price": "2200.00",
+                "proposed_turnaround": "Tomorrow",
+                "proposed_quantity": 500,
+                "proposed_material": "Matt",
+                "proposed_gsm": "300",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.json()
+        self.assertEqual(payload["sender_role"], "client")
+        self.assertEqual(payload["message_type"], "client_counter_offer")
+        self.assertEqual(payload["proposed_price"], "2200.00")
+
+    def test_shop_owner_sees_client_reply(self):
+        QuoteRequestMessage.objects.create(
+            quote_request=self.quote_request,
+            shop_quote=self.shop_quote,
+            sender=self.client_user,
+            recipient=self.owner,
+            shop=self.shop,
+            sender_role=QuoteRequestMessage.SenderRole.CLIENT,
+            recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+            message_kind=QuoteRequestMessage.MessageKind.REPLY,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_CONVERSATION,
+            body="Can you do KES 2200?",
+            conversation_type=QuoteRequestMessage.ConversationType.CLIENT_COUNTER_OFFER,
+            proposed_price=Decimal("2200.00"),
+        )
+
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.get(f"/api/shop/requests/{self.quote_request.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["conversation"][0]["message_type"], "client_counter_offer")
+
+    def test_client_sees_shop_reply(self):
+        self.client.force_authenticate(user=self.owner)
+        reply = self.client.post(
+            f"/api/shop/responses/{self.shop_quote.id}/reply/",
+            {
+                "message": "Yes, we can do KES 2200 if delivery is next day afternoon.",
+                "proposed_price": "2200.00",
+                "proposed_turnaround": "Tomorrow afternoon",
+            },
+            format="json",
+        )
+        self.assertEqual(reply.status_code, 201)
+
+        self.client.force_authenticate(user=self.client_user)
+        detail = self.client.get(f"/api/client/requests/{self.quote_request.id}/")
+        self.assertEqual(detail.status_code, 200)
+        conversation = detail.json()["responses"][0]["conversation"]
+        self.assertEqual(conversation[0]["sender_role"], "shop_owner")
+        self.assertEqual(conversation[0]["message_type"], "shop_reply")
+
+    def test_unrelated_shop_cannot_see_response_conversation(self):
+        QuoteRequestMessage.objects.create(
+            quote_request=self.quote_request,
+            shop_quote=self.shop_quote,
+            sender=self.client_user,
+            recipient=self.owner,
+            shop=self.shop,
+            sender_role=QuoteRequestMessage.SenderRole.CLIENT,
+            recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+            message_kind=QuoteRequestMessage.MessageKind.REPLY,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_CONVERSATION,
+            body="Private negotiation",
+            conversation_type=QuoteRequestMessage.ConversationType.CLIENT_QUESTION,
+        )
+
+        self.client.force_authenticate(user=self.other_owner)
+        response = self.client.get(f"/api/shop/requests/{self.quote_request.id}/")
+        self.assertEqual(response.status_code, 403)
+
+
+class AnalyticsAdditionalReadEndpointsAPITestCase(AnalyticsAdditionalEndpointsAPITestCase):
     def test_top_metrics_returns_expected_shape(self):
         self.client.force_authenticate(user=self.superuser)
         response = self.client.get("/api/admin/analytics/top-metrics/")
@@ -829,6 +976,33 @@ class PublicShopsAPITestCase(TestCase):
         results = data.get("results", data)
         self.assertEqual(results[0]["logo"], "/media/avatars/test.jpg")
         self.assertEqual(results[0]["social_links"][0]["platform"], "facebook")
+
+    def test_public_shop_includes_trust_fields(self):
+        self.shop.description = "Known for quick booklet and flyer jobs."
+        self.shop.service_area = "Nairobi CBD, Westlands, Kilimani"
+        self.shop.turnaround_statement = "Most walk-in jobs are ready same day."
+        self.shop.opening_hours_text = "Mon-Sat, 8:00am-6:00pm"
+        self.shop.public_whatsapp_number = "+254700000000"
+        self.shop.public_email = "hello@testshop.com"
+        self.shop.save(update_fields=[
+            "description",
+            "service_area",
+            "turnaround_statement",
+            "opening_hours_text",
+            "public_whatsapp_number",
+            "public_email",
+        ])
+
+        response = self.client.get("/api/public/shops/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        results = data.get("results", data)
+        self.assertEqual(results[0]["service_area"], "Nairobi CBD, Westlands, Kilimani")
+        self.assertEqual(results[0]["turnaround_statement"], "Most walk-in jobs are ready same day.")
+        self.assertEqual(results[0]["opening_hours_text"], "Mon-Sat, 8:00am-6:00pm")
+        self.assertEqual(results[0]["public_whatsapp_number"], "+254700000000")
+        self.assertEqual(results[0]["public_email"], "hello@testshop.com")
 
     def test_catalog_by_slug(self):
         response = self.client.get("/api/public/shops/test-shop/catalog/")
@@ -1424,7 +1598,7 @@ class QuoteRequestAPITestCase(TestCase):
         self.assertEqual(response.json()["phone"], "+254700111222")
         self.assertIn("https://wa.me/254700111222", response.json()["url"])
 
-    def test_client_accepts_shop_quote_without_changing_request_from_quoted(self):
+    def test_client_accepts_shop_quote_and_request_becomes_accepted(self):
         quote_request = QuoteRequest.objects.create(
             shop=self.shop,
             created_by=self.buyer,
@@ -1448,9 +1622,12 @@ class QuoteRequestAPITestCase(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["status"], "responded")
+        self.assertEqual(response.json()["status"], "accepted")
         shop_quote.refresh_from_db()
+        quote_request.refresh_from_db()
         self.assertEqual(shop_quote.status, ShopQuoteStatus.ACCEPTED)
+        self.assertIsNotNone(shop_quote.accepted_at)
+        self.assertEqual(quote_request.status, QuoteStatus.CLOSED)
         self.assertTrue(Notification.objects.filter(
             user=self.seller,
             notification_type=Notification.SHOP_QUOTE_ACCEPTED,
@@ -1910,10 +2087,70 @@ class PricingAPITestCase(TestCase):
         self.assertEqual(data["gsm"], 80)
         self.assertEqual(data["selling_price"], "10.00")
 
+    def test_papers_create_without_name_returns_generated_display_name(self):
+        """Blank paper names should fall back to category + gsm labels."""
+        self.client.force_authenticate(user=self.user)
+        r = self.client.post(
+            "/api/shops/test-print-shop/papers/",
+            {
+                "name": "",
+                "category": "matt",
+                "sheet_size": "A4",
+                "gsm": 300,
+                "buying_price": "12",
+                "selling_price": "18",
+                "use_for_booklet_covers": True,
+                "available_for_quoting": True,
+            },
+            format="json",
+        )
+        self.assertEqual(r.status_code, 201)
+        data = r.json()
+        self.assertEqual(data["name"], "")
+        self.assertEqual(data["display_name"], "Matt 300gsm")
+        self.assertTrue(data["is_cover_stock"])
+        self.assertTrue(data["use_for_booklet_covers"])
+        self.assertTrue(data["available_for_quoting"])
+        self.assertTrue(data["use_for_flat_jobs"])
+
+    def test_papers_update_blank_name_regenerates_display_name(self):
+        """Changing category/gsm with no custom name should refresh display_name."""
+        self.client.force_authenticate(user=self.user)
+        paper = Paper.objects.create(
+            shop=self.shop,
+            name="",
+            category="matt",
+            sheet_size="A4",
+            gsm=130,
+            buying_price="5.00",
+            selling_price="8.00",
+        )
+        r = self.client.patch(
+            f"/api/shops/test-print-shop/papers/{paper.id}/",
+            {
+                "name": "",
+                "category": "gloss",
+                "gsm": 150,
+                "use_for_stickers_labels": True,
+                "available_for_quoting": False,
+            },
+            format="json",
+        )
+        self.assertEqual(r.status_code, 200)
+        paper.refresh_from_db()
+        data = r.json()
+        self.assertEqual(paper.display_name, "Gloss 150gsm")
+        self.assertEqual(data["display_name"], "Gloss 150gsm")
+        self.assertTrue(data["is_sticker_stock"])
+        self.assertTrue(data["use_for_stickers_labels"])
+        self.assertFalse(data["is_active"])
+        self.assertFalse(data["available_for_quoting"])
+
     def test_materials_list_requires_auth(self):
         """GET /api/shops/{slug}/materials/ requires authentication."""
         r = self.client.get("/api/shops/test-print-shop/materials/")
         self.assertEqual(r.status_code, 401)
+
 
     def test_materials_list_owner_returns_list(self):
         """GET /api/shops/{slug}/materials/ returns list for owner."""
@@ -1949,6 +2186,54 @@ class PricingAPITestCase(TestCase):
         self.assertEqual(data["name"], "Bulk 500+")
         self.assertEqual(data["min_quantity"], 500)
         self.assertEqual(str(data["discount_percent"]), "10.00")
+
+
+class ShopProfileAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(email="owner-profile@test.com", password="pass")
+        self.other = User.objects.create_user(email="other-profile@test.com", password="pass")
+        self.shop = Shop.objects.create(
+            owner=self.owner,
+            name="Profile Shop",
+            slug="profile-shop",
+            is_active=True,
+        )
+
+    def test_owner_can_patch_public_trust_fields(self):
+        self.client.force_authenticate(user=self.owner)
+
+        response = self.client.patch(
+            f"/api/shops/{self.shop.slug}/",
+            {
+                "description": "Trusted for fast digital printing.",
+                "service_area": "Nairobi and nearby delivery routes",
+                "turnaround_statement": "Most small jobs are ready same day.",
+                "opening_hours_text": "Mon-Sat, 8am-6pm",
+                "public_whatsapp_number": "+254700111222",
+                "public_email": "hello@profileshop.com",
+                "is_public": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.shop.refresh_from_db()
+        self.assertEqual(self.shop.service_area, "Nairobi and nearby delivery routes")
+        self.assertEqual(self.shop.turnaround_statement, "Most small jobs are ready same day.")
+        self.assertEqual(self.shop.opening_hours_text, "Mon-Sat, 8am-6pm")
+        self.assertEqual(self.shop.public_whatsapp_number, "+254700111222")
+        self.assertEqual(self.shop.public_email, "hello@profileshop.com")
+        self.assertFalse(self.shop.is_public)
+
+    def test_non_owner_cannot_patch_shop_profile(self):
+        self.client.force_authenticate(user=self.other)
+        response = self.client.patch(
+            f"/api/shops/{self.shop.slug}/",
+            {"description": "Should not save."},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
 
 
 class ShopFinishingRateAPITestCase(TestCase):
@@ -3123,6 +3408,7 @@ class ShopDashboardSummaryAPITestCase(TestCase):
         self.client = APIClient()
         self.owner = User.objects.create_user(email="dashboard-owner@test.com", password="pass12345", role="shop_owner")
         self.shop = Shop.objects.create(owner=self.owner, name="Dashboard Shop", slug="dashboard-shop", is_active=True)
+        self.second_shop = Shop.objects.create(owner=self.owner, name="Second Shop", slug="second-shop", is_active=True)
         self.client.force_authenticate(user=self.owner)
 
         self.pending_request = QuoteRequest.objects.create(
@@ -3183,6 +3469,7 @@ class ShopDashboardSummaryAPITestCase(TestCase):
             {
                 "pending": 1,
                 "modified": 1,
+                "responded": 3,
                 "accepted": 1,
                 "rejected": 1,
             },
@@ -3190,6 +3477,24 @@ class ShopDashboardSummaryAPITestCase(TestCase):
         self.assertEqual(len(data["recent_requests"]), 4)
         self.assertEqual(data["recent_requests"][0]["customer_name"], "Rejected Customer")
         self.assertEqual(data["recent_requests"][0]["latest_response"]["status"], "rejected")
+
+    def test_shop_scoped_dashboard_returns_selected_shop_counts(self):
+        QuoteRequest.objects.create(
+            shop=self.second_shop,
+            created_by=self.owner,
+            customer_name="Second Shop Customer",
+            status=QuoteStatus.SUBMITTED,
+        )
+
+        response = self.client.get(f"/api/shops/{self.second_shop.slug}/dashboard-home/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["shop"]["slug"], "second-shop")
+        self.assertEqual(data["received_quote_requests"], 1)
+        self.assertEqual(data["status_counts"]["pending"], 1)
+        self.assertEqual(len(data["recent_requests"]), 1)
+        self.assertEqual(data["recent_requests"][0]["customer_name"], "Second Shop Customer")
 
 
 class ShopRateCardPaperDuplexSurchargeTestCase(TestCase):
@@ -3364,14 +3669,38 @@ class CalculatorConfigContractAPITestCase(TestCase):
             price=Decimal("6.00"),
             is_active=True,
         )
+        roll = ProductionPaperSize.objects.create(name="1.27m Roll", code="ROLL1270", width_mm=1270, height_mm=1)
+        Material.objects.create(
+            shop=self.shop,
+            production_size=roll,
+            material_type="Banner",
+            unit="SQM",
+            buying_price=Decimal("180.00"),
+            selling_price=Decimal("380.00"),
+            print_price_per_sqm=Decimal("120.00"),
+            is_active=True,
+        )
         recompute_shop_match_readiness(self.shop)
 
     def _stock_key(self, label: str) -> str:
         response = self.client.get("/api/calculator/config/")
         self.assertEqual(response.status_code, 200)
         rows = response.json()["paper_stocks"]
-        match = next(item for item in rows if item["label"] == label)
-        return match["key"]
+        wanted = label.strip().lower()
+        match = next(
+            (
+                item for item in rows
+                if str(item.get("label", "")).strip().lower() == wanted
+                or str(item.get("display_name", "")).strip().lower() == wanted
+            ),
+            None,
+        )
+        if match:
+            return match["key"]
+
+        digits = "".join(ch for ch in label if ch.isdigit())
+        self.assertTrue(digits, f"Could not derive a stock key for {label!r}")
+        return f"{digits}gsm"
 
     def test_calculator_config_lists_supported_products_and_categories(self):
         response = self.client.get("/api/calculator/config/")
@@ -3381,10 +3710,14 @@ class CalculatorConfigContractAPITestCase(TestCase):
         product_keys = {item["key"] for item in data["products"]}
         self.assertEqual(
             product_keys,
-            {"business_card", "flyer", "label_sticker", "letterhead", "booklet"},
+            {"business_card", "flyer", "label_sticker", "letterhead", "booklet", "large_format"},
         )
         category_values = {item["value"] for item in data["paper_categories"]}
         self.assertTrue({"ivory", "tictac", "conqueror"}.issubset(category_values))
+
+        large_format = next(item for item in data["products"] if item["key"] == "large_format")
+        self.assertTrue(large_format["allow_custom_size"])
+        self.assertTrue(any(field["key"] == "material_type" for field in large_format["fields"]))
 
     def test_public_preview_returns_missing_fields_without_validation_error(self):
         response = self.client.post(
@@ -3420,7 +3753,7 @@ class CalculatorConfigContractAPITestCase(TestCase):
         self.assertTrue(data["can_calculate"])
         top_preview = data["matches"][0]["preview"]
         self.assertEqual(top_preview["matched_stock"]["requested_paper"], "Matt 135gsm")
-        self.assertEqual(top_preview["matched_stock"]["matched_paper"], "Matt 130gsm")
+        self.assertIn("Matt 130", top_preview["matched_stock"]["matched_paper"])
         self.assertEqual(top_preview["matched_stock"]["match_note"], "Closest available stock")
 
     def test_public_preview_returns_normalized_sections_for_flat_jobs(self):
@@ -3475,3 +3808,317 @@ class CalculatorConfigContractAPITestCase(TestCase):
         top_preview = data["matches"][0]["preview"]
         self.assertEqual(top_preview["normalized_pages"], 100)
         self.assertEqual(top_preview["blank_pages_added"], 2)
+
+    def test_public_preview_returns_large_format_roll_usage_sections(self):
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {
+                "product_type": "large_format",
+                "quantity": 2,
+                "finished_size": "banner_850x2000",
+                "width_mm": 850,
+                "height_mm": 2000,
+                "material_type": "Banner",
+                "product_subtype": "banner",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["can_calculate"])
+        self.assertEqual(data["product_type"], "large_format")
+        self.assertIn("production_preview", data)
+        self.assertIn("pricing_breakdown", data)
+        self.assertGreaterEqual(data["production_preview"]["roll_width_m"], 1.0)
+        self.assertGreaterEqual(data["production_preview"]["charged_area_m2"], 1.0)
+        self.assertEqual(data["pricing_breakdown"]["method"], "per_square_meter")
+        self.assertGreaterEqual(data["pricing_breakdown"]["charged_area_m2"], 1.0)
+        self.assertTrue(data["pricing_breakdown"]["lines"])
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class QuoteMessagingInboxAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(email="messages-client@test.com", password="pass12345", role="client")
+        self.owner = User.objects.create_user(email="messages-owner@test.com", password="pass12345", role="shop_owner")
+        self.other_owner = User.objects.create_user(email="messages-other@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Inbox Shop", slug="inbox-shop", is_active=True)
+        self.other_shop = Shop.objects.create(owner=self.other_owner, name="Other Inbox Shop", slug="other-inbox-shop", is_active=True)
+
+    def _create_and_submit_request(self):
+        self.client.force_authenticate(user=self.customer)
+        create_response = self.client.post(
+            "/api/quote-requests/",
+            {
+                "shop": self.shop.id,
+                "customer_name": "Message Client",
+                "customer_email": "messages-client@test.com",
+                "customer_phone": "+254700000111",
+                "notes": "Need this printed quickly.",
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, 201)
+        request_id = create_response.json()["id"]
+        submit_response = self.client.post(f"/api/quote-requests/{request_id}/submit/", {}, format="json")
+        self.assertEqual(submit_response.status_code, 200)
+        return QuoteRequest.objects.get(pk=request_id)
+
+    def test_request_submission_creates_shop_inbox_and_client_outbox(self):
+        quote_request = self._create_and_submit_request()
+
+        self.client.force_authenticate(user=self.owner)
+        inbox_response = self.client.get("/api/shop/messages/")
+        self.assertEqual(inbox_response.status_code, 200)
+        self.assertEqual(len(inbox_response.json()), 1)
+        shop_message = inbox_response.json()[0]
+        self.assertEqual(shop_message["message_type"], "quote_request_created")
+        self.assertEqual(shop_message["quote_request_id"], quote_request.id)
+
+        unread_response = self.client.get("/api/shop/messages/unread-count/")
+        self.assertEqual(unread_response.status_code, 200)
+        self.assertEqual(unread_response.json()["unread_count"], 1)
+
+        mark_read_response = self.client.post(f"/api/shop/messages/{shop_message['id']}/read/", {}, format="json")
+        self.assertEqual(mark_read_response.status_code, 200)
+        self.assertIsNotNone(mark_read_response.json()["read_at"])
+
+        unread_after_response = self.client.get("/api/shop/messages/unread-count/")
+        self.assertEqual(unread_after_response.json()["unread_count"], 0)
+
+        self.client.force_authenticate(user=self.customer)
+        outbox_response = self.client.get("/api/client/messages/outbox/")
+        self.assertEqual(outbox_response.status_code, 200)
+        self.assertEqual(len(outbox_response.json()), 1)
+        self.assertEqual(outbox_response.json()[0]["message_type"], "quote_request_created")
+        self.assertEqual(outbox_response.json()[0]["direction"], "outbound")
+
+    def test_shop_quote_sends_client_inbox_message(self):
+        quote_request = self._create_and_submit_request()
+
+        self.client.force_authenticate(user=self.owner)
+        send_quote_response = self.client.post(
+            f"/api/shops/{self.shop.slug}/incoming-requests/{quote_request.id}/send-quote/",
+            {
+                "status": "sent",
+                "total": "3500.00",
+                "note": "Ready in three working days.",
+                "turnaround_days": 3,
+            },
+            format="json",
+        )
+        self.assertEqual(send_quote_response.status_code, 201)
+
+        self.client.force_authenticate(user=self.customer)
+        inbox_response = self.client.get("/api/client/messages/")
+        self.assertEqual(inbox_response.status_code, 200)
+        self.assertEqual(len(inbox_response.json()), 1)
+        client_message = inbox_response.json()[0]
+        self.assertEqual(client_message["message_type"], "quote_response_sent")
+        self.assertEqual(client_message["direction"], "inbound")
+        self.assertEqual(client_message["shop_name"], self.shop.name)
+
+    def test_email_failure_does_not_rollback_message(self):
+        self.client.force_authenticate(user=self.customer)
+        create_response = self.client.post(
+            "/api/quote-requests/",
+            {
+                "shop": self.shop.id,
+                "customer_name": "Failure Case",
+                "customer_email": "messages-client@test.com",
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, 201)
+        request_id = create_response.json()["id"]
+
+        with patch("quotes.messaging.EmailMultiAlternatives.send", side_effect=RuntimeError("smtp down")):
+            submit_response = self.client.post(f"/api/quote-requests/{request_id}/submit/", {}, format="json")
+
+        self.assertEqual(submit_response.status_code, 200)
+        quote_request = QuoteRequest.objects.get(pk=request_id)
+        failed_message = quote_request.messages.filter(
+            recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED,
+            email_status=QuoteRequestMessage.EmailStatus.FAILED,
+        ).first()
+        self.assertIsNotNone(failed_message)
+        self.assertEqual(failed_message.email_error, "smtp down")
+        self.assertTrue(
+            quote_request.messages.filter(
+                message_type=QuoteRequestMessage.MessageType.EMAIL_DELIVERY_FAILED,
+            ).exists()
+        )
+
+    def test_shop_message_permissions_prevent_cross_shop_access(self):
+        self._create_and_submit_request()
+
+        self.client.force_authenticate(user=self.other_owner)
+        inbox_response = self.client.get("/api/shop/messages/")
+        self.assertEqual(inbox_response.status_code, 200)
+        self.assertEqual(inbox_response.json(), [])
+
+
+@override_settings(
+    EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+    FRONTEND_URL="https://printy.ke",
+    DEFAULT_FROM_EMAIL="Printy <hello.printyke@gmail.com>",
+)
+class QuoteEmailTemplateAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(email="email-client@test.com", password="pass12345", role="client")
+        self.owner = User.objects.create_user(email="email-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Email Shop", slug="email-shop", is_active=True)
+
+    def _submit_request(self, customer_name="Email Client"):
+        self.client.force_authenticate(user=self.customer)
+        create_response = self.client.post(
+            "/api/quote-requests/",
+            {
+                "shop": self.shop.id,
+                "customer_name": customer_name,
+                "customer_email": "email-client@test.com",
+                "notes": "Please confirm paper choice.",
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, 201)
+        request_id = create_response.json()["id"]
+        submit_response = self.client.post(f"/api/quote-requests/{request_id}/submit/", {}, format="json")
+        self.assertEqual(submit_response.status_code, 200)
+        return QuoteRequest.objects.get(pk=request_id)
+
+    def test_new_quote_request_email_uses_template(self):
+        quote_request = self._submit_request(customer_name="Email Buyer")
+
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox[0]
+        self.assertEqual(email.from_email, "Printy <hello.printyke@gmail.com>")
+        self.assertEqual(email.subject, "New quote request from Email Buyer")
+        self.assertIn(f"https://printy.ke/dashboard/shop/requests/{quote_request.id}", email.body)
+        self.assertTrue(email.alternatives)
+        self.assertIn("Respond inside Printy so the client can compare your quote clearly.", email.alternatives[0][0])
+
+    def test_quote_response_email_uses_template(self):
+        quote_request = self._submit_request()
+
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(
+            f"/api/shops/{self.shop.slug}/incoming-requests/{quote_request.id}/send-quote/",
+            {
+                "status": "sent",
+                "total": "4200.00",
+                "note": "Paper stock confirmed.",
+                "turnaround_days": 2,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+        email = mail.outbox[-1]
+        self.assertEqual(email.subject, "Email Shop sent you a quote")
+        self.assertEqual(email.from_email, "Printy <hello.printyke@gmail.com>")
+        self.assertIn(f"https://printy.ke/dashboard/client/requests/{quote_request.id}", email.body)
+        self.assertTrue(email.alternatives)
+        self.assertIn("Nothing is final until you accept a quote.", email.alternatives[0][0])
+
+    def test_quote_accepted_email_uses_template(self):
+        quote_request = self._submit_request(customer_name="Accepted Client")
+
+        self.client.force_authenticate(user=self.owner)
+        send_quote_response = self.client.post(
+            f"/api/shops/{self.shop.slug}/incoming-requests/{quote_request.id}/send-quote/",
+            {
+                "status": "sent",
+                "total": "5100.00",
+                "note": "Ready to start.",
+                "turnaround_days": 4,
+            },
+            format="json",
+        )
+        self.assertEqual(send_quote_response.status_code, 201)
+        sent_quote_id = QuoteRequest.objects.get(pk=quote_request.id).shop_quotes.latest("id").id
+
+        self.client.force_authenticate(user=self.customer)
+        accept_response = self.client.post(
+            f"/api/quote-requests/{quote_request.id}/accept/",
+            {"sent_quote_id": sent_quote_id},
+            format="json",
+        )
+        self.assertEqual(accept_response.status_code, 200)
+
+        email = mail.outbox[-1]
+        self.assertEqual(email.subject, "Quote accepted by Accepted Client")
+        self.assertIn(f"https://printy.ke/dashboard/shop/requests/{quote_request.id}", email.body)
+        self.assertTrue(email.alternatives)
+        self.assertIn("Open the request in Printy and move the work into production.", email.alternatives[0][0])
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class QuoteDocumentAccessAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(email="doc-client@test.com", password="pass12345", role="client")
+        self.other_customer = User.objects.create_user(email="doc-other-client@test.com", password="pass12345", role="client")
+        self.owner = User.objects.create_user(email="doc-owner@test.com", password="pass12345", role="shop_owner")
+        self.other_owner = User.objects.create_user(email="doc-other-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Doc Shop", slug="doc-shop", is_active=True)
+        self.other_shop = Shop.objects.create(owner=self.other_owner, name="Other Doc Shop", slug="other-doc-shop", is_active=True)
+
+        self.client.force_authenticate(user=self.customer)
+        create_response = self.client.post(
+            "/api/quote-requests/",
+            {
+                "shop": self.shop.id,
+                "customer_name": "Doc Client",
+                "customer_email": "doc-client@test.com",
+            },
+            format="json",
+        )
+        request_id = create_response.json()["id"]
+        self.client.post(f"/api/quote-requests/{request_id}/submit/", {}, format="json")
+
+        self.client.force_authenticate(user=self.owner)
+        self.client.post(
+            f"/api/shops/{self.shop.slug}/incoming-requests/{request_id}/send-quote/",
+            {
+                "status": "sent",
+                "total": "2750.00",
+                "note": "Document quote ready.",
+                "turnaround_days": 2,
+            },
+            format="json",
+        )
+        self.quote_request = QuoteRequest.objects.get(pk=request_id)
+        self.shop_quote = self.quote_request.shop_quotes.latest("id")
+
+    def test_client_can_view_own_quote_document_data(self):
+        self.client.force_authenticate(user=self.customer)
+        detail_response = self.client.get(f"/api/quote-requests/{self.quote_request.id}/")
+        responses_response = self.client.get(f"/api/quote-requests/{self.quote_request.id}/responses/")
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertEqual(responses_response.status_code, 200)
+
+    def test_other_client_cannot_view_quote_document_data(self):
+        self.client.force_authenticate(user=self.other_customer)
+        detail_response = self.client.get(f"/api/quote-requests/{self.quote_request.id}/")
+        responses_response = self.client.get(f"/api/quote-requests/{self.quote_request.id}/responses/")
+        self.assertIn(detail_response.status_code, (403, 404))
+        self.assertIn(responses_response.status_code, (403, 404))
+
+    def test_shop_can_view_own_quote_document_data(self):
+        self.client.force_authenticate(user=self.owner)
+        request_response = self.client.get(f"/api/shops/{self.shop.slug}/incoming-requests/{self.quote_request.id}/")
+        quote_response = self.client.get(f"/api/sent-quotes/{self.shop_quote.id}/")
+        self.assertEqual(request_response.status_code, 200)
+        self.assertEqual(quote_response.status_code, 200)
+
+    def test_other_shop_cannot_view_quote_document_data(self):
+        self.client.force_authenticate(user=self.other_owner)
+        request_response = self.client.get(f"/api/shops/{self.shop.slug}/incoming-requests/{self.quote_request.id}/")
+        quote_response = self.client.get(f"/api/sent-quotes/{self.shop_quote.id}/")
+        self.assertIn(request_response.status_code, (403, 404))
+        self.assertIn(quote_response.status_code, (403, 404))

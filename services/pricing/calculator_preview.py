@@ -23,6 +23,7 @@ PRODUCT_FAMILY_BY_TYPE = {
     "label_sticker": "flat",
     "letterhead": "flat",
     "booklet": "booklet",
+    "large_format": "large_format",
 }
 
 
@@ -62,6 +63,9 @@ def _build_missing_response(product_type: str, missing_fields: list[str]) -> dic
         "print_sides": "print sides",
         "color_mode": "color mode",
         "total_pages": "total pages",
+        "material_type": "material",
+        "width_mm": "width",
+        "height_mm": "height",
     }
     readable = [field_labels.get(field, field.replace("_", " ")) for field in missing_fields]
     message = f"Choose {', '.join(readable)} to price this {product_type.replace('_', ' ')}."
@@ -188,6 +192,34 @@ def _extract_production_preview(matches: list[dict[str, Any]], product_type: str
         "warnings": warnings,
     }
 
+    if product_type == "large_format":
+        roll_usage = breakdown.get("roll_usage") or {}
+        dimensions = breakdown.get("dimensions") or {}
+        pricing = breakdown.get("pricing") or {}
+        result.update({
+            "size_label": preview_data.get("size_label") or result.get("size_label"),
+            "roll_width_m": (
+                round(float(roll_usage.get("roll_width_mm")) / 1000, 3)
+                if roll_usage.get("roll_width_mm") not in (None, "")
+                else None
+            ),
+            "roll_width_mm": roll_usage.get("roll_width_mm"),
+            "items_per_row": roll_usage.get("items_per_row") or preview_data.get("items_per_row"),
+            "rows": roll_usage.get("rows") or preview_data.get("rows"),
+            "used_length_m": preview_data.get("used_length_m"),
+            "orientation": roll_usage.get("orientation") or preview_data.get("orientation"),
+            "input_size_m": {
+                "width": round(float(dimensions.get("width_mm")) / 1000, 3),
+                "height": round(float(dimensions.get("height_mm")) / 1000, 3),
+            } if dimensions.get("width_mm") and dimensions.get("height_mm") else None,
+            "charged_area_m2": preview_data.get("charged_area_m2") or pricing.get("charged_area_m2"),
+            "printed_area_m2": preview_data.get("printed_area_m2"),
+            "waste_area_m2": preview_data.get("waste_area_m2"),
+            "overlap_area_m2": preview_data.get("overlap_area_m2"),
+            "tiling": preview_data.get("tiling") or breakdown.get("tiling"),
+        })
+        return result
+
     if product_type == "booklet":
         booklet_bd = breakdown.get("booklet") or {}
         cover_bd = breakdown.get("cover") or {}
@@ -218,6 +250,9 @@ def _extract_pricing_breakdown(matches: list[dict[str, Any]]) -> dict[str, Any] 
     per_sheet = preview_data.get("per_sheet_pricing") or breakdown.get("per_sheet_pricing") or {}
     totals = preview_data.get("totals") or {}
     line_items = (preview_data.get("calculation_result") or {}).get("line_items") or []
+    pricing = breakdown.get("pricing") or preview_data.get("pricing") or {}
+    material = breakdown.get("material") or {}
+    material_rate = pricing.get("rate") if pricing.get("rate") is not None else material.get("rate_per_unit")
 
     return {
         "currency": top_match.get("currency", "KES"),
@@ -228,6 +263,12 @@ def _extract_pricing_breakdown(matches: list[dict[str, Any]]) -> dict[str, Any] 
         "estimated_total": totals.get("grand_total"),
         "price_range": None,
         "formula": per_sheet.get("formula"),
+        "method": pricing.get("method"),
+        "rate": material_rate,
+        "charged_area_m2": pricing.get("charged_area_m2"),
+        "charged_length_m": pricing.get("charged_length_m"),
+        "minimum_charge": pricing.get("minimum_charge"),
+        "minimum_charge_applied": pricing.get("minimum_charge_applied"),
         "lines": [
             {
                 "label": item.get("label") or item.get("code") or "Line item",
@@ -272,9 +313,64 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
     if missing_fields:
         return _build_missing_response(product_type, missing_fields)
 
-    size = resolve_finished_size(product_type, payload.get("finished_size"))
-    if not size:
-        return _build_missing_response(product_type, ["finished_size"])
+    if product_type == "large_format":
+        width_mm = payload.get("width_mm")
+        height_mm = payload.get("height_mm")
+        extra_missing: list[str] = []
+        if not width_mm:
+            extra_missing.append("width_mm")
+        if not height_mm:
+            extra_missing.append("height_mm")
+        if extra_missing:
+            return _build_missing_response(product_type, extra_missing)
+
+        request_payload = {
+            "calculator_mode": "marketplace",
+            "product_family": "large_format",
+            "pricing_mode": "custom",
+            "product_pricing_mode": "LARGE_FORMAT",
+            "product_subtype": payload.get("product_subtype") or definition["defaults"].get("product_subtype") or "banner",
+            "quantity": payload.get("quantity"),
+            "width_mm": width_mm,
+            "height_mm": height_mm,
+            "material_type": payload.get("material_type"),
+            "finishing_slugs": [
+                value
+                for value in [
+                    payload.get("lamination") if payload.get("lamination") not in {None, "", "none"} else None,
+                    payload.get("cut_type"),
+                ]
+                if value
+            ],
+            "turnaround_hours": payload.get("turnaround_hours"),
+        }
+        response = get_marketplace_matches(request_payload)
+        response["product_type"] = product_type
+        response["can_calculate"] = bool(response.get("matches_count"))
+        response["price_mode"] = "exact" if response.get("exact_or_estimated") else "estimate"
+        response["missing_fields"] = response.get("missing_requirements", [])
+        response["production_preview"] = response.get("production_preview")
+        response["pricing_breakdown"] = response.get("pricing_breakdown")
+        return response
+
+    finished_size_raw = payload.get("finished_size") or ""
+    custom_warnings: list[str] = []
+
+    paper_selection_mode = payload.get("paper_selection_mode", "configured")
+    if paper_selection_mode == "custom_request":
+        custom_warnings.append("Requested paper needs shop confirmation.")
+
+    if finished_size_raw == "custom":
+        custom_width = payload.get("custom_width_mm") or payload.get("width_mm")
+        custom_height = payload.get("custom_height_mm") or payload.get("height_mm")
+        if not custom_width or not custom_height:
+            return _build_missing_response(product_type, ["custom_width_mm", "custom_height_mm"])
+        size = {"width_mm": float(custom_width), "height_mm": float(custom_height)}
+        custom_warnings.append("Custom size will be priced from actual dimensions.")
+    else:
+        size = resolve_finished_size(product_type, finished_size_raw)
+        if not size:
+            return _build_missing_response(product_type, ["finished_size"])
 
     if product_type == "booklet":
         cover_stock_raw = payload.get("cover_stock") or ""
@@ -283,6 +379,7 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         insert_stock = resolve_stock_option(insert_stock_raw, usage="insert")
         cover_tier_gsm = _parse_tier_gsm(cover_stock_raw) if not cover_stock else None
         insert_tier_gsm = _parse_tier_gsm(insert_stock_raw) if not insert_stock else None
+        color_mode = payload.get("color_mode") or "COLOR"
         request_payload = {
             "product_family": "booklet",
             "quantity": payload.get("quantity"),
@@ -293,6 +390,7 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
             "insert_paper_type": payload.get("requested_insert_paper_category") or (insert_stock or {}).get("category"),
             "insert_paper_gsm": payload.get("requested_insert_gsm") or (insert_stock or {}).get("gsm") or insert_tier_gsm,
             "cover_lamination_mode": payload.get("cover_lamination") or definition["defaults"].get("cover_lamination"),
+            "color_mode": color_mode,
             "width_mm": size["width_mm"],
             "height_mm": size["height_mm"],
             "turnaround_hours": payload.get("turnaround_hours"),
@@ -302,12 +400,14 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         response["can_calculate"] = bool(response.get("matches_count"))
         response["price_mode"] = "exact" if response.get("exact_or_estimated") else "estimate"
         response["missing_fields"] = response.get("missing_requirements", [])
-        
+        if custom_warnings:
+            response["warnings"] = list(response.get("warnings") or []) + custom_warnings
+
         # Attach normalized previews
         matches = response.get("matches", [])
         response["production_preview"] = _extract_production_preview(matches, product_type)
         response["pricing_breakdown"] = _extract_pricing_breakdown(matches)
-        
+
         return _attach_booklet_match_metadata(response, request_payload)
 
     paper_stock_raw = payload.get("paper_stock") or ""
@@ -318,14 +418,15 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
             tier_gsm = int(paper_stock_raw[:-3])
         except ValueError:
             pass
+    is_custom_size = finished_size_raw == "custom"
     request_payload = {
         "calculator_mode": "marketplace",
         "product_family": PRODUCT_FAMILY_BY_TYPE[product_type],
         "pricing_mode": "custom",
         "product_pricing_mode": "SHEET",
         "quantity": payload.get("quantity"),
-        "size_mode": "standard",
-        "size_label": payload.get("finished_size"),
+        "size_mode": "custom" if is_custom_size else "standard",
+        "size_label": None if is_custom_size else finished_size_raw,
         "width_mm": size["width_mm"],
         "height_mm": size["height_mm"],
         "sides": payload.get("print_sides") or definition["defaults"].get("print_sides"),
@@ -349,6 +450,8 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
     response["can_calculate"] = bool(response.get("matches_count"))
     response["price_mode"] = "exact" if response.get("exact_or_estimated") else "estimate"
     response["missing_fields"] = response.get("missing_requirements", [])
+    if custom_warnings:
+        response["warnings"] = list(response.get("warnings") or []) + custom_warnings
 
     # Attach normalized previews
     matches = response.get("matches", [])

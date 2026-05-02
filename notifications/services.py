@@ -64,7 +64,5 @@ def notify_quote_event(
         object_type=object_type,
         object_id=object_id,
         actor=actor,
-        send_email_notification=True,
-        email_subject="Printy quote update",
-        email_message=message,
+        send_email_notification=False,
     )

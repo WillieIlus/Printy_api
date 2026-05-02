@@ -6,7 +6,7 @@ from inventory.models import Machine, Paper
 from pricing.models import FinishingRate, Material
 from api.size_utils import normalize_size_payload, validate_size_selection
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
-from quotes.models import QuoteDraft, QuoteRequest, ShopQuote
+from quotes.models import QuoteDraft, QuoteItem, QuoteRequest, QuoteRequestMessage, ShopQuote
 from quotes.request_brief import build_quote_request_whatsapp_handoff
 from quotes.status_normalization import (
     denormalize_quote_response_status,
@@ -19,6 +19,8 @@ from quotes.status_normalization import (
 )
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours
 from shops.models import Shop
+from .serializers import QuoteItemReadSerializer
+from .quote_serializers import QuoteItemCustomerSerializer, QuoteRequestAttachmentSerializer
 
 
 class FinishingSelectionSerializer(serializers.Serializer):
@@ -33,14 +35,22 @@ class FinishingSelectionSerializer(serializers.Serializer):
 
 class CalculatorConfigPreviewSerializer(serializers.Serializer):
     product_type = serializers.ChoiceField(
-        choices=["business_card", "flyer", "label_sticker", "letterhead", "booklet"],
+        choices=["business_card", "flyer", "label_sticker", "letterhead", "booklet", "large_format"],
         help_text="Homepage calculator product preset to preview.",
     )
     quantity = serializers.IntegerField(required=False, allow_null=True, min_value=1, default=100, help_text="Requested quantity.")
     finished_size = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Use values from /api/calculator/config/, e.g. 85x55mm, A5, A4.")
+    size_mode = serializers.ChoiceField(choices=["standard", "custom"], required=False, default="standard")
+    input_unit = serializers.ChoiceField(choices=["mm", "cm", "m", "in"], required=False, default="mm")
+    width_input = serializers.DecimalField(required=False, allow_null=True, max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
+    height_input = serializers.DecimalField(required=False, allow_null=True, max_digits=10, decimal_places=3, min_value=Decimal("0.001"))
+    width_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    height_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     print_sides = serializers.ChoiceField(choices=["SIMPLEX", "DUPLEX"], required=False, allow_null=True, default="SIMPLEX", help_text="Flat-job print sides.")
     color_mode = serializers.ChoiceField(choices=["BW", "COLOR"], required=False, allow_null=True, default="COLOR", help_text="Flat-job colour mode.")
     paper_stock = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Paper stock key from /api/calculator/config/.")
+    material_type = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Large-format material label from /api/calculator/config/.")
+    product_subtype = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Large-format subtype such as banner or poster.")
     requested_paper_category = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Fallback paper category when the buyer wants the shop to advise.")
     requested_gsm = serializers.IntegerField(required=False, allow_null=True, min_value=1, help_text="Preferred paper gsm.")
     lamination = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Finishing slug such as gloss-lamination or matt-lamination.")
@@ -59,6 +69,19 @@ class CalculatorConfigPreviewSerializer(serializers.Serializer):
     binding_type = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Booklet binding type, e.g. saddle_stitch.")
     cutting = serializers.BooleanField(required=False, allow_null=True, help_text="Whether booklet cutting is requested.")
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1, help_text="Optional turnaround target in working hours.")
+
+    def to_internal_value(self, data):
+        normalized = normalize_size_payload(
+            data,
+            legacy_width_keys=("custom_width_mm",),
+            legacy_height_keys=("custom_height_mm",),
+        )
+        return super().to_internal_value(normalized)
+
+    def validate(self, attrs):
+        if attrs.get("product_type") == "large_format":
+            attrs = validate_size_selection(attrs)
+        return attrs
 
 
 class CalculatorPreviewSerializer(serializers.Serializer):
@@ -481,12 +504,15 @@ class QuoteResponseUpdateSerializer(serializers.Serializer):
 
 class QuoteResponseReadSerializer(serializers.ModelSerializer):
     request_reference = serializers.CharField(source="quote_request.request_reference", read_only=True)
+    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_slug = serializers.CharField(source="shop.slug", read_only=True)
     raw_status = serializers.CharField(source="status", read_only=True)
     status = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
     whatsapp_available = serializers.SerializerMethodField()
     whatsapp_url = serializers.SerializerMethodField()
     whatsapp_label = serializers.SerializerMethodField()
+    conversation = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopQuote
@@ -496,6 +522,8 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
             "quote_request",
             "request_reference",
             "shop",
+            "shop_name",
+            "shop_slug",
             "status",
             "raw_status",
             "status_label",
@@ -508,10 +536,15 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
             "turnaround_label",
             "response_snapshot",
             "revised_pricing_snapshot",
+            "accepted_at",
+            "rejected_at",
+            "rejection_reason",
+            "rejection_message",
             "revision_number",
             "pricing_locked_at",
             "created_at",
             "sent_at",
+            "conversation",
             "whatsapp_available",
             "whatsapp_url",
             "whatsapp_label",
@@ -538,3 +571,272 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
 
     def get_whatsapp_label(self, obj):
         return self._whatsapp_handoff(obj).get("label", "")
+
+    def get_conversation(self, obj):
+        messages = obj.messages.select_related("sender").order_by("created_at", "id")
+        return QuoteConversationMessageSerializer(messages, many=True).data
+
+
+class QuoteConversationMessageSerializer(serializers.ModelSerializer):
+    request_id = serializers.IntegerField(source="quote_request_id", read_only=True)
+    response_id = serializers.IntegerField(source="shop_quote_id", read_only=True)
+    sender_name = serializers.SerializerMethodField()
+    sender_role = serializers.SerializerMethodField()
+    message = serializers.CharField(source="body", read_only=True)
+    message_type = serializers.SerializerMethodField()
+    recipient_user_id = serializers.IntegerField(source="recipient_id", read_only=True)
+    recipient_shop_id = serializers.IntegerField(source="shop_id", read_only=True)
+    is_read = serializers.SerializerMethodField()
+
+    class Meta:
+        model = QuoteRequestMessage
+        fields = [
+            "id",
+            "request_id",
+            "response_id",
+            "sender_name",
+            "sender_role",
+            "recipient_user_id",
+            "recipient_shop_id",
+            "message_type",
+            "subject",
+            "message",
+            "proposed_price",
+            "proposed_turnaround",
+            "proposed_quantity",
+            "proposed_material",
+            "proposed_gsm",
+            "proposed_size",
+            "proposed_finishing",
+            "is_read",
+            "read_at",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_sender_name(self, obj):
+        sender = obj.sender
+        if not sender:
+            return "System"
+        return getattr(sender, "name", "") or getattr(sender, "email", "") or "User"
+
+    def get_sender_role(self, obj):
+        if obj.sender_role == QuoteRequestMessage.SenderRole.SHOP:
+            return "shop_owner"
+        return obj.sender_role
+
+    def get_message_type(self, obj):
+        return obj.conversation_type or obj.message_type
+
+    def get_is_read(self, obj):
+        return obj.read_at is not None
+
+
+class ClientResponseRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=True, allow_blank=False, max_length=255)
+    message = serializers.CharField(required=False, allow_blank=True)
+
+
+class ClientResponseReplySerializer(serializers.Serializer):
+    message_type = serializers.ChoiceField(
+        choices=QuoteRequestMessage.ConversationType.choices,
+    )
+    subject = serializers.CharField(required=False, allow_blank=True)
+    message = serializers.CharField(required=True, allow_blank=False)
+    proposed_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    proposed_turnaround = serializers.CharField(required=False, allow_blank=True)
+    proposed_quantity = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    proposed_material = serializers.CharField(required=False, allow_blank=True)
+    proposed_gsm = serializers.CharField(required=False, allow_blank=True)
+    proposed_size = serializers.CharField(required=False, allow_blank=True)
+    proposed_finishing = serializers.JSONField(required=False)
+
+    def validate_message_type(self, value):
+        allowed = {
+            QuoteRequestMessage.ConversationType.CLIENT_QUESTION,
+            QuoteRequestMessage.ConversationType.CLIENT_COUNTER_OFFER,
+            QuoteRequestMessage.ConversationType.CLIENT_CHANGE_REQUEST,
+            QuoteRequestMessage.ConversationType.CLIENT_FILE_UPDATE,
+        }
+        if value not in allowed:
+            raise serializers.ValidationError("Unsupported client conversation type.")
+        return value
+
+
+class ShopResponseReplySerializer(serializers.Serializer):
+    subject = serializers.CharField(required=False, allow_blank=True)
+    message = serializers.CharField(required=True, allow_blank=False)
+    proposed_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    proposed_turnaround = serializers.CharField(required=False, allow_blank=True)
+    proposed_quantity = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    proposed_material = serializers.CharField(required=False, allow_blank=True)
+    proposed_gsm = serializers.CharField(required=False, allow_blank=True)
+    proposed_size = serializers.CharField(required=False, allow_blank=True)
+    proposed_finishing = serializers.JSONField(required=False)
+
+
+class ClientResponseListItemSerializer(serializers.ModelSerializer):
+    request_id = serializers.IntegerField(source="quote_request_id", read_only=True)
+    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    currency = serializers.CharField(source="shop.currency", read_only=True)
+    price = serializers.DecimalField(source="total", max_digits=12, decimal_places=2, read_only=True)
+    status = serializers.SerializerMethodField()
+    latest_message = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ShopQuote
+        fields = [
+            "id",
+            "request_id",
+            "shop_name",
+            "price",
+            "currency",
+            "turnaround_days",
+            "turnaround_hours",
+            "status",
+            "latest_message",
+            "unread_count",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_latest_message(self, obj):
+        latest = obj.messages.order_by("-created_at", "-id").first()
+        if not latest:
+            return ""
+        return latest.body
+
+    def get_status(self, obj):
+        return normalize_quote_response_status(obj.status)
+
+    def get_unread_count(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not user or not getattr(user, "is_authenticated", False):
+            return 0
+        return obj.messages.filter(
+            recipient=user,
+            recipient_role=QuoteRequestMessage.RecipientRole.CLIENT,
+            read_at__isnull=True,
+        ).count()
+
+
+class ClientQuoteItemDetailSerializer(serializers.ModelSerializer):
+    """Nested item serializer for client-facing detail with production readout."""
+    product_name = serializers.SerializerMethodField()
+    finishings = serializers.SerializerMethodField()
+    sheets_needed = serializers.SerializerMethodField()
+    imposition_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = QuoteItem
+        fields = [
+            "id",
+            "item_type",
+            "product_name",
+            "title",
+            "spec_text",
+            "quantity",
+            "chosen_width_mm",
+            "chosen_height_mm",
+            "sides",
+            "color_mode",
+            "special_instructions",
+            "finishings",
+            "sheets_needed",
+            "imposition_count",
+            "pricing_snapshot",
+        ]
+
+    def get_product_name(self, obj):
+        if obj.item_type == "PRODUCT" and obj.product_id:
+            return obj.product.name
+        return obj.title or ""
+
+    def get_finishings(self, obj):
+        return [
+            {
+                "id": f.id,
+                "finishing_rate_name": f.finishing_rate.get_code_display() if f.finishing_rate else "",
+                "selected_side": f.selected_side,
+            }
+            for f in obj.finishings.all().select_related("finishing_rate")
+        ]
+
+    def get_sheets_needed(self, obj):
+        return (obj.pricing_snapshot or {}).get("sheets_needed")
+
+    def get_imposition_count(self, obj):
+        return (obj.pricing_snapshot or {}).get("imposition_count")
+
+
+class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
+    """
+    Comprehensive serializer for client-facing request detail page.
+    Aggregates responses from all sibling requests (broadcast group).
+    """
+
+    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_slug = serializers.CharField(source="shop.slug", read_only=True)
+    shop_currency = serializers.CharField(source="shop.currency", read_only=True)
+    items = ClientQuoteItemDetailSerializer(many=True, read_only=True)
+    attachments = QuoteRequestAttachmentSerializer(many=True, read_only=True)
+    sibling_responses = serializers.SerializerMethodField()
+    responses = serializers.SerializerMethodField()
+    raw_status = serializers.CharField(source="status", read_only=True)
+    status = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = QuoteRequest
+        fields = [
+            "id",
+            "request_reference",
+            "shop",
+            "shop_name",
+            "shop_slug",
+            "shop_currency",
+            "status",
+            "raw_status",
+            "status_label",
+            "customer_name",
+            "customer_email",
+            "customer_phone",
+            "notes",
+            "delivery_preference",
+            "delivery_address",
+            "delivery_location",
+            "request_snapshot",
+            "items",
+            "attachments",
+            "responses",
+            "sibling_responses",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_status(self, obj):
+        return normalize_quote_request_status(obj.status)
+
+    def get_status_label(self, obj):
+        return quote_request_status_label(self.get_status(obj))
+
+    def get_sibling_responses(self, obj):
+        return self.get_responses(obj)
+
+    def get_responses(self, obj):
+        source_draft = obj.source_draft
+        if not source_draft:
+            siblings = [obj]
+        else:
+            siblings = source_draft.generated_requests.all().select_related("shop")
+
+        responses = []
+        for sib in siblings:
+            # Only show responses that are sent/accepted/etc, not pending drafts
+            latest = sib.shop_quotes.exclude(status=ShopQuoteStatus.PENDING).order_by("-created_at").first()
+            if latest:
+                # We want the full QuoteResponseReadSerializer to give all the details requested
+                responses.append(QuoteResponseReadSerializer(latest, context=self.context).data)
+        return responses

@@ -425,6 +425,31 @@ class ShopQuote(TimeStampedModel):
         verbose_name=_("revised pricing snapshot"),
         help_text=_("Frozen revised pricing payload for this response."),
     )
+    accepted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("accepted at"),
+        help_text=_("When the client accepted this quote."),
+    )
+    rejected_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("rejected at"),
+        help_text=_("When the client rejected or did not select this quote."),
+    )
+    rejection_reason = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("rejection reason"),
+        help_text=_("Short client rejection reason or not-selected reason."),
+    )
+    rejection_message = models.TextField(
+        blank=True,
+        default="",
+        verbose_name=_("rejection message"),
+        help_text=_("Optional detailed rejection message from the client."),
+    )
 
     class Meta:
         ordering = ["-sent_at", "-created_at"]
@@ -458,6 +483,40 @@ class QuoteRequestMessage(TimeStampedModel):
         QUOTE = "quote", "Quote"
         NOTE = "note", "Note"
 
+    class RecipientRole(models.TextChoices):
+        CLIENT = "client", "Client"
+        SHOP_OWNER = "shop_owner", "Shop owner"
+        ADMIN = "admin", "Admin"
+        SYSTEM = "system", "System"
+
+    class MessageType(models.TextChoices):
+        QUOTE_REQUEST_CREATED = "quote_request_created", "Quote request created"
+        QUOTE_RESPONSE_SENT = "quote_response_sent", "Quote response sent"
+        QUOTE_QUESTION = "quote_question", "Quote question"
+        QUOTE_ACCEPTED = "quote_accepted", "Quote accepted"
+        QUOTE_REJECTED = "quote_rejected", "Quote rejected"
+        QUOTE_CONVERSATION = "quote_conversation", "Quote conversation"
+        SYSTEM_NOTICE = "system_notice", "System notice"
+        EMAIL_DELIVERY_FAILED = "email_delivery_failed", "Email delivery failed"
+
+    class ConversationType(models.TextChoices):
+        CLIENT_QUESTION = "client_question", "Client question"
+        CLIENT_COUNTER_OFFER = "client_counter_offer", "Client counter offer"
+        CLIENT_CHANGE_REQUEST = "client_change_request", "Client change request"
+        CLIENT_FILE_UPDATE = "client_file_update", "Client file update"
+        SHOP_REPLY = "shop_reply", "Shop reply"
+        SYSTEM_UPDATE = "system_update", "System update"
+
+    class Direction(models.TextChoices):
+        INBOUND = "inbound", "Inbound"
+        OUTBOUND = "outbound", "Outbound"
+
+    class EmailStatus(models.TextChoices):
+        NOT_SENT = "not_sent", "Not sent"
+        SENT = "sent", "Sent"
+        FAILED = "failed", "Failed"
+        BOUNCED = "bounced", "Bounced"
+
     quote_request = models.ForeignKey(
         QuoteRequest,
         on_delete=models.CASCADE,
@@ -483,12 +542,42 @@ class QuoteRequestMessage(TimeStampedModel):
         verbose_name=_("sender"),
         help_text=_("User who sent this message."),
     )
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="received_quote_request_messages",
+        verbose_name=_("recipient"),
+        help_text=_("User who should see this inbox message."),
+    )
+    shop = models.ForeignKey(
+        Shop,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="quote_request_messages",
+        verbose_name=_("shop"),
+        help_text=_("Shop this message belongs to."),
+    )
+    recipient_email = models.EmailField(
+        blank=True,
+        verbose_name=_("recipient email"),
+        help_text=_("Email copy recipient, if applicable."),
+    )
     sender_role = models.CharField(
         max_length=20,
         choices=SenderRole.choices,
         default=SenderRole.SYSTEM,
         verbose_name=_("sender role"),
         help_text=_("Whether this message came from the client, shop, or system."),
+    )
+    recipient_role = models.CharField(
+        max_length=20,
+        choices=RecipientRole.choices,
+        default=RecipientRole.SYSTEM,
+        verbose_name=_("recipient role"),
+        help_text=_("Who this message is intended for."),
     )
     message_kind = models.CharField(
         max_length=20,
@@ -497,11 +586,119 @@ class QuoteRequestMessage(TimeStampedModel):
         verbose_name=_("message kind"),
         help_text=_("Thread message classification for UI timelines."),
     )
+    message_type = models.CharField(
+        max_length=40,
+        choices=MessageType.choices,
+        default=MessageType.SYSTEM_NOTICE,
+        verbose_name=_("message type"),
+        help_text=_("Normalized message event type for inbox/outbox."),
+    )
+    direction = models.CharField(
+        max_length=20,
+        choices=Direction.choices,
+        default=Direction.INBOUND,
+        verbose_name=_("direction"),
+        help_text=_("Inbox/outbox direction for the receiving user."),
+    )
+    subject = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("subject"),
+        help_text=_("Short subject line for message lists."),
+    )
     body = models.TextField(
         blank=True,
         default="",
         verbose_name=_("body"),
         help_text=_("Visible thread message body."),
+    )
+    conversation_type = models.CharField(
+        max_length=40,
+        choices=ConversationType.choices,
+        blank=True,
+        default="",
+        verbose_name=_("conversation type"),
+        help_text=_("Structured quote conversation type for negotiation and follow-up messages."),
+    )
+    proposed_price = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name=_("proposed price"),
+        help_text=_("Optional proposed price in a conversation message."),
+    )
+    proposed_turnaround = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("proposed turnaround"),
+        help_text=_("Optional proposed turnaround text in a conversation message."),
+    )
+    proposed_quantity = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_("proposed quantity"),
+        help_text=_("Optional proposed quantity in a conversation message."),
+    )
+    proposed_material = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("proposed material"),
+        help_text=_("Optional proposed material in a conversation message."),
+    )
+    proposed_gsm = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        verbose_name=_("proposed gsm"),
+        help_text=_("Optional proposed gsm in a conversation message."),
+    )
+    proposed_size = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("proposed size"),
+        help_text=_("Optional proposed size in a conversation message."),
+    )
+    proposed_finishing = models.JSONField(
+        null=True,
+        blank=True,
+        verbose_name=_("proposed finishing"),
+        help_text=_("Optional proposed finishing selections in a conversation message."),
+    )
+    read_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("read at"),
+        help_text=_("When the recipient opened this message."),
+    )
+    sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("sent at"),
+        help_text=_("When the message event was emitted."),
+    )
+    email_sent = models.BooleanField(
+        default=False,
+        verbose_name=_("email sent"),
+        help_text=_("Whether an email copy was sent successfully."),
+    )
+    email_status = models.CharField(
+        max_length=20,
+        choices=EmailStatus.choices,
+        default=EmailStatus.NOT_SENT,
+        verbose_name=_("email status"),
+        help_text=_("Delivery state for the optional email copy."),
+    )
+    email_error = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        verbose_name=_("email error"),
+        help_text=_("Safe delivery error summary."),
     )
     metadata = models.JSONField(
         null=True,
@@ -514,6 +711,11 @@ class QuoteRequestMessage(TimeStampedModel):
         ordering = ["created_at", "id"]
         verbose_name = _("quote request message")
         verbose_name_plural = _("quote request messages")
+        indexes = [
+            models.Index(fields=["recipient", "read_at"], name="qmsg_recipient_read_idx"),
+            models.Index(fields=["quote_request", "direction"], name="qmsg_request_direction_idx"),
+            models.Index(fields=["shop", "recipient_role"], name="qmsg_shop_role_idx"),
+        ]
 
     def __str__(self):
         return f"{self.get_sender_role_display()} message for request #{self.quote_request_id}"

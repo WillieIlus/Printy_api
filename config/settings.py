@@ -130,10 +130,10 @@ REST_FRAMEWORK = {
 # SimpleJWT
 # =============================================================================
 
-REFRESH_TOKEN_DAYS = 30
+REFRESH_TOKEN_DAYS = 14
 
 SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
+    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=REFRESH_TOKEN_DAYS),
     "ROTATE_REFRESH_TOKENS": True,
     "BLACKLIST_AFTER_ROTATION": True,
@@ -160,7 +160,7 @@ ACCOUNT_LOGIN_METHODS = {"email"}
 ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*", "password2*"]
 ACCOUNT_UNIQUE_EMAIL = True
 ACCOUNT_USER_MODEL_USERNAME_FIELD = None
-ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+ACCOUNT_EMAIL_VERIFICATION = os.environ.get("ACCOUNT_EMAIL_VERIFICATION", "none")
 ACCOUNT_EMAIL_SUBJECT_PREFIX = ""
 ACCOUNT_CONFIRM_EMAIL_ON_GET = True
 ACCOUNT_DEFAULT_HTTP_PROTOCOL = "http" if DEBUG else "https"
@@ -205,11 +205,23 @@ EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "")
 EMAIL_TIMEOUT = 10
 DEFAULT_FROM_EMAIL = os.environ.get(
-    "DEFAULT_FROM_EMAIL", "Printyke <hello.printyke@gmail.com>"
+    "DEFAULT_FROM_EMAIL", "Printy <hello.printyke@gmail.com>"
 )
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
+ADMIN_NOTIFY_EMAIL = os.environ.get("ADMIN_NOTIFY_EMAIL", "hello.printyke@gmail.com")
 
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+
+if not DEBUG and "localhost" in FRONTEND_URL:
+    import warnings
+    warnings.warn(
+        f"FRONTEND_URL is set to '{FRONTEND_URL}' but DEBUG=False. "
+        "Production emails will contain localhost links. "
+        "Set FRONTEND_URL=https://printy.ke in your environment.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
 EMAIL_CONFIRMATION_URL = f"{FRONTEND_URL}/auth/confirm-email"
 PASSWORD_RESET_URL = f"{FRONTEND_URL}/auth/reset-password"
 

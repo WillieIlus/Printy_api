@@ -6,6 +6,7 @@ from rest_framework.routers import DefaultRouter
 
 from billing import views as billing_views
 from . import public_matching_views, quote_views, views, workflow_views
+from .workflow_views import GuestQuoteRequestView
 from .analytics_views import AnalyticsEventIngestView
 from .admin_views import (
     AnalyticsDashboardSummaryView,
@@ -67,6 +68,10 @@ job_claims_router.register(r"job-claims", JobClaimViewSet, basename="job-claim")
 
 notifications_router = DefaultRouter()
 notifications_router.register(r"", NotificationViewSet, basename="notification")
+client_messages_router = DefaultRouter()
+client_messages_router.register(r"client/messages", quote_views.ClientMessageInboxViewSet, basename="client-message")
+shop_messages_router = DefaultRouter()
+shop_messages_router.register(r"shop/messages", quote_views.ShopMessageInboxViewSet, basename="shop-message")
 
 urlpatterns = [
     path("setup-status/", workflow_views.SetupStatusCompatView.as_view(), name="setup-status-compat"),
@@ -82,9 +87,18 @@ urlpatterns = [
     path("calculator/drafts/<int:pk>/send/", workflow_views.QuoteDraftSendView.as_view(), name="calculator-draft-send"),
     path("workflow/quote-requests/", workflow_views.QuoteRequestListView.as_view(), name="workflow-quote-request-list"),
     path("workflow/quote-requests/<int:pk>/", workflow_views.QuoteRequestDetailView.as_view(), name="workflow-quote-request-detail"),
+    path("client/requests/<int:pk>/", workflow_views.ClientQuoteRequestDetailView.as_view(), name="client-quote-request-detail"),
+    path("shop/requests/<int:pk>/", workflow_views.ShopQuoteRequestDetailView.as_view(), name="shop-quote-request-detail"),
+    path("client/responses/", workflow_views.ClientResponseListView.as_view(), name="client-response-list"),
+    path("client/responses/<int:response_id>/accept/", workflow_views.ClientResponseAcceptView.as_view(), name="client-response-accept"),
+    path("client/responses/<int:response_id>/reject/", workflow_views.ClientResponseRejectView.as_view(), name="client-response-reject"),
+    path("client/responses/<int:response_id>/reply/", workflow_views.ClientResponseReplyView.as_view(), name="client-response-reply"),
+    path("shop/responses/<int:response_id>/reply/", workflow_views.ShopResponseReplyView.as_view(), name="shop-response-reply"),
     path("quote-requests/<int:request_id>/responses/", workflow_views.QuoteResponseListCreateView.as_view(), name="quote-request-response-list-create"),
     path("workflow/quote-responses/<int:pk>/", workflow_views.QuoteResponseDetailView.as_view(), name="workflow-quote-response-detail"),
     path("dashboard/shop-home/", workflow_views.ShopHomeDashboardView.as_view(), name="dashboard-shop-home"),
+    path("shops/<slug:shop_slug>/dashboard-home/", workflow_views.ShopHomeDashboardView.as_view(), name="shop-dashboard-home"),
+    path("quote-requests/guest-send/", GuestQuoteRequestView.as_view(), name="guest-quote-request-send"),
     path("analytics/events/", AnalyticsEventIngestView.as_view(), name="analytics-events"),
     path("admin/analytics/summary/", AnalyticsDashboardSummaryView.as_view(), name="admin-analytics-summary"),
     path("admin/analytics/timeseries/", AnalyticsTimeSeriesView.as_view(), name="admin-analytics-timeseries"),
@@ -165,6 +179,8 @@ urlpatterns = [
     
     # Shop rating (buyer) — requires eligible QuoteRequest
     path("me/notifications/", include(notifications_router.urls)),
+    path("", include(client_messages_router.urls)),
+    path("", include(shop_messages_router.urls)),
     path(
         "shops/<int:shop_id>/rate/",
         views.ShopRateView.as_view(),

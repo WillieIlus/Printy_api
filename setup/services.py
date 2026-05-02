@@ -7,18 +7,18 @@ from shops.models import Shop
 
 PROFILE_PLACEHOLDERS = {
     "description": "Business description for the shop.",
-    "business_email": "shop@example.com",
+    "business_email": "shop@printy.ke",
     "phone_number": "+254 700 000 000",
     "address_line": "Street address",
 }
 
 READINESS_STEPS = [
-    ("profile", "Shop profile", "Review profile"),
-    ("materials", "Materials", "Add materials"),
-    ("pricing", "Print pricing", "Add pricing"),
-    ("finishing", "Finishing", "Add finishing"),
-    ("turnaround", "Turnaround", "Add turnaround"),
-    ("publish", "Publishing", "Review shop visibility"),
+    ("profile", "Public shop details", "Open profile"),
+    ("materials", "Papers and materials", "Add papers"),
+    ("pricing", "Print pricing rules", "Add pricing"),
+    ("finishing", "Finishing rates", "Add finishing"),
+    ("turnaround", "Turnaround guidance", "Add turnaround"),
+    ("publish", "Publish your shop", "Review visibility"),
 ]
 
 
@@ -66,7 +66,7 @@ def _shop_profile_complete(shop: Shop) -> bool:
     )
 
 
-def _turnaround_configured(shop: Shop) -> bool:
+def _product_turnaround_configured(shop: Shop) -> bool:
     return Product.objects.filter(
         shop=shop,
         is_active=True,
@@ -83,6 +83,10 @@ def _turnaround_configured(shop: Shop) -> bool:
     ).filter(
         turnaround_days__isnull=False,
     ).exists()
+
+
+def _turnaround_configured(shop: Shop) -> bool:
+    return _has_real_text(getattr(shop, "turnaround_statement", "")) or _product_turnaround_configured(shop)
 
 
 def _build_steps_payload(*, shop: Shop | None, state: dict, next_step: str) -> list[dict]:
@@ -111,12 +115,12 @@ def _build_steps_payload(*, shop: Shop | None, state: dict, next_step: str) -> l
         "machines": state["has_pricing_rules"],
     }
     helpers = {
-        "profile": "Add real contact and business details buyers can trust.",
-        "materials": "List paper stocks or materials so Printy can match jobs to your rate card.",
-        "pricing": "To price more jobs automatically, add print pricing rules.",
-        "finishing": "Your shop can receive requests, but exact pricing needs finishing rates.",
-        "turnaround": "Add turnaround on at least one active product so request responses can show expected timing.",
-        "publish": "Make the shop public when you are ready to receive marketplace traffic.",
+        "profile": "Complete your profile so buyers trust your shop.",
+        "materials": "Add papers so Printy can match your shop to real jobs.",
+        "pricing": "Add pricing rules so buyers can see accurate estimates.",
+        "finishing": "Add finishing rates to reduce manual confirmation.",
+        "turnaround": "Add a turnaround statement so buyers know how fast you usually respond.",
+        "publish": "Publish your shop when you are ready for buyer traffic.",
     }
 
     steps = []
@@ -210,19 +214,19 @@ def _build_status_for_shop(shop: Shop | None) -> dict:
     recommendations: list[str] = []
 
     if not shop_profile_complete:
-        recommendations.append("Add clear business details so buyers know who is pricing their job.")
+        recommendations.append("Complete your profile so buyers trust your shop.")
     if not has_materials:
-        recommendations.append("Add paper stocks or materials so Printy can match jobs against real production inputs.")
+        recommendations.append("Add papers so Printy can match your shop to real jobs.")
     if not has_pricing_rules:
-        recommendations.append("To price more jobs automatically, add print pricing rules.")
+        recommendations.append("Add pricing rules so buyers can see accurate estimates.")
     if can_receive_requests and not has_finishing_rates:
-        warnings.append("Your shop can receive requests, but exact pricing needs finishing rates.")
+        warnings.append("Your shop can receive requests, but some add-ons still need manual confirmation until finishing rates are added.")
     elif not has_finishing_rates:
-        recommendations.append("Add finishing rates so lamination, cutting, binding, and other add-ons can be priced instantly.")
+        recommendations.append("Add finishing rates to reduce manual confirmation.")
     if not turnaround_configured:
-        recommendations.append("Add turnaround on at least one active product so buyers can see expected timing.")
+        recommendations.append("Add a turnaround statement so buyers know how fast you usually respond.")
     if not shop_published:
-        recommendations.append("Make the shop public when you are ready for marketplace visibility.")
+        recommendations.append("Publish your shop when you are ready for marketplace visibility.")
 
     if not shop_profile_complete:
         next_step = "profile"

@@ -35,7 +35,7 @@ All required and optional environment variables. Use a local `.env` file or depl
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DEFAULT_FROM_EMAIL` | No | `Printyke <hello.printyke@gmail.com>` | From address for emails |
+| `DEFAULT_FROM_EMAIL` | No | `Printy <hello.printyke@gmail.com>` | From address for emails |
 | `EMAIL_BACKEND` | No | console backend | SMTP backend override for production |
 | `EMAIL_HOST` | No | `smtp.gmail.com` | SMTP server host |
 | `EMAIL_PORT` | No | `587` | SMTP server port |

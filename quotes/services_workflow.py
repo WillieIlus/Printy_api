@@ -9,6 +9,7 @@ from notifications.models import Notification
 from notifications.services import notify_quote_event
 from pricing.models import FinishingRate, Material
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
+from quotes.messaging import create_quote_message
 from quotes.models import (
     QuoteDraft,
     QuoteItem,
@@ -238,13 +239,20 @@ def _build_quote_item(*, quote_request: QuoteRequest, draft: QuoteDraft, shop: S
 
 
 def _create_request_message(*, quote_request: QuoteRequest, sender, metadata: dict | None = None):
-    return QuoteRequestMessage.objects.create(
+    return create_quote_message(
         quote_request=quote_request,
         sender=sender,
-        sender_role="client",
-        message_kind="status",
-        body="Request submitted to the shop.",
+        recipient=quote_request.shop.owner,
+        sender_role=QuoteRequestMessage.SenderRole.CLIENT,
+        recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+        message_kind=QuoteRequestMessage.MessageKind.STATUS,
+        message_type=QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED,
+        direction=QuoteRequestMessage.Direction.INBOUND,
+        subject=f"New quote request from {quote_request.customer_name or 'client'}",
+        body=quote_request.notes or "Request submitted to the shop.",
         metadata=metadata or {"status": QuoteStatus.SUBMITTED, "source": "calculator_draft_send"},
+        send_email_copy=bool(getattr(quote_request.shop.owner, "email", "")),
+        create_failure_notice=True,
     )
 
 
@@ -336,6 +344,19 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                 merged_request_details=merged_request_details,
             )
             _create_request_message(quote_request=quote_request, sender=draft.user)
+            create_quote_message(
+                quote_request=quote_request,
+                sender=draft.user,
+                recipient=draft.user,
+                sender_role=QuoteRequestMessage.SenderRole.CLIENT,
+                recipient_role=QuoteRequestMessage.RecipientRole.CLIENT,
+                message_kind=QuoteRequestMessage.MessageKind.STATUS,
+                message_type=QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED,
+                direction=QuoteRequestMessage.Direction.OUTBOUND,
+                subject=f"Quote request sent to {shop.name}",
+                body=quote_request.notes or f"Your quote request was sent to {shop.name}.",
+                metadata={"status": QuoteStatus.SUBMITTED, "source": "calculator_draft_send"},
+            )
             if shop.owner_id and shop.owner_id != draft.user.id:
                 notify_quote_event(
                     recipient=shop.owner,
@@ -406,6 +427,38 @@ def create_quote_response(*, quote_request: QuoteRequest, shop, user, status: st
     response.save(update_fields=["quote_reference", "updated_at"])
     quote_request.status = _request_status_for_response_status(status)
     quote_request.save(update_fields=["status", "updated_at"])
+    if status != ShopQuoteStatus.PENDING:
+        create_quote_message(
+            quote_request=quote_request,
+            shop_quote=response,
+            sender=user,
+            recipient=quote_request.created_by,
+            recipient_email=quote_request.customer_email,
+            sender_role=QuoteRequestMessage.SenderRole.SHOP,
+            recipient_role=QuoteRequestMessage.RecipientRole.CLIENT,
+            message_kind=QuoteRequestMessage.MessageKind.QUOTE,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
+            direction=QuoteRequestMessage.Direction.INBOUND,
+            subject=f"{quote_request.shop.name} sent a quote",
+            body=note or "A shop sent you a quote in Printy.",
+            metadata={"status": quote_request.status, "quote_status": status, "total": str(total or "")},
+            send_email_copy=bool(quote_request.customer_email),
+            create_failure_notice=True,
+        )
+        create_quote_message(
+            quote_request=quote_request,
+            shop_quote=response,
+            sender=user,
+            recipient=user,
+            sender_role=QuoteRequestMessage.SenderRole.SHOP,
+            recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+            message_kind=QuoteRequestMessage.MessageKind.QUOTE,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
+            direction=QuoteRequestMessage.Direction.OUTBOUND,
+            subject=f"Quote sent to {quote_request.customer_name or 'client'}",
+            body=note or "You sent a quote from Printy.",
+            metadata={"status": quote_request.status, "quote_status": status, "total": str(total or "")},
+        )
     return response
 
 
@@ -449,4 +502,36 @@ def update_quote_response(
     quote_request = response.quote_request
     quote_request.status = _request_status_for_response_status(status)
     quote_request.save(update_fields=["status", "updated_at"])
+    if status != ShopQuoteStatus.PENDING:
+        create_quote_message(
+            quote_request=quote_request,
+            shop_quote=response,
+            sender=response.created_by,
+            recipient=quote_request.created_by,
+            recipient_email=quote_request.customer_email,
+            sender_role=QuoteRequestMessage.SenderRole.SHOP,
+            recipient_role=QuoteRequestMessage.RecipientRole.CLIENT,
+            message_kind=QuoteRequestMessage.MessageKind.QUOTE,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
+            direction=QuoteRequestMessage.Direction.INBOUND,
+            subject=f"{quote_request.shop.name} sent a quote",
+            body=response.note or "A shop updated your quote in Printy.",
+            metadata={"status": quote_request.status, "quote_status": status, "total": str(response.total or "")},
+            send_email_copy=bool(quote_request.customer_email),
+            create_failure_notice=True,
+        )
+        create_quote_message(
+            quote_request=quote_request,
+            shop_quote=response,
+            sender=response.created_by,
+            recipient=response.created_by,
+            sender_role=QuoteRequestMessage.SenderRole.SHOP,
+            recipient_role=QuoteRequestMessage.RecipientRole.SHOP_OWNER,
+            message_kind=QuoteRequestMessage.MessageKind.QUOTE,
+            message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
+            direction=QuoteRequestMessage.Direction.OUTBOUND,
+            subject=f"Quote sent to {quote_request.customer_name or 'client'}",
+            body=response.note or "You updated a quote in Printy.",
+            metadata={"status": quote_request.status, "quote_status": status, "total": str(response.total or "")},
+        )
     return response

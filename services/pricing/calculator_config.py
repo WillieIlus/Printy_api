@@ -9,13 +9,21 @@ from django.utils.text import slugify
 from inventory.choices import PaperCategory
 from inventory.models import Paper
 from pricing.choices import Sides
-from pricing.models import FinishingRate
+from pricing.models import FinishingRate, Material
 from shops.models import Shop
 
 
+DIGITAL_GSM_CHOICES = [60, 70, 80, 100, 115, 130, 150, 170, 200, 220, 250, 300, 350, 400]
+
 COLOR_MODES = [
     {"value": "COLOR", "label": "Full color"},
-    {"value": "BW", "label": "Black and white"},
+    {"value": "BW", "label": "Black only"},
+]
+
+BOOKLET_COLOR_MODES = [
+    {"value": "COLOR", "label": "Full color"},
+    {"value": "BW", "label": "Black only"},
+    {"value": "COVER_COLOR_INSERT_BW", "label": "Color cover, black inside"},
 ]
 
 PRINT_SIDES = [
@@ -62,7 +70,21 @@ SIZE_LIBRARY = {
         {"value": "A5", "label": "A5", "width_mm": 148, "height_mm": 210},
         {"value": "A4", "label": "A4", "width_mm": 210, "height_mm": 297},
     ],
+    "large_format": [
+        {"value": "A4", "label": "A4", "width_mm": 210, "height_mm": 297},
+        {"value": "A3", "label": "A3", "width_mm": 297, "height_mm": 420},
+        {"value": "poster_500x700", "label": "Poster 500 x 700 mm", "width_mm": 500, "height_mm": 700},
+        {"value": "banner_850x2000", "label": "Banner 850 x 2000 mm", "width_mm": 850, "height_mm": 2000},
+    ],
 }
+
+LARGE_FORMAT_SUBTYPE_OPTIONS = [
+    {"value": "banner", "label": "Banner"},
+    {"value": "poster", "label": "Poster"},
+    {"value": "sticker", "label": "Sticker"},
+    {"value": "roll_up_banner", "label": "Roll-up Banner"},
+    {"value": "mounted_board", "label": "Mounted Board"},
+]
 
 
 PRODUCT_DEFINITIONS = OrderedDict(
@@ -161,6 +183,22 @@ PRODUCT_DEFINITIONS = OrderedDict(
                 "allowed_print_sides": ["DUPLEX"],
             },
         ),
+        (
+            "large_format",
+            {
+                "label": "Large Format",
+                "required_fields": ["quantity", "material_type"],
+                "optional_fields": ["product_subtype"],
+                "defaults": {
+                    "quantity": 1,
+                    "product_subtype": "banner",
+                    "finished_size": "banner_850x2000",
+                    "input_unit": "mm",
+                },
+                "allowed_finishings": [],
+                "allowed_print_sides": [],
+            },
+        ),
     ]
 )
 
@@ -189,6 +227,12 @@ SIZE_OPTION_METADATA: dict[str, list[dict[str, Any]]] = {
     "booklet": [
         {"id": "A5", "label": "A5", "description": "Compact booklet", "recommended": True},
         {"id": "A4", "label": "A4", "description": "Full-size booklet", "recommended": False},
+    ],
+    "large_format": [
+        {"id": "A4", "label": "A4", "description": "Small poster or notice", "recommended": False},
+        {"id": "A3", "label": "A3", "description": "Indoor poster", "recommended": False},
+        {"id": "poster_500x700", "label": "Poster", "description": "Standard poster size", "recommended": True},
+        {"id": "banner_850x2000", "label": "Banner", "description": "Common pull-up banner size", "recommended": False},
     ],
 }
 
@@ -271,6 +315,28 @@ def _aggregate_paper_stocks() -> list[dict[str, Any]]:
     return list(options.values())
 
 
+def _aggregate_material_types() -> list[dict[str, Any]]:
+    options: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    public_shop_ids = Shop.objects.filter(is_active=True, is_public=True).values_list("id", flat=True)
+    queryset = (
+        Material.objects.filter(shop_id__in=public_shop_ids, is_active=True, selling_price__gt=0)
+        .select_related("production_size")
+        .order_by("material_type", "selling_price", "id")
+    )
+    for material in queryset:
+        key = slugify((material.material_type or "").strip()) or f"material-{material.id}"
+        if key in options:
+            continue
+        roll_width_mm = getattr(getattr(material, "production_size", None), "width_mm", None)
+        options[key] = {
+            "value": material.material_type,
+            "label": material.material_type,
+            "roll_width_mm": roll_width_mm,
+            "unit": material.unit,
+        }
+    return list(options.values())
+
+
 def _aggregate_finishings() -> list[dict[str, Any]]:
     rows: OrderedDict[str, dict[str, Any]] = OrderedDict()
     shop_ids = Shop.objects.filter(is_active=True, is_public=True).values_list("id", flat=True)
@@ -300,7 +366,12 @@ def _paper_categories() -> list[dict[str, Any]]:
     return [{"value": value, "label": label} for value, label in PaperCategory.choices]
 
 
-def _field_definitions(product_key: str, definition: dict[str, Any], paper_stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _field_definitions(
+    product_key: str,
+    definition: dict[str, Any],
+    paper_stocks: list[dict[str, Any]],
+    material_types: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     category_field_key = "allowed_paper_categories"
     stock_usage_filter = lambda item: True
     stock_field = "paper_stock"
@@ -327,6 +398,13 @@ def _field_definitions(product_key: str, definition: dict[str, Any], paper_stock
             {"key": "cover_lamination", "label": "Cover lamination", "type": "select", "required": False, "options": [{"value": "none", "label": "No lamination"}, {"value": "front", "label": "Front only"}, {"value": "both", "label": "Both sides"}], "help_text": "Lamination is applied to cover sheets only."},
             {"key": "binding_type", "label": "Binding", "type": "select", "required": False, "options": [{"value": "saddle_stitch", "label": "Saddle stitch"}, {"value": "perfect_bind", "label": "Perfect bind"}, {"value": "wire_o", "label": "Wire-O"}]},
             {"key": "cutting", "label": "Cutting", "type": "boolean", "required": False, "help_text": "Backend applies cutting only when the shop has a matching finishing path."},
+        ]
+
+    if product_key == "large_format":
+        return [
+            {"key": "quantity", "label": "How many pieces?", "type": "number", "required": True},
+            {"key": "material_type", "label": "Material", "type": "select", "required": True, "options": material_types},
+            {"key": "product_subtype", "label": "Product style", "type": "select", "required": False, "options": LARGE_FORMAT_SUBTYPE_OPTIONS},
         ]
 
     if product_key == "label_sticker":
@@ -371,10 +449,11 @@ def _field_definitions(product_key: str, definition: dict[str, Any], paper_stock
 
 def get_calculator_config() -> dict[str, Any]:
     paper_stocks = _aggregate_paper_stocks()
+    material_types = _aggregate_material_types()
     finishings = _aggregate_finishings()
     products = []
     for product_key, definition in PRODUCT_DEFINITIONS.items():
-        fields = _field_definitions(product_key, definition, paper_stocks)
+        fields = _field_definitions(product_key, definition, paper_stocks, material_types)
         products.append(
             {
                 "key": product_key,
@@ -393,7 +472,9 @@ def get_calculator_config() -> dict[str, Any]:
                 "cover_paper_options": BOOKLET_COVER_TIER_DEFINITIONS if product_key == "booklet" else [],
                 "insert_paper_options": BOOKLET_INSERT_TIER_DEFINITIONS if product_key == "booklet" else [],
                 "size_options": _size_options_for_product(product_key),
-                "allow_custom_size": False,
+                "allow_custom_size": True,
+                "allow_custom_paper_request": product_key != "large_format",
+                "color_mode_options": BOOKLET_COLOR_MODES if product_key == "booklet" else ([] if product_key == "large_format" else COLOR_MODES),
             }
         )
     return {
