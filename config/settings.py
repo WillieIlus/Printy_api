@@ -96,6 +96,7 @@ INSTALLED_APPS = [
     "production",
     "billing",
     "artwork",
+    "leads",
 ]
 
 AUTH_USER_MODEL = "accounts.User"
@@ -325,6 +326,8 @@ DEFAULT_SUBSCRIPTION_PLAN = "STARTER"
 # =============================================================================
 # Billing (new system)
 # =============================================================================
+
+EARLY_ACCESS_TOTAL_SPOTS = int(os.environ.get("EARLY_ACCESS_TOTAL_SPOTS", "20"))
 
 BILLING_GRACE_PERIOD_DAYS = int(os.environ.get("BILLING_GRACE_PERIOD_DAYS", "3"))
 BILLING_RETRY_SCHEDULE_HOURS = [
