@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 from common.models import TimeStampedModel
 
@@ -25,3 +26,34 @@ class ShopLead(TimeStampedModel):
 
     def __str__(self):
         return f"{self.shop_name} ({self.phone})"
+
+
+class DemoAction(TimeStampedModel):
+    class Action(models.TextChoices):
+        ACCEPTED = "accepted", "Accepted"
+        MODIFIED = "modified", "Modified"
+        REJECTED = "rejected", "Rejected"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="demo_actions",
+    )
+    selected_product = models.CharField(max_length=50)
+    quantity = models.PositiveIntegerField()
+    suggested_min = models.PositiveIntegerField()
+    suggested_max = models.PositiveIntegerField()
+    action = models.CharField(max_length=20, choices=Action.choices)
+    modified_min = models.PositiveIntegerField(null=True, blank=True)
+    modified_max = models.PositiveIntegerField(null=True, blank=True)
+    reject_reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Demo Action"
+        verbose_name_plural = "Demo Actions"
+
+    def __str__(self):
+        return f"{self.selected_product} – {self.action} ({self.created_at:%Y-%m-%d})"

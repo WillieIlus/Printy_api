@@ -5,8 +5,8 @@ from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle
 from rest_framework.views import APIView
 
-from .models import ShopLead
-from .serializers import ShopLeadSerializer
+from .models import DemoAction, ShopLead
+from .serializers import DemoActionSerializer, ShopLeadSerializer
 
 _ACTIVE = [ShopLead.Status.PENDING, ShopLead.Status.CONTACTED, ShopLead.Status.ONBOARDED]
 
@@ -45,3 +45,15 @@ class ApplyView(APIView):
 
         serializer.save()
         return Response({"detail": "Application received."}, status=status.HTTP_201_CREATED)
+
+
+class DemoActionView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = DemoActionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        user = request.user if request.user.is_authenticated else None
+        serializer.save(user=user)
+        return Response({"detail": "Demo action recorded."}, status=status.HTTP_201_CREATED)
