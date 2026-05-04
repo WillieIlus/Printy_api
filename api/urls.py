@@ -25,6 +25,8 @@ from .seo_views import (
     SEOProductsView,
     SEORoutesView,
 )
+from leads.views import EarlyAccessView
+from .location_pricing_views import LocationPricingView
 from gallery.views import (
     GalleryCategoryViewSet,
     GalleryProductViewSet,
@@ -111,6 +113,8 @@ urlpatterns = [
     path("", include("production.urls")),
     path("", include(public_router.urls)),
     path("", include(finishing_category_router.urls)),
+    path("public/early-access/", EarlyAccessView.as_view(), name="public-early-access"),
+    path("shops/location-pricing/", LocationPricingView.as_view(), name="location-pricing"),
     path("public/products/", views.PublicAllProductsView.as_view(), name="public-all-products"),
     path("public/match-shops/", public_matching_views.PublicMatchShopsView.as_view(), name="public-match-shops"),
     path("public/calculator/preview/", public_matching_views.PublicMatchShopsView.as_view(), name="public-calculator-preview"),

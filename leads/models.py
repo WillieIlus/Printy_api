@@ -3,6 +3,20 @@ from django.db import models
 from common.models import TimeStampedModel
 
 
+class EarlyAccessCampaign(TimeStampedModel):
+    city = models.CharField(max_length=100, unique=True)
+    total_spots = models.PositiveIntegerField(default=20)
+    manual_reserved_spots = models.PositiveIntegerField(default=0)
+    active = models.BooleanField(default=True)
+
+    class Meta:
+        verbose_name = "Early Access Campaign"
+        verbose_name_plural = "Early Access Campaigns"
+
+    def __str__(self):
+        return f"{self.city} ({self.total_spots} spots)"
+
+
 class ShopLead(TimeStampedModel):
     class Status(models.TextChoices):
         PENDING = "PENDING", "Pending"

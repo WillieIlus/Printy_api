@@ -6,3 +6,4 @@ urlpatterns = [
     path("apply/", ApplyView.as_view(), name="early-access-apply"),
     path("demo-actions/", DemoActionView.as_view(), name="demo-actions"),
 ]
+

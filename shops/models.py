@@ -238,6 +238,17 @@ class Shop(AutoSlugMixin, models.Model):
         verbose_name=_("same-day cutoff time"),
         help_text=_("Optional cutoff after which new work starts on the next working slot."),
     )
+    pricing_ranges = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("pricing ranges"),
+        help_text=_(
+            "Market-intelligence pricing ranges per product type. "
+            "Keys: booklets, flyers, posters, business_cards. "
+            "Each value: {low: KES, high: KES}."
+        ),
+    )
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
