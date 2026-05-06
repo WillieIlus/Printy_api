@@ -423,9 +423,9 @@ LOCALE_PATHS = [BASE_DIR / "locale"]
 # Static & Media
 # =============================================================================
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
-MEDIA_URL = "media/"
+MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
@@ -465,6 +465,21 @@ LOGGING = {
             "propagate": False,
         },
         "payments": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "artwork": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "artwork.pdf": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "artwork.upload": {
             "handlers": ["console"],
             "level": "INFO",
             "propagate": False,

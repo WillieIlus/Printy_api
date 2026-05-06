@@ -27,6 +27,14 @@ from services.pricing.booklet_builder import build_booklet_preview
 from services.pricing.large_format_builder import build_large_format_preview
 from services.pricing.calculator_config import get_calculator_config
 from services.pricing.calculator_preview import build_public_calculator_preview
+from services.pricing.for_shops_wizard import (
+    build_public_rate_wizard_config,
+    build_public_rate_wizard_preview,
+    build_rate_wizard_config,
+    build_step_preview,
+    complete_rate_wizard,
+    save_step_values,
+)
 from setup.services import get_setup_status_for_shop, get_setup_status_for_user
 from shops.models import Shop
 from shops.services import can_manage_quotes, can_manage_shop
@@ -46,6 +54,8 @@ from .workflow_serializers import (
     QuoteDraftReadSerializer,
     QuoteDraftSendSerializer,
     QuoteDraftUpdateSerializer,
+    PublicRateWizardPreviewSerializer,
+    RateWizardStepActionSerializer,
     QuoteRequestReadSerializer,
     QuoteResponseCreateSerializer,
     QuoteResponseReadSerializer,
@@ -62,6 +72,19 @@ def _broadcast_group_requests(quote_request: QuoteRequest):
     if quote_request.source_draft_id:
         return quote_request.source_draft.generated_requests.select_related("shop")
     return QuoteRequest.objects.filter(pk=quote_request.pk).select_related("shop")
+
+
+def _resolve_wizard_shop(*, request, shop_slug: str | None = None):
+    slug = (shop_slug or "").strip()
+    if slug:
+        shop = get_object_or_404(Shop, slug=slug)
+    else:
+        shop = Shop.objects.filter(owner=request.user).order_by("id").first()
+        if shop is None:
+            return None
+    if not can_manage_shop(shop, request.user):
+        return None
+    return shop
 
 
 def _create_conversation_message(
@@ -183,6 +206,82 @@ class CalculatorConfigView(APIView):
                 {"detail": "Calculator configuration unavailable."},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
+
+
+class ForShopsRateWizardConfigView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        shop = _resolve_wizard_shop(request=request, shop_slug=request.query_params.get("shop_slug"))
+        if shop is None:
+            return Response({"detail": "No manageable shop was found for this user."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(build_rate_wizard_config(shop))
+
+
+class ForShopsRateWizardPublicConfigView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        return Response(build_public_rate_wizard_config())
+
+
+class ForShopsRateWizardPublicPreviewView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PublicRateWizardPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if serializer.validated_data["preset_key"] != "business_cards":
+            return Response({"detail": "Only business_cards is supported right now."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            build_public_rate_wizard_preview(
+                quantity=serializer.validated_data["quantity"],
+                rates=serializer.validated_data.get("rates") or {},
+            )
+        )
+
+
+class ForShopsRateWizardPreviewView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = RateWizardStepActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        shop = _resolve_wizard_shop(request=request, shop_slug=serializer.validated_data.get("shop_slug"))
+        if shop is None:
+            return Response({"detail": "No manageable shop was found for this user."}, status=status.HTTP_404_NOT_FOUND)
+
+        with transaction.atomic():
+            save_step_values(shop, serializer.validated_data["step_key"], serializer.validated_data.get("values") or [])
+            preview = build_step_preview(
+                shop,
+                serializer.validated_data["step_key"],
+                quantity=serializer.validated_data.get("quantity"),
+            )
+            transaction.set_rollback(True)
+        return Response(preview)
+
+
+class ForShopsRateWizardSaveStepView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = RateWizardStepActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        shop = _resolve_wizard_shop(request=request, shop_slug=serializer.validated_data.get("shop_slug"))
+        if shop is None:
+            return Response({"detail": "No manageable shop was found for this user."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(save_step_values(shop, serializer.validated_data["step_key"], serializer.validated_data.get("values") or []))
+
+
+class ForShopsRateWizardCompleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        shop = _resolve_wizard_shop(request=request, shop_slug=request.data.get("shop_slug"))
+        if shop is None:
+            return Response({"detail": "No manageable shop was found for this user."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(complete_rate_wizard(shop))
 
 
 class CalculatorConfigPreviewView(APIView):

@@ -840,3 +840,21 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
                 # We want the full QuoteResponseReadSerializer to give all the details requested
                 responses.append(QuoteResponseReadSerializer(latest, context=self.context).data)
         return responses
+
+
+class RateWizardValueSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    value = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+
+
+class RateWizardStepActionSerializer(serializers.Serializer):
+    shop_slug = serializers.CharField(required=False, allow_blank=True)
+    step_key = serializers.CharField()
+    quantity = serializers.IntegerField(required=False, min_value=1)
+    values = RateWizardValueSerializer(many=True, required=False, default=list)
+
+
+class PublicRateWizardPreviewSerializer(serializers.Serializer):
+    preset_key = serializers.CharField()
+    quantity = serializers.IntegerField(min_value=1)
+    rates = serializers.DictField(child=serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True), required=False, default=dict)

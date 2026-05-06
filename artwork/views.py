@@ -1,14 +1,17 @@
-from pathlib import Path
+import logging
 
-from django.core.files import File
+from django.core.files.base import ContentFile
+from rest_framework import status
 from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework import status
 
 from .models import UploadedArtwork
 from .services.pdf_analysis import analyze_pdf
+
+
+logger = logging.getLogger("artwork.upload")
 
 
 class ArtworkUploadView(APIView):
@@ -18,15 +21,34 @@ class ArtworkUploadView(APIView):
     def post(self, request):
         file = request.FILES.get('file')
         if not file:
-            return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    'upload_status': 'failed',
+                    'error': 'No file provided',
+                    'error_code': 'no_file',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         file_type = _file_ext(file.name)
-        artwork = UploadedArtwork.objects.create(file=file, file_type=file_type)
+        try:
+            artwork = UploadedArtwork.objects.create(file=file, file_type=file_type)
+        except Exception:
+            logger.exception("Artwork upload failed while saving %s", getattr(file, 'name', '<unknown>'))
+            return Response(
+                {
+                    'upload_status': 'failed',
+                    'error': 'Upload failed',
+                    'error_code': 'upload_failed',
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         analysis: dict = {
             'analysis_status': 'skipped',
             'analysis_error': None,
-            'preview_path': None,
+            'analysis_error_code': None,
+            'analysis_technical_detail': None,
             'detected': None,
             'suggested_product': None,
             'suggestions': [],
@@ -35,12 +57,14 @@ class ArtworkUploadView(APIView):
             'pages': None,
             'width_mm': None,
             'height_mm': None,
+            'preview_format': None,
         }
         if file_type == 'pdf':
-            analysis = analyze_pdf(artwork.file.path)
+            analysis = analyze_pdf(artwork.file)
         else:
             analysis['warnings'] = ['Automatic PDF analysis was skipped for this file type.']
 
+        preview_bytes = analysis.pop('_preview_bytes', None)
         detected = analysis.get('detected') or {}
         artwork.detected_pages = detected.get('pages')
         artwork.detected_width_mm = detected.get('width_mm')
@@ -50,15 +74,22 @@ class ArtworkUploadView(APIView):
         artwork.analysis_error = analysis.get('analysis_error')
         artwork.analysis = analysis
 
-        preview_path = analysis.get('preview_path')
-        if preview_path and Path(preview_path).exists():
-            with open(preview_path, 'rb') as preview_file:
+        if preview_bytes:
+            try:
                 artwork.preview_image.save(
                     f'{artwork.id}_preview.jpg',
-                    File(preview_file),
+                    ContentFile(preview_bytes),
                     save=False,
                 )
-            Path(preview_path).unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Artwork preview save failed for artwork %s", artwork.id)
+                artwork.analysis_warnings = [
+                    *artwork.analysis_warnings,
+                    'Preview image generation failed.',
+                ]
+                artwork.analysis['warnings'] = artwork.analysis_warnings
+                artwork.analysis['analysis_warnings'] = artwork.analysis_warnings
+
         artwork.save()
 
         return Response(
@@ -104,6 +135,8 @@ def _serialize_artwork(request, artwork: UploadedArtwork) -> dict:
         'analysis_status': artwork.analysis_status or analysis.get('analysis_status', 'pending'),
         'analysis_warnings': artwork.analysis_warnings or analysis.get('warnings', []),
         'analysis_error': artwork.analysis_error or analysis.get('analysis_error'),
+        'analysis_error_code': analysis.get('analysis_error_code'),
+        'analysis_technical_detail': analysis.get('analysis_technical_detail'),
         'detected': analysis.get('detected'),
         'suggested_product': analysis.get('suggested_product'),
         'suggestions': analysis.get('suggestions', []),

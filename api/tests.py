@@ -15,11 +15,11 @@ from accounts.models import User, UserProfile
 from common.models import AnalyticsEvent
 from catalog.choices import PricingMode, ProductKind, ProductStatus
 from catalog.models import Product, ProductCategory, ProductImage
-from inventory.choices import PaperCategory
+from inventory.choices import MachineType, PaperCategory, PaperType, SheetSize
 from inventory.models import Machine, Paper, ProductionPaperSize
 from locations.models import Location
 from notifications.models import Notification
-from pricing.choices import ChargeUnit, FinishingBillingBasis, FinishingSideMode, Sides
+from pricing.choices import ChargeUnit, ColorMode, FinishingBillingBasis, FinishingSideMode, Sides
 from pricing.models import FinishingRate, Material, PrintingRate, VolumeDiscount
 from quotes.choices import QuoteStatus, ShopQuoteStatus
 from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteRequest, QuoteRequestMessage, ShopQuote
@@ -3173,6 +3173,179 @@ class CalculatorPreviewAPITestCase(TestCase):
         self.assertTrue(data["warnings"])
         self.assertEqual(data["tiles_x"], 2)
         self.assertEqual(data["tiles_y"], 3)
+
+
+class ForShopsRateWizardAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.owner = User.objects.create_user(email="wizard-owner@test.com", password="pass12345")
+        self.shop = Shop.objects.create(
+            owner=self.owner,
+            name="Wizard Shop",
+            slug="wizard-shop",
+            is_active=True,
+            is_public=True,
+        )
+        self.client.force_authenticate(user=self.owner)
+
+    def _wizard_config(self):
+        response = self.client.get("/api/for-shops/rate-wizard/config/", {"shop_slug": self.shop.slug})
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _step_fields(self, payload, step_key):
+        return next(step for step in payload["steps"] if step["key"] == step_key)["fields"]
+
+    def test_rate_wizard_config_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+        response = self.client.get("/api/for-shops/rate-wizard/config/", {"shop_slug": self.shop.slug})
+        self.assertEqual(response.status_code, 401)
+
+    def test_rate_wizard_config_reports_empty_backend_data_without_fake_values(self):
+        payload = self._wizard_config()
+        business_fields = self._step_fields(payload, "business_cards")
+        field_map = {field["key"]: field for field in business_fields}
+
+        self.assertEqual(payload["requirements"]["sheet_machine_required"], False)
+        self.assertIsNone(field_map["business_cards_paper_price"]["value"])
+        self.assertIsNone(field_map["business_cards_paper_price"]["market"]["median"])
+        self.assertIn("Create this paper", field_map["business_cards_paper_price"]["save_error"])
+        self.assertIsNone(field_map["business_cards_print_single_price"]["value"])
+        self.assertIn("Add a digital or offset machine", field_map["business_cards_print_single_price"]["save_error"])
+
+    def test_rate_wizard_save_step_and_preview_use_existing_models(self):
+        machine = Machine.objects.create(
+            shop=self.shop,
+            name="Wizard Press",
+            machine_type=MachineType.DIGITAL,
+            max_width_mm=450,
+            max_height_mm=320,
+            is_active=True,
+        )
+        Paper.objects.create(
+            shop=self.shop,
+            name="350gsm Art Card",
+            sheet_size=SheetSize.SRA3,
+            gsm=350,
+            category=PaperCategory.ARTCARD,
+            paper_type=PaperType.GLOSS,
+            is_cover_stock=True,
+            buying_price=Decimal("20.00"),
+            selling_price=Decimal("40.00"),
+            is_active=True,
+        )
+        market_owner = User.objects.create_user(email="other-wizard@test.com", password="pass12345")
+        market_shop = Shop.objects.create(
+            owner=market_owner,
+            name="Market Shop",
+            slug="market-shop",
+            is_active=True,
+            is_public=True,
+        )
+        market_machine = Machine.objects.create(
+            shop=market_shop,
+            name="Market Press",
+            machine_type=MachineType.DIGITAL,
+            max_width_mm=450,
+            max_height_mm=320,
+            is_active=True,
+        )
+        Paper.objects.create(
+            shop=market_shop,
+            name="350gsm Art Card",
+            sheet_size=SheetSize.SRA3,
+            gsm=350,
+            category=PaperCategory.ARTCARD,
+            paper_type=PaperType.GLOSS,
+            is_cover_stock=True,
+            buying_price=Decimal("18.00"),
+            selling_price=Decimal("60.00"),
+            is_active=True,
+        )
+        PrintingRate.objects.create(
+            machine=market_machine,
+            sheet_size=SheetSize.SRA3,
+            color_mode=ColorMode.COLOR,
+            single_price=Decimal("14.00"),
+            double_price=Decimal("26.00"),
+            is_active=True,
+            is_default=True,
+        )
+        FinishingRate.objects.create(
+            shop=market_shop,
+            name="Matte Lamination",
+            slug="matte-lamination",
+            charge_unit=ChargeUnit.PER_SHEET,
+            billing_basis=FinishingBillingBasis.PER_SHEET,
+            side_mode=FinishingSideMode.PER_SELECTED_SIDE,
+            price=Decimal("11.00"),
+            double_side_price=Decimal("20.00"),
+            is_active=True,
+        )
+
+        save_response = self.client.post(
+            "/api/for-shops/rate-wizard/save-step/",
+            {
+                "shop_slug": self.shop.slug,
+                "step_key": "business_cards",
+                "values": [
+                    {"key": "business_cards_paper_price", "value": "45.00"},
+                    {"key": "business_cards_print_single_price", "value": "15.00"},
+                    {"key": "business_cards_print_double_price", "value": "28.00"},
+                    {"key": "business_cards_lamination_price", "value": "12.00"},
+                    {"key": "business_cards_lamination_double_side_price", "value": "22.00"},
+                    {"key": "business_cards_cutting_price", "value": "300.00"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(save_response.status_code, 200)
+        machine_rate = PrintingRate.objects.get(machine=machine, sheet_size=SheetSize.SRA3, color_mode=ColorMode.COLOR)
+        self.assertEqual(str(machine_rate.single_price), "15.00")
+        self.assertEqual(str(machine_rate.double_price), "28.00")
+        lamination = FinishingRate.objects.get(shop=self.shop, slug="matte-lamination")
+        self.assertEqual(str(lamination.price), "12.00")
+        self.assertEqual(str(lamination.double_side_price), "22.00")
+
+        config = self._wizard_config()
+        business_fields = self._step_fields(config, "business_cards")
+        field_map = {field["key"]: field for field in business_fields}
+        self.assertEqual(field_map["business_cards_paper_price"]["market"]["median"], "52.50")
+        self.assertEqual(field_map["business_cards_print_single_price"]["market"]["mean"], "14.50")
+
+        preview_response = self.client.post(
+            "/api/for-shops/rate-wizard/preview/",
+            {
+                "shop_slug": self.shop.slug,
+                "step_key": "business_cards",
+                "values": [
+                    {"key": "business_cards_paper_price", "value": "45.00"},
+                    {"key": "business_cards_print_single_price", "value": "15.00"},
+                    {"key": "business_cards_print_double_price", "value": "28.00"},
+                    {"key": "business_cards_lamination_price", "value": "12.00"},
+                    {"key": "business_cards_lamination_double_side_price", "value": "22.00"},
+                    {"key": "business_cards_cutting_price", "value": "300.00"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(preview_response.status_code, 200)
+        preview_payload = preview_response.json()
+        self.assertTrue(preview_payload["can_calculate"])
+        self.assertEqual(preview_payload["step_key"], "business_cards")
+        self.assertEqual(preview_payload["suggested_quote"], preview_payload["production_cost"])
+        self.assertGreater(preview_payload["imposition"]["copies_per_sheet"], 0)
+
+    def test_rate_wizard_complete_reports_readiness_without_fake_completion_model(self):
+        response = self.client.post(
+            "/api/for-shops/rate-wizard/complete/",
+            {"shop_slug": self.shop.slug},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["supports_explicit_completion"])
+        self.assertIn("no separate onboarding-complete model", payload["message"].lower())
 
 
 class PublicCalculatorPayloadSerializerTestCase(TestCase):

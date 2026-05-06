@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
+
+logger = logging.getLogger("artwork.pdf")
+
+POINTS_TO_MM = 25.4 / 72
 
 STANDARD_SIZES = {
     "A3": (297, 420),
@@ -28,27 +33,35 @@ SIZE_CANDIDATES = [
 ]
 
 
-def analyze_pdf(file_path: str) -> dict[str, Any]:
+def analyze_pdf(source: Any) -> dict[str, Any]:
+    source_name = _source_name(source)
+
     try:
         import fitz  # PyMuPDF
-    except ImportError:
+    except ImportError as exc:
+        logger.exception("PDF analysis dependency missing for %s", source_name)
         return _failed_result(
-            error="PDF analysis unavailable",
+            status="dependency_missing",
+            error_code="dependency_missing",
+            error="PDF analysis dependency missing",
             warnings=["We could not read PDF details automatically."],
             confidence="none",
+            technical_detail=str(exc),
         )
 
     try:
-        with fitz.open(file_path) as doc:
+        with _open_document(fitz, source) as doc:
             if doc.page_count == 0:
                 return _failed_result(
+                    status="unreadable",
+                    error_code="pdf_has_no_pages",
                     error="PDF has no pages",
                     warnings=["We could not read PDF details automatically."],
                 )
 
             first_page = doc[0]
-            width_mm = round(first_page.rect.width * 25.4 / 72, 1)
-            height_mm = round(first_page.rect.height * 25.4 / 72, 1)
+            width_mm = round(first_page.rect.width * POINTS_TO_MM, 1)
+            height_mm = round(first_page.rect.height * POINTS_TO_MM, 1)
 
             sizes = {
                 (round(page.rect.width, 1), round(page.rect.height, 1))
@@ -58,7 +71,7 @@ def analyze_pdf(file_path: str) -> dict[str, Any]:
             if len(sizes) > 1:
                 warnings.append("Mixed page sizes detected")
 
-            preview_path = _render_preview(first_page, Path(file_path))
+            preview_bytes = _render_preview(first_page)
             size_match = _match_size(width_mm, height_mm)
             size_label = size_match["label"] if size_match else None
             suggested_product = _suggest_product(
@@ -77,17 +90,21 @@ def analyze_pdf(file_path: str) -> dict[str, Any]:
             return {
                 "analysis_status": "analysed",
                 "analysis_error": None,
+                "analysis_error_code": None,
+                "analysis_technical_detail": None,
                 "detected": {
                     "pages": doc.page_count,
                     "width_mm": width_mm,
                     "height_mm": height_mm,
                     "size_label": size_label,
+                    "unit": "mm",
+                    "points_to_mm": round(POINTS_TO_MM, 6),
                 },
                 "pages": doc.page_count,
                 "width_mm": width_mm,
                 "height_mm": height_mm,
-                "preview_path": str(preview_path) if preview_path else None,
-                "preview_format": "jpeg" if preview_path else None,
+                "preview_format": "jpeg" if preview_bytes else None,
+                "_preview_bytes": preview_bytes,
                 "suggested_product": suggested_product,
                 "suggestions": suggestions,
                 "confidence": suggested_product["confidence"] if suggested_product else ("high" if not warnings else "medium"),
@@ -96,39 +113,77 @@ def analyze_pdf(file_path: str) -> dict[str, Any]:
                 "size_label": size_label,
             }
     except Exception as exc:
+        status_value, error_code, error_message = _classify_exception(exc)
+        logger.exception(
+            "PDF analysis failed (%s/%s) for %s",
+            status_value,
+            error_code,
+            source_name,
+        )
         return _failed_result(
-            error=str(exc) or "PDF could not be read",
+            status=status_value,
+            error_code=error_code,
+            error=error_message,
             warnings=["We could not read PDF details automatically."],
+            technical_detail=str(exc),
         )
 
 
-def _render_preview(page: Any, file_path: Path) -> Path | None:
+def _open_document(fitz_module: Any, source: Any) -> Any:
+    if isinstance(source, (str, Path)):
+        return fitz_module.open(str(source))
+
+    file_obj = source
+    if hasattr(file_obj, "open"):
+        file_obj.open("rb")
+    if hasattr(file_obj, "seek"):
+        file_obj.seek(0)
+
+    pdf_bytes = file_obj.read()
+    if hasattr(file_obj, "seek"):
+        file_obj.seek(0)
+
+    if not pdf_bytes:
+        raise ValueError("Uploaded file is empty.")
+
+    return fitz_module.open(stream=pdf_bytes, filetype="pdf")
+
+
+def _render_preview(page: Any) -> bytes | None:
     try:
-        import fitz  # PyMuPDF
-    except ImportError:
+        pix = page.get_pixmap(matrix=_fitz_matrix(0.35, 0.35), alpha=False)
+        return pix.tobytes("jpeg")
+    except Exception:
+        logger.warning("PDF preview generation failed.", exc_info=True)
         return None
 
-    preview_path = file_path.with_suffix(".preview.jpg")
-    pix = page.get_pixmap(matrix=fitz.Matrix(0.35, 0.35), alpha=False)
-    pix.save(preview_path)
-    return preview_path
+
+def _fitz_matrix(scale_x: float, scale_y: float) -> Any:
+    import fitz  # PyMuPDF
+
+    return fitz.Matrix(scale_x, scale_y)
 
 
 def _failed_result(
     *,
+    status: str,
+    error_code: str,
     error: str,
     warnings: list[str],
     confidence: str = "low",
+    technical_detail: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "analysis_status": "failed",
+        "analysis_status": status,
         "analysis_error": error,
+        "analysis_error_code": error_code,
+        "analysis_technical_detail": technical_detail,
         "detected": None,
         "pages": None,
         "width_mm": None,
         "height_mm": None,
-        "preview_path": None,
         "preview_format": None,
+        "_preview_bytes": None,
         "suggested_product": None,
         "suggestions": [],
         "confidence": confidence,
@@ -136,6 +191,41 @@ def _failed_result(
         "analysis_warnings": warnings,
         "size_label": None,
     }
+
+
+def _classify_exception(exc: Exception) -> tuple[str, str, str]:
+    if isinstance(exc, FileNotFoundError):
+        return ("storage_error", "file_not_found", "Uploaded file could not be found in storage")
+    if isinstance(exc, PermissionError):
+        return ("storage_error", "permission_denied", "Uploaded file could not be accessed in storage")
+    if isinstance(exc, OSError):
+        return ("storage_error", "storage_io_error", "Uploaded file could not be read from storage")
+    if isinstance(exc, ValueError):
+        return ("unreadable", "empty_or_invalid_pdf", "Uploaded PDF is empty or unreadable")
+
+    message = str(exc).lower()
+    class_name = exc.__class__.__name__.lower()
+
+    if "password" in message or "encryption" in message or "unsupported" in message:
+        return ("unsupported", "unsupported_pdf_format", "Unsupported PDF format")
+    if (
+        "filedataerror" in class_name
+        or "not a pdf" in message
+        or "cannot open broken document" in message
+        or "malformed" in message
+        or "format error" in message
+        or "repair" in message
+    ):
+        return ("unreadable", "corrupt_or_unreadable_pdf", "PDF is unreadable or corrupt")
+
+    return ("failed", "analysis_failed", "PDF analysis failed")
+
+
+def _source_name(source: Any) -> str:
+    if isinstance(source, (str, Path)):
+        return str(source)
+    name = getattr(source, "name", None)
+    return str(name or source.__class__.__name__)
 
 
 def _match_size(width_mm: float, height_mm: float) -> dict[str, Any] | None:
