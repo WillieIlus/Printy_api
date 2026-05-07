@@ -35,9 +35,18 @@ from services.pricing.for_shops_wizard import (
     complete_rate_wizard,
     save_step_values,
 )
-from setup.services import get_setup_status_for_shop, get_setup_status_for_user
+from services.pricing.mvp_rate_card import (
+    build_public_rate_card_builder_config,
+    build_shop_rate_card_setup,
+    complete_shop_rate_card_setup,
+    preview_public_rate_card_builder,
+    save_shop_rate_card_setup,
+)
+from setup.services import SHOP_STATUS_ONLY_FIELDS, get_setup_status_for_shop, get_setup_status_for_user
 from shops.models import Shop
 from shops.services import can_manage_quotes, can_manage_shop
+from inventory.models import Machine, Paper
+from services.pricing.engine import calculate_sheet_pricing
 
 from .throttling import GuestQuoteRequestThrottle
 from .workflow_serializers import (
@@ -48,8 +57,12 @@ from .workflow_serializers import (
     ClientResponseRejectSerializer,
     ClientResponseReplySerializer,
     ClientQuoteRequestDetailSerializer,
+    DashboardCalculatorPayloadSerializer,
     DashboardQuoteRequestSummarySerializer,
     LargeFormatCalculatorPreviewSerializer,
+    MvpRateCardPublicSaveSerializer,
+    MvpRateCardPreviewSerializer,
+    MvpRateCardSetupSerializer,
     QuoteDraftCreateSerializer,
     QuoteDraftReadSerializer,
     QuoteDraftSendSerializer,
@@ -85,6 +98,28 @@ def _resolve_wizard_shop(*, request, shop_slug: str | None = None):
     if not can_manage_shop(shop, request.user):
         return None
     return shop
+
+
+def _create_shop_from_rate_card_draft(*, user, shop_details: dict[str, str]):
+    shop_name = (shop_details.get("shop_name") or "").strip() or "Print Shop"
+    location_area = (shop_details.get("location_area") or "").strip() or "Nairobi"
+    whatsapp = (shop_details.get("whatsapp_number") or "").strip()
+    return Shop.objects.create(
+        owner=user,
+        name=shop_name,
+        business_email=(getattr(user, "email", "") or "shop@printy.ke").strip() or "shop@printy.ke",
+        public_email=(getattr(user, "email", "") or "").strip(),
+        phone_number=whatsapp or "+254 700 000 000",
+        public_whatsapp_number=whatsapp,
+        address_line=location_area,
+        city=location_area,
+        state=location_area,
+        country="Kenya",
+        service_area=location_area,
+        description="Created from Printy MVP rate card onboarding.",
+        is_active=True,
+        is_public=True,
+    )
 
 
 def _create_conversation_message(
@@ -147,6 +182,103 @@ def _create_conversation_message(
     return message_obj
 
 
+class DashboardCalculatorPreviewView(APIView):
+    """
+    Shop-owner specific calculator preview.
+    Uses the authenticated user's shop rate card and finishings.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # Resolve shop
+        shop = Shop.objects.filter(owner=request.user).order_by("id").first()
+        if not shop:
+            membership_shop = Shop.objects.filter(memberships__user=request.user, memberships__is_active=True).first()
+            if membership_shop:
+                shop = membership_shop.shop
+        
+        if not shop:
+            return Response({"detail": "No active shop was found for your account. Please set up your shop first."}, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = DashboardCalculatorPayloadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+        
+        paper = validated["paper_id"]
+        color_mode = validated.get("color_mode", "COLOR")
+        sides = validated.get("sides", "SIMPLEX")
+        
+        # Ensure paper belongs to shop
+        if paper.shop_id != shop.id:
+            return Response({"detail": "Selected paper does not belong to your shop."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Resolve machine
+        machine = Machine.objects.filter(
+            shop=shop, 
+            is_active=True,
+            printing_rates__sheet_size=paper.sheet_size,
+            printing_rates__color_mode=color_mode,
+            printing_rates__is_active=True
+        ).first()
+        
+        if not machine:
+            machine = Machine.objects.filter(shop=shop, is_active=True, printing_rates__is_default=True).first()
+            if machine and not machine.printing_rates.filter(sheet_size=paper.sheet_size, color_mode=color_mode, is_active=True).exists():
+                machine = None
+        
+        if not machine:
+            return Response({
+                "detail": f"No active printing rate found for {paper.sheet_size} in {color_mode}. Please add this to your Pricing Setup first."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Ensure finishings belong to shop
+        for fin in validated.get("finishings", []):
+            if fin["rule"].shop_id != shop.id:
+                return Response({"detail": f"Finishing '{fin['rule'].name}' does not belong to your shop."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Calculate pricing
+        try:
+            result = calculate_sheet_pricing(
+                shop=shop,
+                quantity=validated["quantity"],
+                paper=paper,
+                machine=machine,
+                color_mode=color_mode,
+                sides=sides,
+                finishing_selections=validated.get("finishings", []),
+                width_mm=validated.get("width_mm"),
+                height_mm=validated.get("height_mm"),
+            )
+            
+            data = result.to_dict()
+            contract = data.get("calculation_result", {})
+            
+            response_data = {
+                "can_calculate": result.can_calculate,
+                "total": result.totals.get("grand_total"),
+                "currency": result.currency,
+                "price_mode": "exact", # Dashboard uses real rates
+                "production_preview": {
+                    "pieces_per_sheet": result.copies_per_sheet,
+                    "sheets_required": result.good_sheets,
+                    "parent_sheet": result.parent_sheet_name,
+                    "quantity": result.quantity,
+                    "cutting_required": result.breakdown.get("imposition", {}).get("cutting_required", True),
+                    "warnings": contract.get("warnings", []),
+                },
+                "pricing_breakdown": {
+                    "currency": result.currency,
+                    "lines": contract.get("line_items", []),
+                },
+                "warnings": contract.get("warnings", []),
+                "summary": f"Quote for {result.quantity} units on {paper.paper_type} {paper.gsm}gsm",
+            }
+            return Response(response_data)
+        except Exception as e:
+            logger.exception("Dashboard calculator error: %s", e)
+            return Response({"detail": "We could not calculate this quote. Please check your rate card and try again."}, status=status.HTTP_400_BAD_REQUEST)
+
+
 class SetupStatusCompatView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -158,7 +290,7 @@ class ShopSetupStatusCompatView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, shop_slug):
-        shop = get_object_or_404(Shop, slug=shop_slug)
+        shop = get_object_or_404(Shop.objects.only(*SHOP_STATUS_ONLY_FIELDS), slug=shop_slug)
         if not can_manage_shop(shop, request.user):
             return Response({"detail": "You cannot access this shop setup status."}, status=status.HTTP_403_FORBIDDEN)
         return Response(get_setup_status_for_shop(shop))
@@ -239,6 +371,106 @@ class ForShopsRateWizardPublicPreviewView(APIView):
                 rates=serializer.validated_data.get("rates") or {},
             )
         )
+
+
+class ForShopsMvpRateCardPublicConfigView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        return Response(build_public_rate_card_builder_config())
+
+
+class ForShopsMvpRateCardPublicPreviewView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = MvpRateCardPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(
+            preview_public_rate_card_builder(
+                paper_rows=serializer.validated_data.get("paper_rows") or [],
+                finishing_rows=serializer.validated_data.get("finishing_rows") or [],
+            )
+        )
+
+
+class ForShopsMvpRateCardSaveView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = MvpRateCardPublicSaveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        if not request.user.is_authenticated:
+            return Response(
+                {
+                    "pending_auth": True,
+                    "shop_details": serializer.validated_data.get("shop_details") or {},
+                    "paper_rows": serializer.validated_data.get("paper_rows") or [],
+                    "finishing_rows": serializer.validated_data.get("finishing_rows") or [],
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
+
+        shop = _resolve_wizard_shop(request=request)
+        if shop is None:
+            shop = _create_shop_from_rate_card_draft(
+                user=request.user,
+                shop_details=serializer.validated_data.get("shop_details") or {},
+            )
+
+        payload = save_shop_rate_card_setup(
+            shop,
+            paper_rows=serializer.validated_data.get("paper_rows") or [],
+            finishing_rows=serializer.validated_data.get("finishing_rows") or [],
+            shop_details=serializer.validated_data.get("shop_details") or {},
+            completed=True,
+        )
+        setup_status = get_setup_status_for_shop(shop)
+        return Response(
+            {
+                "saved": True,
+                "shop_slug": shop.slug,
+                "redirect_url": "/dashboard/shop/setup",
+                "setup_status": setup_status,
+                **payload,
+            }
+        )
+
+
+class ShopMvpRateCardSetupView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        shop = _resolve_wizard_shop(request=request, shop_slug=request.query_params.get("shop_slug"))
+        if shop is None:
+            return Response({"detail": "No manageable shop was found for this user."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(build_shop_rate_card_setup(shop))
+
+    def patch(self, request):
+        serializer = MvpRateCardSetupSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        shop = _resolve_wizard_shop(request=request, shop_slug=request.data.get("shop_slug") or request.query_params.get("shop_slug"))
+        if shop is None:
+            return Response({"detail": "No manageable shop was found for this user."}, status=status.HTTP_404_NOT_FOUND)
+        payload = save_shop_rate_card_setup(
+            shop,
+            paper_rows=serializer.validated_data.get("paper_rows") or [],
+            finishing_rows=serializer.validated_data.get("finishing_rows") or [],
+            shop_details=serializer.validated_data.get("shop_details") or {},
+            completed=False,
+        )
+        return Response(payload)
+
+
+class ShopMvpRateCardCompleteView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        shop = _resolve_wizard_shop(request=request, shop_slug=request.data.get("shop_slug"))
+        if shop is None:
+            return Response({"detail": "No manageable shop was found for this user."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(complete_shop_rate_card_setup(shop))
 
 
 class ForShopsRateWizardPreviewView(APIView):

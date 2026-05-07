@@ -249,6 +249,16 @@ class Shop(AutoSlugMixin, models.Model):
             "Each value: {low: KES, high: KES}."
         ),
     )
+    mvp_rate_card = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name=_("mvp rate card"),
+        help_text=_(
+            "Structured MVP onboarding rate card. Stores final inclusive digital press paper rows, "
+            "finishing rows, onboarding progress, and shop setup metadata for the simplified shop-owner flow."
+        ),
+    )
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,

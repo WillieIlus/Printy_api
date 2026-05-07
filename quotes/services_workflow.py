@@ -16,6 +16,7 @@ from quotes.models import (
     QuoteItemFinishing,
     QuoteRequest,
     QuoteRequestMessage,
+    QuoteShareLink,
     ShopQuote,
 )
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours
@@ -427,7 +428,18 @@ def create_quote_response(*, quote_request: QuoteRequest, shop, user, status: st
     response.save(update_fields=["quote_reference", "updated_at"])
     quote_request.status = _request_status_for_response_status(status)
     quote_request.save(update_fields=["status", "updated_at"])
+
+    share_link = None
     if status != ShopQuoteStatus.PENDING:
+        # Create share link for client visibility
+        share_link, _ = QuoteShareLink.objects.get_or_create(
+            shop_quote=response,
+            defaults={
+                "expires_at": timezone.now() + timezone.timedelta(days=30),
+                "created_by": user if user and user.is_authenticated else None,
+            }
+        )
+
         create_quote_message(
             quote_request=quote_request,
             shop_quote=response,
@@ -441,7 +453,12 @@ def create_quote_response(*, quote_request: QuoteRequest, shop, user, status: st
             direction=QuoteRequestMessage.Direction.INBOUND,
             subject=f"{quote_request.shop.name} sent a quote",
             body=note or "A shop sent you a quote in Printy.",
-            metadata={"status": quote_request.status, "quote_status": status, "total": str(total or "")},
+            metadata={
+                "status": quote_request.status, 
+                "quote_status": status, 
+                "total": str(total or ""),
+                "share_token": share_link.token if share_link else None,
+            },
             send_email_copy=bool(quote_request.customer_email),
             create_failure_notice=True,
         )
@@ -502,7 +519,18 @@ def update_quote_response(
     quote_request = response.quote_request
     quote_request.status = _request_status_for_response_status(status)
     quote_request.save(update_fields=["status", "updated_at"])
+
+    share_link = None
     if status != ShopQuoteStatus.PENDING:
+        # Create or update share link for client visibility
+        share_link, _ = QuoteShareLink.objects.get_or_create(
+            shop_quote=response,
+            defaults={
+                "expires_at": timezone.now() + timezone.timedelta(days=30),
+                "created_by": response.created_by if response.created_by and response.created_by.is_authenticated else None,
+            }
+        )
+
         create_quote_message(
             quote_request=quote_request,
             shop_quote=response,
@@ -516,7 +544,12 @@ def update_quote_response(
             direction=QuoteRequestMessage.Direction.INBOUND,
             subject=f"{quote_request.shop.name} sent a quote",
             body=response.note or "A shop updated your quote in Printy.",
-            metadata={"status": quote_request.status, "quote_status": status, "total": str(response.total or "")},
+            metadata={
+                "status": quote_request.status, 
+                "quote_status": status, 
+                "total": str(response.total or ""),
+                "share_token": share_link.token if share_link else None,
+            },
             send_email_copy=bool(quote_request.customer_email),
             create_failure_notice=True,
         )

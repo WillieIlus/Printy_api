@@ -1,5 +1,7 @@
 """Backend truth for shop setup and rate-card readiness."""
 
+from django.db import OperationalError, ProgrammingError
+
 from catalog.models import Product
 from inventory.models import Machine, Paper
 from pricing.models import FinishingRate, Material, PrintingRate
@@ -19,6 +21,26 @@ READINESS_STEPS = [
     ("finishing", "Finishing rates", "Add finishing"),
     ("turnaround", "Turnaround guidance", "Add turnaround"),
     ("publish", "Publish your shop", "Review visibility"),
+]
+
+SHOP_STATUS_ONLY_FIELDS = [
+    "id",
+    "owner_id",
+    "name",
+    "description",
+    "business_email",
+    "phone_number",
+    "address_line",
+    "city",
+    "state",
+    "country",
+    "service_area",
+    "turnaround_statement",
+    "public_whatsapp_number",
+    "is_active",
+    "is_public",
+    "supports_custom_requests",
+    "supports_catalog_requests",
 ]
 
 
@@ -48,6 +70,17 @@ def _has_real_text(value: str | None, placeholder: str | None = None) -> bool:
     if placeholder and normalized == placeholder:
         return False
     return True
+
+
+def _safe_mvp_rate_card(shop: Shop | None) -> dict:
+    if shop is None:
+        return {}
+    raw = getattr(shop, "__dict__", {}).get("mvp_rate_card", None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _active_count(rows) -> int:
+    return sum(1 for row in (rows or []) if row.get("active"))
 
 
 def _shop_profile_complete(shop: Shop) -> bool:
@@ -176,6 +209,10 @@ def _build_status_for_shop(shop: Shop | None) -> dict:
             "steps": _build_steps_payload(shop=None, state={}, next_step="shop"),
         }
 
+    mvp_rate_card = _safe_mvp_rate_card(shop)
+    mvp_paper_count = _active_count(mvp_rate_card.get("paper_rows"))
+    mvp_finishing_count = _active_count(mvp_rate_card.get("finishing_rows"))
+
     machine_count = Machine.objects.filter(shop=shop, is_active=True).count()
     paper_count = Paper.objects.filter(shop=shop, is_active=True).count()
     material_count = Material.objects.filter(shop=shop, is_active=True).count()
@@ -184,10 +221,10 @@ def _build_status_for_shop(shop: Shop | None) -> dict:
     products_count = Product.objects.filter(shop=shop, is_active=True).count()
 
     has_machines = machine_count > 0
-    has_papers = paper_count > 0
-    has_materials = (paper_count + material_count) > 0
-    has_pricing_rules = pricing_rules_count > 0 and has_papers
-    has_finishing_rates = finishing_rates_count > 0
+    has_papers = (paper_count + mvp_paper_count) > 0
+    has_materials = (paper_count + material_count + mvp_paper_count) > 0
+    has_pricing_rules = (pricing_rules_count > 0 and (paper_count > 0)) or mvp_paper_count > 0
+    has_finishing_rates = finishing_rates_count > 0 or mvp_finishing_count > 0
     has_products = products_count > 0
     shop_profile_complete = _shop_profile_complete(shop)
     turnaround_configured = _turnaround_configured(shop)
@@ -273,13 +310,14 @@ def _build_status_for_shop(shop: Shop | None) -> dict:
         "has_machines": has_machines,
         "has_papers": has_papers,
         "has_materials": has_materials,
-        "materials_count": paper_count + material_count,
+        "materials_count": paper_count + material_count + mvp_paper_count,
         "has_pricing": has_pricing_rules,
         "has_pricing_rules": has_pricing_rules,
-        "pricing_rules_count": pricing_rules_count,
+        "pricing_rules_count": pricing_rules_count if pricing_rules_count > 0 else mvp_paper_count,
         "has_finishing": has_finishing_rates,
         "has_finishing_rates": has_finishing_rates,
-        "finishing_rates_count": finishing_rates_count,
+        "finishing_rates_count": finishing_rates_count if finishing_rates_count > 0 else mvp_finishing_count,
+        "has_rate_card": bool(mvp_paper_count or mvp_finishing_count),
         "has_products": has_products,
         "shop_profile_complete": shop_profile_complete,
         "turnaround_configured": turnaround_configured,
@@ -300,7 +338,11 @@ def _build_status_for_shop(shop: Shop | None) -> dict:
 
 
 def get_setup_status_for_user(user) -> dict:
-    return _build_status_for_shop(Shop.objects.filter(owner=user).order_by("id").first())
+    try:
+        shop = Shop.objects.filter(owner=user).only(*SHOP_STATUS_ONLY_FIELDS).order_by("id").first()
+    except (ProgrammingError, OperationalError):
+        shop = None
+    return _build_status_for_shop(shop)
 
 
 def get_setup_status_for_shop(shop: Shop) -> dict:
@@ -311,6 +353,8 @@ def get_setup_status(user) -> dict:
     status = get_setup_status_for_user(user)
     return {
         "has_shop": status["has_shop"],
+        "has_materials": status["has_materials"],
+        "has_rate_card": status.get("has_rate_card", False),
         "has_papers": status["has_papers"],
         "has_machines": status["has_machines"],
         "has_pricing": status["has_pricing"],
@@ -318,6 +362,7 @@ def get_setup_status(user) -> dict:
         "has_published_products": status["shop_published"],
         "pricing_ready": status["can_price_requests"],
         "next_step": "done" if status["next_step"] == "complete" else status["next_step"],
+        "completion_percent": status["rate_card_completeness"],
     }
 
 

@@ -37,6 +37,19 @@ def create_default_opening_hours(sender, instance, created, **kwargs):
 
 
 @receiver(post_save, sender=Shop)
+def create_default_machine(sender, instance, created, **kwargs):
+    """Create a default machine so quoting isn't blocked by machine management."""
+    if created:
+        Machine.objects.create(
+            shop=instance,
+            name="Primary Digital Press",
+            is_active=True,
+            max_width_mm=330,
+            max_height_mm=488,
+        )
+
+
+@receiver(post_save, sender=Shop)
 def promote_shop_owner_role(sender, instance, **kwargs):
     """Owning a shop always upgrades the account to shop_owner."""
     promote_to_shop_owner(instance.owner)

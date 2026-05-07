@@ -4,7 +4,7 @@ from rest_framework.views import APIView
 
 from shops.models import Shop
 
-from .services import get_setup_status_for_shop, get_setup_status_for_user
+from .services import SHOP_STATUS_ONLY_FIELDS, get_setup_status_for_shop, get_setup_status_for_user
 
 
 class SetupStatusView(APIView):
@@ -24,6 +24,6 @@ class ShopSetupStatusView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, slug):
-        shop = Shop.objects.get(slug=slug)
+        shop = Shop.objects.only(*SHOP_STATUS_ONLY_FIELDS).get(slug=slug)
         data = get_setup_status_for_shop(shop)
         return Response(data)

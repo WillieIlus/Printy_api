@@ -172,6 +172,7 @@ class ShopRateCardView(APIView):
 
     def get(self, request, shop_slug):
         shop = get_object_or_404(Shop, slug=shop_slug, is_active=True)
+        mvp_rate_card = shop.mvp_rate_card or {}
 
         # Printing: from PrintingRate via Machine (shop's machines). Default rates first.
         printing = []
@@ -218,45 +219,74 @@ class ShopRateCardView(APIView):
                 printing_by_sheet[key] = rate
 
         paper = []
-        for p in Paper.objects.filter(shop=shop, is_active=True, selling_price__gt=0).order_by("sheet_size", "gsm", "paper_type")[:50]:
-            pr = printing_by_sheet.get(p.sheet_size)
-            paper_sell = Decimal(str(p.selling_price))
-            if pr:
-                duplex_breakdown = pr.get_duplex_price_breakdown(paper=p)
-                single = paper_sell + pr.single_price
-                double = paper_sell + duplex_breakdown["total_per_sheet"]
-            else:
-                duplex_breakdown = None
-                single = paper_sell
-                double = paper_sell
+        if mvp_rate_card.get("paper_rows"):
+            for row in mvp_rate_card.get("paper_rows") or []:
+                if not row.get("active"):
+                    continue
+                paper.append({
+                    "gsm": row.get("gsm"),
+                    "paper_name": row.get("paper_name"),
+                    "paper_type": row.get("paper_type"),
+                    "sheet_size": "SRA3",
+                    "single_price": row.get("single_side_price"),
+                    "double_price": row.get("double_side_price") or row.get("single_side_price"),
+                    "duplex_surcharge_enabled": False,
+                    "duplex_surcharge": "0.00",
+                    "duplex_surcharge_min_gsm": None,
+                })
+        else:
+            for p in Paper.objects.filter(shop=shop, is_active=True, selling_price__gt=0).order_by("sheet_size", "gsm", "paper_type")[:50]:
+                pr = printing_by_sheet.get(p.sheet_size)
+                paper_sell = Decimal(str(p.selling_price))
+                if pr:
+                    duplex_breakdown = pr.get_duplex_price_breakdown(paper=p)
+                    single = paper_sell + pr.single_price
+                    double = paper_sell + duplex_breakdown["total_per_sheet"]
+                else:
+                    duplex_breakdown = None
+                    single = paper_sell
+                    double = paper_sell
 
-            row = {
-                "gsm": p.gsm,
-                "paper_type": p.get_paper_type_display() or p.paper_type,
-                "sheet_size": p.sheet_size,
-                "single_price": str(single),
-                "double_price": str(double),
-                "duplex_surcharge_enabled": pr.duplex_surcharge_enabled if pr else False,
-                "duplex_surcharge": str(duplex_breakdown["duplex_surcharge"].quantize(Decimal("0.01"))) if duplex_breakdown else "0.00",
-                "duplex_surcharge_min_gsm": pr.duplex_surcharge_min_gsm if pr else None,
-            }
-            if is_owner and pr:
-                row["price_per_sheet"] = str(p.selling_price)
-                row["printing_single"] = str(pr.single_price)
-                row["printing_double"] = str(duplex_breakdown["total_per_sheet"])
-            paper.append(row)
+                row = {
+                    "gsm": p.gsm,
+                    "paper_type": p.get_paper_type_display() or p.paper_type,
+                    "sheet_size": p.sheet_size,
+                    "single_price": str(single),
+                    "double_price": str(double),
+                    "duplex_surcharge_enabled": pr.duplex_surcharge_enabled if pr else False,
+                    "duplex_surcharge": str(duplex_breakdown["duplex_surcharge"].quantize(Decimal("0.01"))) if duplex_breakdown else "0.00",
+                    "duplex_surcharge_min_gsm": pr.duplex_surcharge_min_gsm if pr else None,
+                }
+                if is_owner and pr:
+                    row["price_per_sheet"] = str(p.selling_price)
+                    row["printing_single"] = str(pr.single_price)
+                    row["printing_double"] = str(duplex_breakdown["total_per_sheet"])
+                paper.append(row)
 
         # Finishing: from FinishingRate
         finishing = []
-        for f in FinishingRate.objects.filter(shop=shop, is_active=True).select_related("category").order_by("name")[:50]:
-            finishing.append({
-                "id": f.id,
-                "name": f.name,
-                "category": f.category.name if f.category else "",
-                "price": str(f.price),
-                "charge_by": f.display_unit_label or f.get_charge_unit_display() or f.charge_unit,
-                "is_default": False,
-            })
+        if mvp_rate_card.get("finishing_rows"):
+            for row in mvp_rate_card.get("finishing_rows") or []:
+                if not row.get("active"):
+                    continue
+                finishing.append({
+                    "id": row.get("id"),
+                    "name": row.get("name"),
+                    "category": "",
+                    "price": row.get("price"),
+                    "charge_by": row.get("pricing_mode"),
+                    "is_default": False,
+                })
+        else:
+            for f in FinishingRate.objects.filter(shop=shop, is_active=True).select_related("category").order_by("name")[:50]:
+                finishing.append({
+                    "id": f.id,
+                    "name": f.name,
+                    "category": f.category.name if f.category else "",
+                    "price": str(f.price),
+                    "charge_by": f.display_unit_label or f.get_charge_unit_display() or f.charge_unit,
+                    "is_default": False,
+                })
 
         return Response({
             "printing": printing_deduped,
@@ -277,6 +307,7 @@ class ShopRateCardForCalculatorView(APIView):
 
     def get(self, request, shop_slug):
         shop = get_object_or_404(Shop, slug=shop_slug, is_active=True)
+        mvp_rate_card = shop.mvp_rate_card or {}
 
         # Templates from active public products.
         products = public_shop_products_queryset(shop).prefetch_related(
@@ -321,54 +352,84 @@ class ShopRateCardForCalculatorView(APIView):
 
         # Papers
         papers = []
-        for p in Paper.objects.filter(shop=shop, is_active=True, selling_price__gt=0).order_by("sheet_size", "gsm")[:50]:
-            pt = p.paper_type
-            if hasattr(pt, "value"):
-                pt = pt.value
-            papers.append({
-                "id": p.id,
-                "sheet_size": p.sheet_size,
-                "gsm": p.gsm,
-                "paper_type": str(pt) if pt else "UNCOATED",
-                "selling_price": str(p.selling_price),
-                "is_active": p.is_active,
-            })
+        if mvp_rate_card.get("paper_rows"):
+            for row in mvp_rate_card.get("paper_rows") or []:
+                if not row.get("active"):
+                    continue
+                papers.append({
+                    "id": row.get("id"),
+                    "sheet_size": "SRA3",
+                    "gsm": row.get("gsm"),
+                    "paper_type": row.get("paper_type"),
+                    "selling_price": row.get("single_side_price"),
+                    "single_side_price": row.get("single_side_price"),
+                    "double_side_price": row.get("double_side_price"),
+                    "is_active": True,
+                })
+        else:
+            for p in Paper.objects.filter(shop=shop, is_active=True, selling_price__gt=0).order_by("sheet_size", "gsm")[:50]:
+                pt = p.paper_type
+                if hasattr(pt, "value"):
+                    pt = pt.value
+                papers.append({
+                    "id": p.id,
+                    "sheet_size": p.sheet_size,
+                    "gsm": p.gsm,
+                    "paper_type": str(pt) if pt else "UNCOATED",
+                    "selling_price": str(p.selling_price),
+                    "is_active": p.is_active,
+                })
 
         # Printing rates (dedupe by sheet_size+color_mode)
         printing_rates = []
-        seen_pr = set()
-        for r in PrintingRate.objects.filter(
-            machine__shop=shop, is_active=True
-        ).order_by("-is_default", "sheet_size", "color_mode")[:50]:
-            key = (r.sheet_size, r.color_mode)
-            if key not in seen_pr:
-                seen_pr.add(key)
-                duplex_breakdown = r.get_duplex_price_breakdown()
-                printing_rates.append({
-                    "id": r.id,
-                    "sheet_size": r.sheet_size,
-                    "color_mode": r.color_mode,
-                    "single_price": str(r.single_price),
-                    "double_price": str(duplex_breakdown["total_per_sheet"]) if duplex_breakdown["total_per_sheet"] is not None else None,
-                    "duplex_override_price": str(r.double_price) if r.double_price is not None else None,
-                    "duplex_surcharge": str(r.duplex_surcharge),
-                    "duplex_surcharge_enabled": r.duplex_surcharge_enabled,
-                    "duplex_surcharge_min_gsm": r.duplex_surcharge_min_gsm,
-                    "is_active": r.is_active,
-                })
+        if not mvp_rate_card.get("paper_rows"):
+            seen_pr = set()
+            for r in PrintingRate.objects.filter(
+                machine__shop=shop, is_active=True
+            ).order_by("-is_default", "sheet_size", "color_mode")[:50]:
+                key = (r.sheet_size, r.color_mode)
+                if key not in seen_pr:
+                    seen_pr.add(key)
+                    duplex_breakdown = r.get_duplex_price_breakdown()
+                    printing_rates.append({
+                        "id": r.id,
+                        "sheet_size": r.sheet_size,
+                        "color_mode": r.color_mode,
+                        "single_price": str(r.single_price),
+                        "double_price": str(duplex_breakdown["total_per_sheet"]) if duplex_breakdown["total_per_sheet"] is not None else None,
+                        "duplex_override_price": str(r.double_price) if r.double_price is not None else None,
+                        "duplex_surcharge": str(r.duplex_surcharge),
+                        "duplex_surcharge_enabled": r.duplex_surcharge_enabled,
+                        "duplex_surcharge_min_gsm": r.duplex_surcharge_min_gsm,
+                        "is_active": r.is_active,
+                    })
 
         # Finishing rates
         finishing_rates = []
-        for f in FinishingRate.objects.filter(shop=shop, is_active=True).order_by("name")[:50]:
-            finishing_rates.append({
-                "id": f.id,
-                "name": f.name,
-                "charge_unit": f.charge_unit,
-                "price": str(f.price),
-                "setup_fee": str(f.setup_fee) if f.setup_fee else None,
-                "min_qty": f.min_qty,
-                "is_active": f.is_active,
-            })
+        if mvp_rate_card.get("finishing_rows"):
+            for row in mvp_rate_card.get("finishing_rows") or []:
+                if not row.get("active"):
+                    continue
+                finishing_rates.append({
+                    "id": row.get("id"),
+                    "name": row.get("name"),
+                    "charge_unit": row.get("pricing_mode"),
+                    "price": row.get("price"),
+                    "setup_fee": None,
+                    "min_qty": None,
+                    "is_active": True,
+                })
+        else:
+            for f in FinishingRate.objects.filter(shop=shop, is_active=True).order_by("name")[:50]:
+                finishing_rates.append({
+                    "id": f.id,
+                    "name": f.name,
+                    "charge_unit": f.charge_unit,
+                    "price": str(f.price),
+                    "setup_fee": str(f.setup_fee) if f.setup_fee else None,
+                    "min_qty": f.min_qty,
+                    "is_active": f.is_active,
+                })
 
         # Materials (large format)
         materials = []
@@ -1647,6 +1708,17 @@ class ShopViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         promote_to_shop_owner(self.request.user)
         serializer.save(owner=self.request.user)
+
+    def destroy(self, request, *args, **kwargs):
+        shop = self.get_object()
+        # Prevent deleting the only shop or a primary shop during MVP
+        if shop.owner == request.user:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied(
+                "You cannot delete your primary shop during the MVP phase. "
+                "If you need to close your shop, please deactivate it in the Profile settings instead."
+            )
+        return super().destroy(request, *args, **kwargs)
 
 
 class ShopScopedMixin:

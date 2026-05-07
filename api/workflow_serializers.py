@@ -269,6 +269,40 @@ class LargeFormatCalculatorPreviewSerializer(serializers.Serializer):
         return attrs
 
 
+class DashboardFinishingSelectionSerializer(serializers.Serializer):
+    finishing_id = serializers.PrimaryKeyRelatedField(
+        queryset=FinishingRate.objects.filter(is_active=True),
+        source="rule"
+    )
+    selected_side = serializers.ChoiceField(choices=["front", "back", "both"], default="both")
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and "finishing_id" not in data and "id" in data:
+            data = {**data, "finishing_id": data["id"]}
+        return super().to_internal_value(data)
+
+
+class DashboardCalculatorPayloadSerializer(serializers.Serializer):
+    job_type = serializers.CharField(required=False, allow_blank=True)
+    quantity = serializers.IntegerField(min_value=1)
+    width_mm = serializers.IntegerField(required=False, min_value=1)
+    height_mm = serializers.IntegerField(required=False, min_value=1)
+    paper_id = serializers.PrimaryKeyRelatedField(queryset=Paper.objects.filter(is_active=True))
+    sides = serializers.ChoiceField(choices=["SIMPLEX", "DUPLEX"], default="SIMPLEX")
+    color_mode = serializers.ChoiceField(choices=["BW", "COLOR"], default="COLOR")
+    orientation = serializers.CharField(required=False, allow_blank=True)
+    bleed_mm = serializers.IntegerField(required=False, default=3)
+    finishings = DashboardFinishingSelectionSerializer(many=True, required=False)
+
+    def to_internal_value(self, data):
+        normalized = normalize_size_payload(
+            data,
+            legacy_width_keys=("chosen_width_mm",),
+            legacy_height_keys=("chosen_height_mm",),
+        )
+        return super().to_internal_value(normalized)
+
+
 class QuoteDraftCreateSerializer(serializers.Serializer):
     title = serializers.CharField(required=False, allow_blank=True)
     shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all(), required=False, allow_null=True)
@@ -507,8 +541,10 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
     shop_name = serializers.CharField(source="shop.name", read_only=True)
     shop_slug = serializers.CharField(source="shop.slug", read_only=True)
     raw_status = serializers.CharField(source="status", read_only=True)
+    created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True)
     status = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
+    share_token = serializers.SerializerMethodField()
     whatsapp_available = serializers.SerializerMethodField()
     whatsapp_url = serializers.SerializerMethodField()
     whatsapp_label = serializers.SerializerMethodField()
@@ -548,10 +584,16 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
             "whatsapp_available",
             "whatsapp_url",
             "whatsapp_label",
+            "share_token",
+            "created_by_name",
         ]
 
     def get_status(self, obj):
         return normalize_quote_response_status(obj.status)
+
+    def get_share_token(self, obj):
+        link = obj.share_links.first()
+        return link.token if link else None
 
     def get_status_label(self, obj):
         return quote_response_status_label(self.get_status(obj))
@@ -858,3 +900,81 @@ class PublicRateWizardPreviewSerializer(serializers.Serializer):
     preset_key = serializers.CharField()
     quantity = serializers.IntegerField(min_value=1)
     rates = serializers.DictField(child=serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True), required=False, default=dict)
+
+
+class MvpRateCardPaperRowSerializer(serializers.Serializer):
+    key = serializers.CharField(required=False, allow_blank=True)
+    id = serializers.CharField(required=False, allow_blank=True)
+    label = serializers.CharField(required=False, allow_blank=True)
+    paper_name = serializers.CharField(required=False, allow_blank=True)
+    gsm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    paper_type = serializers.CharField(required=False, allow_blank=True)
+    category = serializers.CharField(required=False, allow_blank=True)
+    size = serializers.CharField(required=False, allow_blank=True)
+    single_side_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    double_side_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    active = serializers.BooleanField(required=False, default=False)
+
+
+class MvpRateCardFinishingRowSerializer(serializers.Serializer):
+    key = serializers.CharField(required=False, allow_blank=True)
+    id = serializers.CharField(required=False, allow_blank=True)
+    label = serializers.CharField(required=False, allow_blank=True)
+    name = serializers.CharField(required=False, allow_blank=True)
+    pricing_mode = serializers.CharField(required=False, allow_blank=True, default="flat_per_job")
+    unit = serializers.CharField(required=False, allow_blank=True)
+    price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    active = serializers.BooleanField(required=False, default=False)
+
+
+class MvpRateCardShopDetailsSerializer(serializers.Serializer):
+    shop_name = serializers.CharField(required=False, allow_blank=True, default="")
+    whatsapp_number = serializers.CharField(required=False, allow_blank=True, default="")
+    location_area = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class MvpRateCardPublicShopSerializer(serializers.Serializer):
+    name = serializers.CharField(required=False, allow_blank=True, default="")
+    whatsapp = serializers.CharField(required=False, allow_blank=True, default="")
+    location = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class MvpRateCardPreviewSerializer(serializers.Serializer):
+    paper_prices = MvpRateCardPaperRowSerializer(many=True, required=False, default=list)
+    finishings = MvpRateCardFinishingRowSerializer(many=True, required=False, default=list)
+    paper_rows = MvpRateCardPaperRowSerializer(many=True, required=False, default=list)
+    finishing_rows = MvpRateCardFinishingRowSerializer(many=True, required=False, default=list)
+
+    def validate(self, attrs):
+        attrs["paper_rows"] = attrs.get("paper_prices") or attrs.get("paper_rows") or []
+        attrs["finishing_rows"] = attrs.get("finishings") or attrs.get("finishing_rows") or []
+        return attrs
+
+
+class MvpRateCardSetupSerializer(serializers.Serializer):
+    paper_prices = MvpRateCardPaperRowSerializer(many=True, required=False, default=list)
+    finishings = MvpRateCardFinishingRowSerializer(many=True, required=False, default=list)
+    paper_rows = MvpRateCardPaperRowSerializer(many=True, required=False, default=list)
+    finishing_rows = MvpRateCardFinishingRowSerializer(many=True, required=False, default=list)
+    shop_details = MvpRateCardShopDetailsSerializer(required=False, default=dict)
+
+    def validate(self, attrs):
+        attrs["paper_rows"] = attrs.get("paper_prices") or attrs.get("paper_rows") or []
+        attrs["finishing_rows"] = attrs.get("finishings") or attrs.get("finishing_rows") or []
+        return attrs
+
+
+class MvpRateCardPublicSaveSerializer(serializers.Serializer):
+    shop = MvpRateCardPublicShopSerializer(required=False, default=dict)
+    paper_prices = MvpRateCardPaperRowSerializer(many=True, required=False, default=list)
+    finishings = MvpRateCardFinishingRowSerializer(many=True, required=False, default=list)
+
+    def validate(self, attrs):
+        attrs["shop_details"] = {
+            "shop_name": (attrs.get("shop") or {}).get("name", ""),
+            "whatsapp_number": (attrs.get("shop") or {}).get("whatsapp", ""),
+            "location_area": (attrs.get("shop") or {}).get("location", ""),
+        }
+        attrs["paper_rows"] = attrs.get("paper_prices") or []
+        attrs["finishing_rows"] = attrs.get("finishings") or []
+        return attrs

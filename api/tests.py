@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import ProgrammingError
 from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -3733,6 +3734,136 @@ class ShopRateCardPaperDuplexSurchargeTestCase(TestCase):
         self.assertEqual(rows[150]["duplex_surcharge"], "5.00")
         self.assertTrue(rows[150]["duplex_surcharge_enabled"])
         self.assertEqual(rows[150]["duplex_surcharge_min_gsm"], 150)
+
+
+class MvpRateCardPublicPreviewAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_public_preview_accepts_new_mvp_payload_and_enriches_fixed_rows(self):
+        response = self.client.post(
+            "/api/for-shops/rate-card/public-preview/",
+            {
+                "paper_prices": [
+                    {
+                        "key": "300gsm_matte_art_card",
+                        "single_side_price": "62.00",
+                        "double_side_price": "102.00",
+                        "active": True,
+                    }
+                ],
+                "finishings": [
+                    {"key": "matte_lamination", "price": "38.00", "active": True},
+                    {"key": "cutting", "price": "480.00", "active": True},
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["paper_rows"][0]["key"], "300gsm_matte_art_card")
+        self.assertEqual(data["paper_rows"][0]["label"], "300gsm Matte/Art Card")
+        self.assertEqual(data["paper_rows"][0]["size"], "SRA3/A3")
+        self.assertEqual(data["finishing_rows"][0]["label"], "Matte Lamination")
+        self.assertEqual(data["finishing_rows"][0]["pricing_mode"], "per_sheet")
+        self.assertEqual(data["summary"]["paper_rows_added"], 1)
+        self.assertEqual(data["example_quote"]["estimated_total"], "1180.00")
+
+    def test_public_preview_returns_400_for_unknown_predefined_key(self):
+        response = self.client.post(
+            "/api/for-shops/rate-card/public-preview/",
+            {
+                "paper_prices": [
+                    {
+                        "key": "unknown_stock",
+                        "single_side_price": "50.00",
+                        "active": True,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("paper_prices", response.json()["field_errors"])
+
+    @patch("services.pricing.mvp_rate_card._iter_saved_rate_cards", side_effect=ProgrammingError("db not ready"))
+    def test_public_preview_handles_market_guide_failures_without_500(self, _mock_rate_cards):
+        response = self.client.post(
+            "/api/for-shops/rate-card/public-preview/",
+            {
+                "paper_prices": [
+                    {
+                        "key": "300gsm_matte_art_card",
+                        "single_side_price": "62.00",
+                        "double_side_price": "102.00",
+                        "active": True,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["sample_count"], 0)
+        self.assertFalse(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["has_enough_data"])
+
+
+class MvpRateCardSaveAndSetupStatusAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(email="mvp-owner@test.com", password="pass12345")
+
+    def _payload(self):
+        return {
+            "shop": {
+                "name": "Example Print Shop",
+                "whatsapp": "+254700000000",
+                "location": "Nairobi",
+            },
+            "paper_prices": [
+                {
+                    "key": "300gsm_matte_art_card",
+                    "single_side_price": "62.00",
+                    "double_side_price": "102.00",
+                    "active": True,
+                }
+            ],
+            "finishings": [
+                {"key": "matte_lamination", "price": "38.00", "active": True},
+                {"key": "cutting", "price": "480.00", "active": True},
+            ],
+        }
+
+    def test_authenticated_save_creates_shop_and_persists_rate_card(self):
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.post("/api/for-shops/rate-card/save/", self._payload(), format="json")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["saved"])
+        self.assertEqual(data["redirect_url"], "/dashboard/shop/setup")
+        shop = Shop.objects.get(owner=self.user)
+        self.assertEqual(shop.name, "Example Print Shop")
+        self.assertEqual(shop.mvp_rate_card["paper_rows"][0]["key"], "300gsm_matte_art_card")
+        self.assertTrue(data["setup_status"]["has_rate_card"])
+        self.assertTrue(data["setup_status"]["has_materials"])
+        self.assertTrue(data["setup_status"]["has_pricing"])
+        self.assertTrue(data["setup_status"]["has_finishing"])
+
+    @patch("setup.services.Shop.objects.filter", side_effect=ProgrammingError("missing mvp column"))
+    def test_setup_status_returns_incomplete_payload_instead_of_500(self, _mock_filter):
+        self.client.force_authenticate(user=self.user)
+
+        response = self.client.get("/api/setup-status/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertFalse(data["has_shop"])
+        self.assertEqual(data["next_step"], "shop")
 
 
 class CalculatorConfigContractAPITestCase(TestCase):

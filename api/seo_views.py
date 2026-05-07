@@ -66,6 +66,7 @@ class SEORoutesView(APIView):
 
         # Homepage
         routes.append({"loc": "/", "lastmod": today})
+        routes.append({"loc": "/for-shops", "lastmod": today})
 
         # Static hub pages
         routes.append({"loc": "/locations", "lastmod": today})
