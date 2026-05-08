@@ -1,193 +1,222 @@
-# Printy_API
+# Printy API
 
-Next generation print shop SaaS backend for Kenyan print shops.
+Backend for a print-shop SaaS and marketplace focused on Kenyan print businesses. The project is a Django 5 + DRF API that covers shop onboarding, catalog and pricing setup, quote drafting and messaging, public shop discovery, billing with M-Pesa, production tracking, artwork PDF analysis, analytics ingestion, and lead capture.
+
+## What is in this repo
+
+- Multi-tenant shop management: shops, memberships, opening hours, ratings, favorites, nearby search.
+- Catalog and pricing: products, categories, machines, papers, materials, printing rates, finishing rates, volume discounts, rate cards, and setup wizards.
+- Quote workflows: customer quote requests, seller responses, draft quotes, attachments, share links, inbox-style messaging, and calculator previews.
+- Public marketplace features: public shops, public products, SEO location/product endpoints, match-shops calculator flows, and guest quote submission.
+- Billing: subscription plans, entitlements, usage counters, M-Pesa STK push, callbacks, renewal retries, grace periods, and admin support actions.
+- Production and jobs: production orders, job processes, operators, price cards, and overflow job requests/claims.
+- Artwork analysis: uploaded PDF analysis with size detection, booklet hints, preview generation, and product suggestions.
+- Platform support: JWT auth, allauth email verification, Google social login, analytics event ingestion, i18n, and Django admin tooling.
 
 ## Stack
-- Django 5.x
+
+- Python 3
+- Django 5.2
 - Django REST Framework
 - SimpleJWT
-- PostgreSQL / SQLite (dev)
+- django-allauth
+- PostgreSQL
+- PyMuPDF and Pillow for artwork/PDF processing
+- pytest + pytest-django
 
-## Auth Email Flow
+## Main apps
 
-- `POST /api/auth/register/` creates the user, creates a primary unverified `EmailAddress`, and sends an allauth verification email.
-- Verification emails point to `${FRONTEND_URL}/auth/confirm-email?key=...` via `accounts.adapters.AccountAdapter`.
-- `POST /api/auth/email/resend/` is the SPA-facing resend endpoint. It always returns `200` with a generic message and only sends mail for existing unverified addresses.
-- `POST /api/auth/email/verify/` is the SPA-facing confirmation endpoint. It accepts `{ "key": "<allauth key>" }` and marks the address verified.
-- Legacy aliases remain available at `/api/auth/resend-confirmation/` and `/api/auth/confirm-email/`.
-- Missing `/api/...` routes return JSON, not Django HTML error pages.
+| App | Responsibility |
+| --- | --- |
+| `accounts` | Custom user model, JWT auth, registration, email verification, Google social login, roles |
+| `api` | Main API views/serializers for shops, quotes, public marketplace, calculator, analytics, SEO, workflow endpoints |
+| `artwork` | Artwork upload, PDF analysis, preview generation |
+| `billing` | Current subscription/billing system, plans, transactions, renewals, entitlements |
+| `catalog` | Product catalog models and validation |
+| `common` | Shared models, middleware, request/meta helpers, analytics event model |
+| `core` | Shared permissions and querysets |
+| `feedback` | Feedback intake endpoints and throttling |
+| `gallery` | Gallery categories/products for shop storefronts |
+| `inventory` | Machines, paper sizes, papers |
+| `jobs` | Overflow job marketplace requests and claims |
+| `leads` | Early-access and demo lead capture |
+| `locations` | SEO/discovery locations |
+| `notifications` | User notifications API |
+| `pricing` | Finishing categories, printing/finishing/material/service rates, discounts |
+| `production` | Production orders, processes, customers, operators, dashboard |
+| `quotes` | Quote domain models, pricing helpers, summaries, draft/share artifacts |
+| `services` | Pricing engines and lower-level calculator services |
+| `setup` | Shop setup-status endpoints and seed helpers |
+| `shops` | Shop model, memberships, hours, ratings, related admin |
+| `subscriptions` | Legacy subscription/M-Pesa module still referenced by some API routes |
 
-## Architecture Principles
-- No redundant models
-- Shop-scoped pricing
-- No ambiguous price lookups
-- FK-based quote calculations
-- Separate Seller vs Buyer permissions
+## API shape
 
----
+Top-level routing is defined in `config/urls.py` and `api/urls.py`.
 
-## Internationalization (i18n)
+Important route groups:
 
-### Supported languages
-- **English** (`en`)
-- **Kiswahili** (`sw`)
+- `/api/auth/`: register, login, token refresh, profile/me, email verify/resend, Google social login
+- `/api/setup/`: setup status endpoints
+- `/api/billing/`: plans, subscription lifecycle, usage, payments, M-Pesa callbacks
+- `/api/leads/`: early-access spots, applications, demo actions
+- `/api/artwork/`: artwork upload and detail endpoints
+- `/api/public/...`: public shops, products, calculators, match-shops flows
+- `/api/seo/...`: SEO-oriented location/product route data
+- `/api/shops/...`: seller shop resources, pricing resources, hours, gallery, products, rate cards
+- `/api/quote-requests`, `/api/quote-drafts`, `/api/sent-quotes`, `/api/quotes`: quoting workflows
+- `/api/calculator/...`: calculator config, previews, draft creation/sending
+- `/api/dashboard/...`: shop dashboard and calculator preview endpoints
+- `/api/jobs`, `/api/job-processes`, `/api/customers`, etc.: production tracking resources
 
-### How language toggle works
+The API is primarily JWT-protected. Public discovery and some guest quoting endpoints are open by design.
 
-1. **Authenticated users**: Set `preferred_language` via `PATCH /api/auth/me/`:
-   ```json
-   { "preferred_language": "sw" }
-   ```
-   The API activates this language for all subsequent requests. Default is `en`.
+## Auth and user flow
 
-2. **Unauthenticated / fallback**: Send `Accept-Language` header:
-   ```
-   Accept-Language: sw
-   ```
+- Authentication uses JWT bearer tokens only for the API.
+- Registration and email confirmation are implemented with `django-allauth`.
+- Verification links are generated against `FRONTEND_URL` through `accounts.adapters.AccountAdapter`.
+- Authenticated language preference is stored on the user profile; unauthenticated requests can use `Accept-Language`.
+- Google social login is implemented; GitHub provider is installed but not exposed in `accounts/urls.py`.
 
-3. **Frontend guidance**:
-   - Store user preference in profile; send on login.
-   - For API calls, either set `Accept-Language` on each request or rely on `preferred_language` (persisted on user) after login.
+## Pricing and quoting
 
-### Adding translations (makemessages / compilemessages)
+- Shop-scoped pricing is the dominant pattern: machines, papers, materials, finishing rates, discounts, and products belong to a shop.
+- The codebase includes multiple calculator entry points:
+  - standard quote preview
+  - booklet preview
+  - large-format preview
+  - public calculator/match-shops preview
+  - shop onboarding rate-wizard and MVP rate-card preview/setup
+- Quote workflows include draft creation, item attachments, customer/shop messaging, response accept/reject flows, and public share links.
+- Pricing logic lives across `quotes/`, `services/pricing/`, and `services/engine/`.
 
-1. **Extract translatable strings** into a `.po` file for a locale:
-   ```bash
-   python manage.py makemessages -l sw
-   ```
-   This creates/updates `locale/sw/LC_MESSAGES/django.po`.
+## Billing and payments
 
-2. **Edit the `.po` file** and add translations for each `msgid`:
-   ```po
-   msgid "Hello"
-   msgstr "Habari"
-   ```
+- The active billing domain is in `billing/`.
+- Plans are seeded as code-based tiers such as `FREE`, `BIASHARA`, `BIASHARA_PLUS`, and `BIASHARA_MAX`.
+- Billing supports activation, upgrades, downgrades, cancellations, manual renewals, and retry/grace-period handling.
+- M-Pesa Daraja STK push and callback handling are implemented.
+- `subscriptions/` still exists as an older module and some `/api/...` routes still reference it, so both domains currently coexist.
 
-3. **Compile** the `.po` files into `.mo` binaries:
-   ```bash
-   python manage.py compilemessages
-   ```
+## Artwork analysis
 
-4. **Use in code**:
-   ```python
-   from django.utils.translation import gettext as _
-   msg = _("Hello")
-   ```
+Artwork upload and PDF analysis live in `artwork/`.
 
----
+Current analysis behavior includes:
 
-## Django admin
+- opening PDFs with PyMuPDF
+- extracting page size and page count
+- detecting mixed page sizes
+- generating a JPEG preview
+- inferring likely product types such as flyer, booklet, business card, or large-format poster
+- normalizing booklet page counts to multiples of 4 for production hints
 
-- **Shop admin**: Inlines for Paper, FinishingRate, Material, Machine, ServiceRate, Product. Edit all shop resources on one page.
-- **Machine admin**: PrintingRate inline (one row per sheet_size + color_mode). Set Single/Double prices per sheet.
-- **Finishing rates as inline**: Yes. `TabularInline` is formset-like—multiple related rows in a table. Shops have a small, fixed set of finishing options (lamination, cutting, etc.) best managed inline with the shop.
+## Local setup
 
----
+1. Create and activate a virtual environment.
+2. Install dependencies.
+3. Copy `.env.example` to `.env` and fill in required values.
+4. Ensure PostgreSQL is available and the configured database exists.
+5. Run migrations.
+6. Configure the Django site metadata.
+7. Seed any required domain data.
+8. Start the development server.
 
-## Product price range & missing fields
+Example:
 
-### Price hint (`product_price_hint`)
-
-Products expose `price_hint` in the catalog and shop product APIs:
-```json
-{
-  "price_hint": {
-    "can_calculate": true,
-    "min_price": 150.0,
-    "max_price": 450.0,
-    "missing_fields": []
-  }
-}
+```powershell
+python -m venv env
+.\env\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env
+python manage.py migrate
+python manage.py configure_site
+python manage.py runserver
 ```
 
-When data is incomplete (includes actionable suggestions):
-```json
-{
-  "price_hint": {
-    "can_calculate": false,
-    "min_price": null,
-    "max_price": null,
-    "missing_fields": ["paper", "machine", "printing_rate"],
-    "suggestions": [
-      {"code": "ADD_PAPER", "message": "Add paper with selling price under Shop → Papers.", "target": {"resource": "papers", "shop_id": 1}},
-      {"code": "ADD_PRINTING_RATE", "message": "Set printing rate (single/double) for each machine + sheet size under Machine → Printing Rates.", "target": {"resource": "printing_rates", "shop_id": 1}}
-    ],
-    "reason": "Configure papers, machines, and rates under Shop setup."
-  }
-}
+## Environment
+
+The project loads environment variables from `.env` via `python-dotenv`.
+
+Core variables:
+
+- `SECRET_KEY`
+- `DEBUG`
+- `ALLOWED_HOSTS`
+- `DB_NAME`
+- `DB_USER`
+- `DB_PASSWORD`
+- `DB_HOST`
+- `DB_PORT`
+- `FRONTEND_URL`
+- `CORS_ALLOWED_ORIGINS`
+- `CSRF_TRUSTED_ORIGINS`
+
+Email/auth variables:
+
+- `ACCOUNT_EMAIL_VERIFICATION`
+- `EMAIL_BACKEND`
+- `EMAIL_HOST`
+- `EMAIL_PORT`
+- `EMAIL_USE_TLS`
+- `EMAIL_HOST_USER`
+- `EMAIL_HOST_PASSWORD`
+- `DEFAULT_FROM_EMAIL`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GITHUB_CLIENT_ID`
+- `GITHUB_CLIENT_SECRET`
+
+Billing variables:
+
+- `MPESA_ENV`
+- `MPESA_BASE_URL`
+- `MPESA_CONSUMER_KEY`
+- `MPESA_CONSUMER_SECRET`
+- `MPESA_SHORTCODE`
+- `MPESA_PASSKEY`
+- `MPESA_CALLBACK_URL`
+- `MPESA_TIMEOUT_SECONDS`
+- `BILLING_GRACE_PERIOD_DAYS`
+- `BILLING_RETRY_SCHEDULE_HOURS`
+
+See `docs/env_vars.md` and `.env.example` for the fuller reference.
+
+## Useful management commands
+
+- `python manage.py migrate`
+- `python manage.py createsuperuser`
+- `python manage.py configure_site`
+- `python manage.py seed_billing_plans`
+- `python manage.py seed_large_format`
+- `python manage.py seed_shop_pricing`
+- `python manage.py queue_due_renewals`
+- `python manage.py process_due_renewals`
+- `python manage.py expire_grace_periods`
+- `python manage.py backfill_usage_counters`
+- `python manage.py analyze_pdf_sample <path>`
+
+## Testing
+
+The repo contains Django tests and pytest-based execution.
+
+```powershell
+pytest
 ```
 
-Display: "From KES X" when `min_price` is set; optionally "Up to KES Y" when `max_price` differs.
+Targeted examples:
 
-### Defaults used
-
-- **quantity**: `min_quantity` (default 1)
-- **size**: `default_finished_width_mm` / `default_finished_height_mm`; for LARGE_FORMAT, `min_width_mm` / `min_height_mm` override when set.
-
-### What triggers "missing"
-
-- **SHEET products**: Need `dimensions` (default_finished_width_mm, default_finished_height_mm), `paper` (with selling_price), `machine`, `printing_rate` (per sheet_size + color_mode).
-- **LARGE_FORMAT products**: Need `material` (with selling_price), `dimensions` (default or min_width_mm/min_height_mm).
-
-### Preview price response (standardized)
-
-`POST /api/quote-drafts/{id}/preview-price/` always returns PricingDiagnostics:
-- `can_calculate`: bool — true if all items can be priced
-- `total`: number — 0 if none
-- `lines`: list — breakdown lines (empty if none)
-- `needs_review_items`: list[int] — item IDs that need more data
-- `missing_fields`: list[str] — aggregated missing field names
-- `reason`: str — optional human message (e.g. "2 item(s) need more details to calculate.")
-- `suggestions`: list — actionable `{code, message, target}` (ADD_PAPER, ADD_PRINTING_RATE, ADD_DIMENSIONS, etc.)
-- `item_diagnostics`: dict — `{item_id: {can_calculate, missing_fields, suggestions, reason}}` per item
-- `items_missing_fields`: dict — `{item_id: [field_names]}` per item needing review
-
-### Actionable suggestions (Kenyan-printshop friendly)
-
-When pricing cannot be computed, the API returns clear guidance:
-- **ADD_PAPER**: Add paper selling price for SRA3 200gsm under Shop → Papers
-- **ADD_PRINTING_RATE**: Set Digital Press printing rate for SRA3 COLOR (single/double) under Machine → Printing Rates
-- **ADD_DIMENSIONS**: Add artwork size so we can compute imposition (sheets needed)
-- **SELECT_MACHINE**, **SELECT_SIDES**, **SELECT_COLOR_MODE**: Choose options for this item
-
----
-
-## Frontend: repeatable forms (formsets)
-
-For shop setup screens (papers bulk add, finishing list, printing rates grid), use a **dynamic array** pattern similar to Django formsets:
-
-### Structure
-
-1. **State**: `items = ref([{ ... }, { ... }])`
-2. **Add row**: `items.value.push({ sheet_size: 'A4', ... })`
-3. **Remove row**: `items.value.splice(i, 1)`
-4. **Submit**: `POST` each item or `PATCH` in bulk if the API supports it.
-
-### Example (Vue 3 + Nuxt)
-
-```vue
-<script setup>
-const items = ref([{ sheet_size: 'A4', gsm: 80, selling_price: '2.00' }])
-function addRow() {
-  items.value.push({ sheet_size: 'A4', gsm: 80, selling_price: '' })
-}
-function removeRow(i) {
-  items.value.splice(i, 1)
-}
-async function save() {
-  for (const item of items.value) {
-    await $api(`shops/${shopId}/papers/`, { method: 'POST', body: item })
-  }
-}
-</script>
+```powershell
+pytest api/tests.py
+pytest billing/tests/test_payments.py
+pytest tests/test_engine_services.py
 ```
 
-### Best practices
+## Project notes
 
-- **Papers bulk add**: One form per row; validate before submit; show inline errors.
-- **Finishing list**: Same pattern; `charge_unit` options: PER_PIECE, PER_SIDE, PER_SHEET, PER_SQM, FLAT.
-- **Printing rates grid**: Inline edit (click cell → input → blur to save) or modal per row.
-
----
-
-Project is being built incrementally.
+- Database configuration is PostgreSQL-first in `config/settings.py`; SQLite is not the active default.
+- Static files are served with WhiteNoise.
+- API 404/500 responses are customized to return JSON instead of default Django HTML.
+- The project contains substantial implementation notes under `docs/`.
+- There are older and newer implementations in a few domains, especially billing/subscriptions and some quote flows, so route-level behavior should be checked against the current view modules when making changes.
