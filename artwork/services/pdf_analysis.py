@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ STANDARD_SIZES = {
 
 SMALL_ITEM_TOLERANCE_MM = 5
 LARGE_ITEM_TOLERANCE_MM = 10
-SADDLE_STITCH_WARNING = "Pages may need to be rounded to a multiple of 4 for saddle stitch."
+SADDLE_STITCH_WARNING = "Booklets print in multiples of 4 pages."
 
 SIZE_CANDIDATES = [
     {"label": "Business Card", "value": "85x55mm", "display_label": "Standard Business Card", "width_mm": 85, "height_mm": 55, "tolerance_mm": SMALL_ITEM_TOLERANCE_MM},
@@ -63,32 +64,54 @@ def analyze_pdf(source: Any) -> dict[str, Any]:
             width_mm = round(first_page.rect.width * POINTS_TO_MM, 1)
             height_mm = round(first_page.rect.height * POINTS_TO_MM, 1)
 
-            sizes = {
-                (round(page.rect.width, 1), round(page.rect.height, 1))
-                for page in doc
-            }
+            page_sizes = _extract_page_sizes(doc)
+            dominant_page_size = _dominant_page_size(page_sizes)
+            has_mixed_page_sizes = len(page_sizes) > 1
             warnings: list[str] = []
-            if len(sizes) > 1:
-                warnings.append("Mixed page sizes detected")
+            if has_mixed_page_sizes:
+                warnings.append("Mixed page sizes detected. Please confirm the final trim size before pricing.")
 
             preview_bytes = _render_preview(first_page)
             size_match = _match_size(width_mm, height_mm)
+            dominant_size_match = _match_size(
+                dominant_page_size["width_mm"],
+                dominant_page_size["height_mm"],
+            ) if dominant_page_size else size_match
             size_label = size_match["label"] if size_match else None
+            dominant_page_size_payload = _dominant_page_size_payload(
+                dominant_page_size,
+                dominant_size_match,
+            )
+            booklet = _build_booklet_analysis(doc.page_count)
+            detected_product_type = _detect_product_type(
+                pages=doc.page_count,
+                width_mm=width_mm,
+                height_mm=height_mm,
+                booklet=booklet,
+            )
             suggested_product = _suggest_product(
                 pages=doc.page_count,
                 width_mm=width_mm,
                 height_mm=height_mm,
-                size_match=size_match,
+                size_match=dominant_size_match or size_match,
                 warnings=warnings,
+                booklet=booklet,
             )
             suggestions = _build_suggestions(
                 pages=doc.page_count,
                 suggested_product=suggested_product,
-                size_match=size_match,
+                size_match=dominant_size_match or size_match,
+                booklet=booklet,
             )
+            analysis_status = "manual_review" if has_mixed_page_sizes else "success"
+
+            if booklet and booklet["needs_rule_of_4_padding"]:
+                warnings.append(
+                    f"Booklets print in multiples of 4 pages. We rounded {booklet['raw_pages']} pages to {booklet['normalized_pages']} for production."
+                )
 
             return {
-                "analysis_status": "analysed",
+                "analysis_status": analysis_status,
                 "analysis_error": None,
                 "analysis_error_code": None,
                 "analysis_technical_detail": None,
@@ -100,6 +123,18 @@ def analyze_pdf(source: Any) -> dict[str, Any]:
                     "unit": "mm",
                     "points_to_mm": round(POINTS_TO_MM, 6),
                 },
+                "detected_product_type": detected_product_type,
+                "page_count": doc.page_count,
+                "page_sizes": [
+                    {
+                        "width_mm": size["width_mm"],
+                        "height_mm": size["height_mm"],
+                    }
+                    for size in page_sizes
+                ],
+                "dominant_page_size": dominant_page_size_payload,
+                "has_mixed_page_sizes": has_mixed_page_sizes,
+                "booklet": booklet,
                 "pages": doc.page_count,
                 "width_mm": width_mm,
                 "height_mm": height_mm,
@@ -174,11 +209,17 @@ def _failed_result(
     technical_detail: str | None = None,
 ) -> dict[str, Any]:
     return {
-        "analysis_status": status,
+        "analysis_status": "failed",
         "analysis_error": error,
         "analysis_error_code": error_code,
         "analysis_technical_detail": technical_detail,
         "detected": None,
+        "detected_product_type": None,
+        "page_count": None,
+        "page_sizes": [],
+        "dominant_page_size": None,
+        "has_mixed_page_sizes": False,
+        "booklet": None,
         "pages": None,
         "width_mm": None,
         "height_mm": None,
@@ -190,6 +231,7 @@ def _failed_result(
         "warnings": warnings,
         "analysis_warnings": warnings,
         "size_label": None,
+        "failure_status": status,
     }
 
 
@@ -251,6 +293,7 @@ def _suggest_product(
     height_mm: float,
     size_match: dict[str, Any] | None,
     warnings: list[str],
+    booklet: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     if _is_large_format(width_mm, height_mm):
         confidence = "high" if max(width_mm, height_mm) >= 500 else "medium"
@@ -261,15 +304,19 @@ def _suggest_product(
             "reason": f"PDF size is {width_mm} x {height_mm} mm, which looks larger than standard sheet sizes.",
         }
 
-    if size_match and size_match["label"] in {"A4", "A5"} and pages > 4:
-        confidence = "high" if pages % 4 == 0 else "medium"
-        if pages % 4 != 0 and SADDLE_STITCH_WARNING not in warnings:
+    if booklet:
+        confidence = "high" if size_match and size_match["label"] in {"A4", "A5"} and pages % 4 == 0 else "medium"
+        if booklet["needs_rule_of_4_padding"] and SADDLE_STITCH_WARNING not in warnings:
             warnings.append(SADDLE_STITCH_WARNING)
         return {
             "type": "booklet",
             "label": "Booklets",
             "confidence": confidence,
-            "reason": f"PDF has {pages} pages and the size is close to {size_match['label']}, which looks like a booklet.",
+            "reason": (
+                f"PDF has {pages} pages and the size is close to {size_match['label']}, which looks like a booklet."
+                if size_match and size_match["label"] in {"A4", "A5"}
+                else f"PDF has {pages} pages, which looks like booklet content."
+            ),
         }
 
     if size_match and size_match["label"] == "Business Card":
@@ -298,6 +345,7 @@ def _build_suggestions(
     pages: int,
     suggested_product: dict[str, Any] | None,
     size_match: dict[str, Any] | None,
+    booklet: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     if not suggested_product:
         return []
@@ -320,8 +368,12 @@ def _build_suggestions(
         suggestions.append(
             {
                 "field": "total_pages",
-                "value": pages,
-                "label": f"{pages} pages",
+                "value": booklet["normalized_pages"] if booklet else pages,
+                "label": (
+                    f"{booklet['normalized_pages']} pages for production"
+                    if booklet and booklet["needs_rule_of_4_padding"]
+                    else f"{pages} pages"
+                ),
                 "confidence": confidence,
             }
         )
@@ -350,3 +402,65 @@ def _size_diff(width_mm: float, height_mm: float, target_width_mm: float, target
     direct = max(abs(width_mm - target_width_mm), abs(height_mm - target_height_mm))
     rotated = max(abs(width_mm - target_height_mm), abs(height_mm - target_width_mm))
     return min(direct, rotated)
+
+
+def _extract_page_sizes(doc: Any) -> list[dict[str, Any]]:
+    sizes: dict[tuple[float, float], dict[str, Any]] = {}
+    for page in doc:
+        width_mm = round(page.rect.width * POINTS_TO_MM, 1)
+        height_mm = round(page.rect.height * POINTS_TO_MM, 1)
+        normalized = tuple(sorted((width_mm, height_mm)))
+        record = sizes.setdefault(
+            normalized,
+            {
+                "width_mm": normalized[0],
+                "height_mm": normalized[1],
+                "count": 0,
+            },
+        )
+        record["count"] += 1
+    return sorted(sizes.values(), key=lambda item: item["count"], reverse=True)
+
+
+def _dominant_page_size(page_sizes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return page_sizes[0] if page_sizes else None
+
+
+def _dominant_page_size_payload(
+    dominant_page_size: dict[str, Any] | None,
+    size_match: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not dominant_page_size:
+        return None
+    return {
+        "width_mm": dominant_page_size["width_mm"],
+        "height_mm": dominant_page_size["height_mm"],
+        "label": size_match["label"] if size_match else "Custom",
+    }
+
+
+def _build_booklet_analysis(page_count: int) -> dict[str, Any] | None:
+    if page_count <= 4:
+        return None
+    normalized_pages = int(math.ceil(page_count / 4) * 4)
+    return {
+        "raw_pages": page_count,
+        "normalized_pages": normalized_pages,
+        "cover_pages": 4,
+        "insert_pages": max(normalized_pages - 4, 0),
+        "needs_rule_of_4_padding": normalized_pages != page_count,
+    }
+
+
+def _detect_product_type(
+    *,
+    pages: int,
+    width_mm: float,
+    height_mm: float,
+    booklet: dict[str, Any] | None,
+) -> str | None:
+    if _is_large_format(width_mm, height_mm):
+        return "poster_large_format"
+    if booklet:
+        return "booklet"
+    return None

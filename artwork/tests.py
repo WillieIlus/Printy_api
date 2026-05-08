@@ -85,12 +85,25 @@ class PdfAnalysisSuggestionTests(SimpleTestCase):
 
         self.assertEqual(result["suggested_product"]["type"], "booklet")
         self.assertEqual(result["suggested_product"]["confidence"], "medium")
-        self.assertIn("Pages may need to be rounded to a multiple of 4 for saddle stitch.", result["warnings"])
+        self.assertEqual(result["analysis_status"], "success")
+        self.assertEqual(result["detected_product_type"], "booklet")
+        self.assertEqual(
+            result["booklet"],
+            {
+                "raw_pages": 10,
+                "normalized_pages": 12,
+                "cover_pages": 4,
+                "insert_pages": 8,
+                "needs_rule_of_4_padding": True,
+            },
+        )
+        self.assertIn("Booklets print in multiples of 4 pages.", result["warnings"])
+        self.assertIn("We rounded 10 pages to 12 for production.", " ".join(result["warnings"]))
         self.assertIn(
             {
                 "field": "total_pages",
-                "value": 10,
-                "label": "10 pages",
+                "value": 12,
+                "label": "12 pages for production",
                 "confidence": "medium",
             },
             result["suggestions"],
@@ -101,7 +114,9 @@ class PdfAnalysisSuggestionTests(SimpleTestCase):
 
         self.assertEqual(result["suggested_product"]["type"], "booklet")
         self.assertEqual(result["suggested_product"]["confidence"], "high")
-        self.assertNotIn("Pages may need to be rounded to a multiple of 4 for saddle stitch.", result["warnings"])
+        self.assertEqual(result["booklet"]["normalized_pages"], 48)
+        self.assertFalse(result["booklet"]["needs_rule_of_4_padding"])
+        self.assertNotIn("Booklets print in multiples of 4 pages.", result["warnings"])
 
     def test_large_format_pdf_suggests_poster_without_calculator_product(self):
         result = self._analyze_pdf([(600, 900)])
@@ -116,7 +131,7 @@ class PdfAnalysisSuggestionTests(SimpleTestCase):
         with patch.dict(sys.modules, {"fitz": fake_fitz}):
             result = analyze_pdf(upload)
 
-        self.assertEqual(result["analysis_status"], "analysed")
+        self.assertEqual(result["analysis_status"], "success")
         self.assertEqual(result["pages"], 1)
         self.assertEqual(result["width_mm"], 210.0)
         self.assertEqual(result["height_mm"], 297.0)
@@ -129,9 +144,27 @@ class PdfAnalysisSuggestionTests(SimpleTestCase):
         with patch.dict(sys.modules, {"fitz": fake_fitz}):
             result = analyze_pdf("broken.pdf")
 
-        self.assertEqual(result["analysis_status"], "unreadable")
+        self.assertEqual(result["analysis_status"], "failed")
         self.assertEqual(result["analysis_error_code"], "corrupt_or_unreadable_pdf")
         self.assertEqual(result["analysis_error"], "PDF is unreadable or corrupt")
+
+    def test_mixed_page_sizes_trigger_manual_review(self):
+        result = self._analyze_pdf([(210, 297), (148, 210), (210, 297), (148, 210)])
+
+        self.assertEqual(result["analysis_status"], "manual_review")
+        self.assertTrue(result["has_mixed_page_sizes"])
+        self.assertEqual(
+            result["dominant_page_size"],
+            {
+                "width_mm": 210.0,
+                "height_mm": 297.0,
+                "label": "A4",
+            },
+        )
+        self.assertIn(
+            "Mixed page sizes detected. Please confirm the final trim size before pricing.",
+            result["warnings"],
+        )
 
     def _analyze_pdf(self, pages_mm: list[tuple[float, float]]) -> dict:
         fake_fitz = self._fake_fitz(pages_mm)
