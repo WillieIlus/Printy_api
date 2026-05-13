@@ -3,6 +3,7 @@ from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.settings import api_settings
 
 from .models import User, UserProfile, UserSocialLink
+from .services.capabilities import capability_keys, get_account_capabilities, normalize_capability_overrides
 from .services.roles import get_assignable_roles, set_account_role
 
 PROFILE_FIELDS = (
@@ -33,6 +34,7 @@ class UserSerializer(serializers.ModelSerializer):
     """User profile plus persisted dashboard fields."""
 
     is_email_verified = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
     bio = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     avatar = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     phone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -52,6 +54,9 @@ class UserSerializer(serializers.ModelSerializer):
             "first_name",
             "last_name",
             "role",
+            "partner_profile_enabled",
+            "capability_overrides",
+            "capabilities",
             "preferred_language",
             "is_email_verified",
             "is_active",
@@ -81,6 +86,9 @@ class UserSerializer(serializers.ModelSerializer):
             verified=True,
         ).exists()
 
+    def get_capabilities(self, instance):
+        return get_account_capabilities(instance)
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
         profile = get_or_create_profile(instance)
@@ -93,6 +101,17 @@ class UserSerializer(serializers.ModelSerializer):
         if value not in get_assignable_roles():
             raise serializers.ValidationError("Role must be one of: client, shop_owner, staff.")
         return value
+
+    def validate_capability_overrides(self, value):
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Capability overrides must be an object keyed by capability name.")
+        normalized = normalize_capability_overrides(value)
+        unknown_keys = sorted(set(value.keys()) - set(capability_keys()))
+        if unknown_keys:
+            raise serializers.ValidationError(f"Unsupported capability override keys: {', '.join(unknown_keys)}.")
+        return normalized
 
     def update(self, instance, validated_data):
         social_links_data = validated_data.pop("social_links", None)
@@ -147,13 +166,34 @@ class UserCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ["id", "email", "password", "name", "first_name", "last_name", "role"]
+        fields = [
+            "id",
+            "email",
+            "password",
+            "name",
+            "first_name",
+            "last_name",
+            "role",
+            "partner_profile_enabled",
+            "capability_overrides",
+        ]
         read_only_fields = ["id"]
 
     def validate_role(self, value):
         if value not in get_assignable_roles():
             raise serializers.ValidationError("Role must be one of: client, shop_owner, staff.")
         return value
+
+    def validate_capability_overrides(self, value):
+        if value in (None, ""):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Capability overrides must be an object keyed by capability name.")
+        normalized = normalize_capability_overrides(value)
+        unknown_keys = sorted(set(value.keys()) - set(capability_keys()))
+        if unknown_keys:
+            raise serializers.ValidationError(f"Unsupported capability override keys: {', '.join(unknown_keys)}.")
+        return normalized
 
     def create(self, validated_data):
         user = User.objects.create_user(**validated_data)

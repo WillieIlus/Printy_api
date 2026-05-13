@@ -15,6 +15,20 @@ from shops.models import Shop
 class Customer(TimeStampedModel):
     """Unified customer for production orders and quote requests. Replaces former Client."""
 
+    class RelationshipOwnerType(models.TextChoices):
+        UNKNOWN = "unknown", _("Unknown")
+        PRINTY = "printy", _("Printy")
+        USER = "user", _("User")
+        SHOP = "shop", _("Shop")
+
+    class AcquisitionSource(models.TextChoices):
+        UNKNOWN = "unknown", _("Unknown")
+        LEGACY_QUOTE = "legacy_quote", _("Legacy quote flow")
+        DIRECT = "direct", _("Direct")
+        PARTNER = "partner", _("Partner")
+        SHOP = "shop", _("Shop")
+        OPS = "ops", _("Ops")
+
     shop = models.ForeignKey(
         Shop,
         on_delete=models.CASCADE,
@@ -26,6 +40,38 @@ class Customer(TimeStampedModel):
     phone = models.CharField(max_length=50, blank=True, default="")
     address = models.TextField(blank=True, default="")
     notes = models.TextField(blank=True, default="")
+    relationship_owner_type = models.CharField(
+        max_length=20,
+        choices=RelationshipOwnerType.choices,
+        default=RelationshipOwnerType.UNKNOWN,
+        verbose_name=_("relationship owner type"),
+        help_text=_("Who currently owns the client relationship for attribution and payout routing."),
+    )
+    relationship_owner_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="owned_customer_relationships",
+        verbose_name=_("relationship owner user"),
+        help_text=_("User that owns the relationship when the owner type is user."),
+    )
+    relationship_owner_shop = models.ForeignKey(
+        Shop,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="owned_customer_relationships",
+        verbose_name=_("relationship owner shop"),
+        help_text=_("Shop that owns the relationship when the owner type is shop."),
+    )
+    acquisition_source = models.CharField(
+        max_length=20,
+        choices=AcquisitionSource.choices,
+        default=AcquisitionSource.UNKNOWN,
+        verbose_name=_("acquisition source"),
+        help_text=_("Migration-safe origin label for how this customer entered the system."),
+    )
 
     class Meta:
         ordering = ["name"]
@@ -35,6 +81,15 @@ class Customer(TimeStampedModel):
 
     def __str__(self):
         return self.name
+
+    def relationship_owner_reference(self) -> str:
+        if self.relationship_owner_type == self.RelationshipOwnerType.PRINTY:
+            return "printy"
+        if self.relationship_owner_type == self.RelationshipOwnerType.USER and self.relationship_owner_user_id:
+            return f"user:{self.relationship_owner_user_id}"
+        if self.relationship_owner_type == self.RelationshipOwnerType.SHOP and self.relationship_owner_shop_id:
+            return f"shop:{self.relationship_owner_shop_id}"
+        return ""
 
 
 class ProductionProduct(TimeStampedModel):

@@ -5,6 +5,20 @@ from catalog.models import Product
 from inventory.models import Machine, Paper
 from pricing.models import FinishingRate, Material
 from api.size_utils import normalize_size_payload, validate_size_selection
+from api.visibility import (
+    CLIENT_ACTOR,
+    OPS_ACTOR,
+    PARTNER_ACTOR,
+    SHOP_ACTOR,
+    project_client_counterparty_name,
+    project_client_identity,
+    resolve_actor,
+    project_identity,
+    project_quote_response_snapshot_for_client,
+    project_request_snapshot_for_client,
+    project_revised_pricing_snapshot_for_client,
+    resolve_topology_mode_for_quote_request,
+)
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
 from quotes.models import QuoteDraft, QuoteItem, QuoteRequest, QuoteRequestMessage, ShopQuote
 from quotes.request_brief import build_quote_request_whatsapp_handoff
@@ -69,6 +83,13 @@ class CalculatorConfigPreviewSerializer(serializers.Serializer):
     binding_type = serializers.CharField(required=False, allow_blank=True, allow_null=True, help_text="Booklet binding type, e.g. saddle_stitch.")
     cutting = serializers.BooleanField(required=False, allow_null=True, help_text="Whether booklet cutting is requested.")
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1, help_text="Optional turnaround target in working hours.")
+    urgency_type = serializers.ChoiceField(
+        choices=["standard", "same_day", "express", "after_hours", "emergency"],
+        required=False,
+        default="standard",
+    )
+    requested_deadline = serializers.DateTimeField(required=False, allow_null=True)
+    requested_delivery_time = serializers.DateTimeField(required=False, allow_null=True)
 
     def to_internal_value(self, data):
         normalized = normalize_size_payload(
@@ -101,6 +122,13 @@ class CalculatorPreviewSerializer(serializers.Serializer):
     width_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     height_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     finishings = FinishingSelectionSerializer(many=True, required=False)
+    urgency_type = serializers.ChoiceField(
+        choices=["standard", "same_day", "express", "after_hours", "emergency"],
+        required=False,
+        default="standard",
+    )
+    requested_deadline = serializers.DateTimeField(required=False, allow_null=True)
+    requested_delivery_time = serializers.DateTimeField(required=False, allow_null=True)
 
     def to_internal_value(self, data):
         normalized = normalize_size_payload(
@@ -166,6 +194,13 @@ class BookletCalculatorPreviewSerializer(serializers.Serializer):
         allow_null=True,
     )
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    urgency_type = serializers.ChoiceField(
+        choices=["standard", "same_day", "express", "after_hours", "emergency"],
+        required=False,
+        default="standard",
+    )
+    requested_deadline = serializers.DateTimeField(required=False, allow_null=True)
+    requested_delivery_time = serializers.DateTimeField(required=False, allow_null=True)
     size_mode = serializers.ChoiceField(choices=["standard", "custom"], required=False, default="custom")
     size_label = serializers.CharField(required=False, allow_blank=True, default="")
     input_unit = serializers.ChoiceField(choices=["mm", "cm", "m", "in"], required=False, default="mm")
@@ -226,6 +261,13 @@ class LargeFormatCalculatorPreviewSerializer(serializers.Serializer):
         allow_null=True,
     )
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    urgency_type = serializers.ChoiceField(
+        choices=["standard", "same_day", "express", "after_hours", "emergency"],
+        required=False,
+        default="standard",
+    )
+    requested_deadline = serializers.DateTimeField(required=False, allow_null=True)
+    requested_delivery_time = serializers.DateTimeField(required=False, allow_null=True)
     size_mode = serializers.ChoiceField(choices=["standard", "custom"], required=False, default="custom")
     size_label = serializers.CharField(required=False, allow_blank=True, default="")
     input_unit = serializers.ChoiceField(choices=["mm", "cm", "m", "in"], required=False, default="mm")
@@ -293,6 +335,13 @@ class DashboardCalculatorPayloadSerializer(serializers.Serializer):
     orientation = serializers.CharField(required=False, allow_blank=True)
     bleed_mm = serializers.IntegerField(required=False, default=3)
     finishings = DashboardFinishingSelectionSerializer(many=True, required=False)
+    urgency_type = serializers.ChoiceField(
+        choices=["standard", "same_day", "express", "after_hours", "emergency"],
+        required=False,
+        default="standard",
+    )
+    requested_deadline = serializers.DateTimeField(required=False, allow_null=True)
+    requested_delivery_time = serializers.DateTimeField(required=False, allow_null=True)
 
     def to_internal_value(self, data):
         normalized = normalize_size_payload(
@@ -323,9 +372,32 @@ class QuoteDraftUpdateSerializer(serializers.Serializer):
     request_details_snapshot = serializers.JSONField(required=False)
 
 
+class PartnerQuotePreviewSerializer(serializers.Serializer):
+    shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all())
+    pricing_snapshot = serializers.JSONField()
+    partner_markup = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.00"))
+
+
+class PartnerQuoteCreateSerializer(serializers.Serializer):
+    shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all())
+    title = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    client_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    client_email = serializers.EmailField(required=False, allow_blank=True)
+    client_phone = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    note = serializers.CharField(required=False, allow_blank=True, max_length=1000)
+    calculator_inputs_snapshot = serializers.JSONField()
+    pricing_snapshot = serializers.JSONField()
+    partner_markup = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.00"))
+
+    def validate(self, attrs):
+        if not (attrs.get("client_name") or attrs.get("client_email") or attrs.get("client_phone")):
+            raise serializers.ValidationError("Client name, email, or phone is required.")
+        return attrs
+
+
 class QuoteDraftReadSerializer(serializers.ModelSerializer):
     generated_request_ids = serializers.SerializerMethodField()
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_name = serializers.SerializerMethodField()
     shop_slug = serializers.CharField(source="shop.slug", read_only=True)
     shop_currency = serializers.CharField(source="shop.currency", read_only=True)
     raw_status = serializers.CharField(source="status", read_only=True)
@@ -354,6 +426,16 @@ class QuoteDraftReadSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_shop_name(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        if actor == CLIENT_ACTOR:
+            return project_client_counterparty_name(
+                fallback_name=obj.shop.name if obj.shop_id else None,
+                request_snapshot=obj.request_details_snapshot,
+            )
+        return project_identity(obj.shop.name if obj.shop_id else None, actor=actor)
 
     def get_generated_request_ids(self, obj):
         return list(obj.generated_requests.values_list("id", flat=True))
@@ -406,11 +488,15 @@ class QuoteRequestReadSerializer(serializers.ModelSerializer):
         ]
 
     def get_latest_response(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        
         latest = obj.get_latest_response()
         if not latest:
             return None
+            
         normalized_status = normalize_quote_response_status(latest.status)
-        return {
+        data = {
             "id": latest.id,
             "quote_reference": latest.quote_reference,
             "status": normalized_status,
@@ -422,11 +508,21 @@ class QuoteRequestReadSerializer(serializers.ModelSerializer):
             "estimated_ready_at": latest.estimated_ready_at,
             "human_ready_text": latest.human_ready_text,
             "turnaround_label": latest.turnaround_label,
-            "response_snapshot": latest.response_snapshot,
-            "revised_pricing_snapshot": latest.revised_pricing_snapshot,
             "created_at": latest.created_at,
             "sent_at": latest.sent_at,
         }
+        
+        if actor in (OPS_ACTOR, SHOP_ACTOR):
+            data["response_snapshot"] = latest.response_snapshot
+            data["revised_pricing_snapshot"] = latest.revised_pricing_snapshot
+        else:
+            data["response_snapshot"] = project_quote_response_snapshot_for_client(
+                latest.response_snapshot,
+                revised_pricing_snapshot=latest.revised_pricing_snapshot,
+            )
+            data["revised_pricing_snapshot"] = project_revised_pricing_snapshot_for_client(latest.revised_pricing_snapshot)
+            
+        return data
 
     def get_responses_count(self, obj):
         return obj.shop_quotes.count()
@@ -465,23 +561,41 @@ class DashboardQuoteRequestSummarySerializer(serializers.ModelSerializer):
         ]
 
     def get_latest_response(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        
         latest_response_id = getattr(obj, "latest_response_id", None)
         if not latest_response_id:
             return None
+            
         raw_status = getattr(obj, "latest_response_status", "")
         normalized_status = normalize_quote_response_status(raw_status)
-        return {
+        
+        raw_snapshot = getattr(obj, "latest_response_snapshot", None)
+        raw_revised = getattr(obj, "latest_revised_pricing_snapshot", None)
+        
+        data = {
             "id": latest_response_id,
             "quote_reference": getattr(obj, "latest_response_reference", ""),
             "status": normalized_status,
             "raw_status": raw_status,
             "status_label": quote_response_status_label(normalized_status),
             "total": getattr(obj, "latest_response_total", None),
-            "response_snapshot": getattr(obj, "latest_response_snapshot", None),
-            "revised_pricing_snapshot": getattr(obj, "latest_revised_pricing_snapshot", None),
             "created_at": getattr(obj, "latest_response_created_at", None),
             "sent_at": getattr(obj, "latest_response_sent_at", None),
         }
+        
+        if actor in (OPS_ACTOR, SHOP_ACTOR):
+            data["response_snapshot"] = raw_snapshot
+            data["revised_pricing_snapshot"] = raw_revised
+        else:
+            data["response_snapshot"] = project_quote_response_snapshot_for_client(
+                raw_snapshot,
+                revised_pricing_snapshot=raw_revised,
+            )
+            data["revised_pricing_snapshot"] = project_revised_pricing_snapshot_for_client(raw_revised)
+            
+        return data
 
     def get_status(self, obj):
         return normalize_quote_request_status(obj.status)
@@ -538,8 +652,8 @@ class QuoteResponseUpdateSerializer(serializers.Serializer):
 
 class QuoteResponseReadSerializer(serializers.ModelSerializer):
     request_reference = serializers.CharField(source="quote_request.request_reference", read_only=True)
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
-    shop_slug = serializers.CharField(source="shop.slug", read_only=True)
+    shop_name = serializers.SerializerMethodField()
+    shop_slug = serializers.SerializerMethodField()
     raw_status = serializers.CharField(source="status", read_only=True)
     created_by_name = serializers.CharField(source="created_by.get_full_name", read_only=True)
     status = serializers.SerializerMethodField()
@@ -549,6 +663,8 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
     whatsapp_url = serializers.SerializerMethodField()
     whatsapp_label = serializers.SerializerMethodField()
     conversation = serializers.SerializerMethodField()
+    response_snapshot = serializers.SerializerMethodField()
+    revised_pricing_snapshot = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopQuote
@@ -591,6 +707,37 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
     def get_status(self, obj):
         return normalize_quote_response_status(obj.status)
 
+    def get_shop_name(self, obj):
+        actor = self._visibility_actor(obj)
+        topology_mode = resolve_topology_mode_for_quote_request(obj.quote_request)
+        if actor == CLIENT_ACTOR:
+            return project_client_counterparty_name(
+                fallback_name=obj.shop.name if obj.shop_id else None,
+                topology_mode=topology_mode,
+                request_snapshot=getattr(obj.quote_request, "request_snapshot", None),
+                response_snapshot=obj.response_snapshot,
+            )
+        return project_identity(obj.shop.name if obj.shop_id else None, actor=actor, topology_mode=topology_mode)
+
+    def get_shop_slug(self, obj):
+        actor = self._visibility_actor(obj)
+        topology_mode = resolve_topology_mode_for_quote_request(obj.quote_request)
+        if actor in {SHOP_ACTOR, OPS_ACTOR, PARTNER_ACTOR} or topology_mode == "marketplace_legacy":
+            return obj.shop.slug if obj.shop_id else ""
+        return "partner"
+
+    def _visibility_actor(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user and getattr(user, "is_authenticated", False):
+            if getattr(user, "is_staff", False):
+                return OPS_ACTOR
+            if getattr(user, "id", None) == obj.shop.owner_id:
+                return SHOP_ACTOR
+            if getattr(user, "role", None) == "broker":
+                return PARTNER_ACTOR
+        return CLIENT_ACTOR
+
     def get_share_token(self, obj):
         link = obj.share_links.first()
         return link.token if link else None
@@ -598,10 +745,26 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
     def get_status_label(self, obj):
         return quote_response_status_label(self.get_status(obj))
 
+    def get_response_snapshot(self, obj):
+        actor = self._visibility_actor(obj)
+        if actor in {SHOP_ACTOR, OPS_ACTOR, PARTNER_ACTOR}:
+            return obj.response_snapshot
+        return project_quote_response_snapshot_for_client(
+            obj.response_snapshot,
+            revised_pricing_snapshot=obj.revised_pricing_snapshot,
+        )
+
+    def get_revised_pricing_snapshot(self, obj):
+        actor = self._visibility_actor(obj)
+        if actor in {SHOP_ACTOR, OPS_ACTOR, PARTNER_ACTOR}:
+            return obj.revised_pricing_snapshot
+        return project_revised_pricing_snapshot_for_client(obj.revised_pricing_snapshot)
+
     def _whatsapp_handoff(self, obj):
         request = self.context.get("request")
         viewer_role = "buyer"
-        if request and getattr(request.user, "id", None) == obj.shop.owner_id:
+        request_user = getattr(request, "user", None) if request else None
+        if request_user and getattr(request_user, "id", None) == obj.shop.owner_id:
             viewer_role = "shop"
         return build_quote_request_whatsapp_handoff(obj.quote_request, viewer_role=viewer_role)
 
@@ -719,7 +882,7 @@ class ShopResponseReplySerializer(serializers.Serializer):
 
 class ClientResponseListItemSerializer(serializers.ModelSerializer):
     request_id = serializers.IntegerField(source="quote_request_id", read_only=True)
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_name = serializers.SerializerMethodField()
     currency = serializers.CharField(source="shop.currency", read_only=True)
     price = serializers.DecimalField(source="total", max_digits=12, decimal_places=2, read_only=True)
     status = serializers.SerializerMethodField()
@@ -749,6 +912,15 @@ class ClientResponseListItemSerializer(serializers.ModelSerializer):
             return ""
         return latest.body
 
+    def get_shop_name(self, obj):
+        topology_mode = resolve_topology_mode_for_quote_request(obj.quote_request)
+        return project_client_counterparty_name(
+            fallback_name=obj.shop.name if obj.shop_id else None,
+            topology_mode=topology_mode,
+            request_snapshot=getattr(obj.quote_request, "request_snapshot", None),
+            response_snapshot=obj.response_snapshot,
+        )
+
     def get_status(self, obj):
         return normalize_quote_response_status(obj.status)
 
@@ -770,6 +942,8 @@ class ClientQuoteItemDetailSerializer(serializers.ModelSerializer):
     finishings = serializers.SerializerMethodField()
     sheets_needed = serializers.SerializerMethodField()
     imposition_count = serializers.SerializerMethodField()
+    finishing_summary = serializers.SerializerMethodField()
+    production_description = serializers.SerializerMethodField()
 
     class Meta:
         model = QuoteItem
@@ -788,7 +962,8 @@ class ClientQuoteItemDetailSerializer(serializers.ModelSerializer):
             "finishings",
             "sheets_needed",
             "imposition_count",
-            "pricing_snapshot",
+            "finishing_summary",
+            "production_description",
         ]
 
     def get_product_name(self, obj):
@@ -812,6 +987,13 @@ class ClientQuoteItemDetailSerializer(serializers.ModelSerializer):
     def get_imposition_count(self, obj):
         return (obj.pricing_snapshot or {}).get("imposition_count")
 
+    def get_finishing_summary(self, obj):
+        names = [f.finishing_rate.get_code_display() for f in obj.finishings.all() if f.finishing_rate]
+        return ", ".join(names) if names else "None"
+
+    def get_production_description(self, obj):
+        return (obj.pricing_snapshot or {}).get("production_summary") or obj.spec_text
+
 
 class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
     """
@@ -819,8 +1001,8 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
     Aggregates responses from all sibling requests (broadcast group).
     """
 
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
-    shop_slug = serializers.CharField(source="shop.slug", read_only=True)
+    shop_name = serializers.SerializerMethodField()
+    shop_slug = serializers.SerializerMethodField()
     shop_currency = serializers.CharField(source="shop.currency", read_only=True)
     items = ClientQuoteItemDetailSerializer(many=True, read_only=True)
     attachments = QuoteRequestAttachmentSerializer(many=True, read_only=True)
@@ -861,6 +1043,20 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
     def get_status(self, obj):
         return normalize_quote_request_status(obj.status)
 
+    def get_shop_name(self, obj):
+        topology_mode = resolve_topology_mode_for_quote_request(obj)
+        return project_client_counterparty_name(
+            fallback_name=obj.shop.name if obj.shop_id else None,
+            topology_mode=topology_mode,
+            request_snapshot=obj.request_snapshot,
+        )
+
+    def get_shop_slug(self, obj):
+        topology_mode = resolve_topology_mode_for_quote_request(obj)
+        if topology_mode == "marketplace_legacy":
+            return obj.shop.slug if obj.shop_id else ""
+        return "partner"
+
     def get_status_label(self, obj):
         return quote_request_status_label(self.get_status(obj))
 
@@ -882,6 +1078,11 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
                 # We want the full QuoteResponseReadSerializer to give all the details requested
                 responses.append(QuoteResponseReadSerializer(latest, context=self.context).data)
         return responses
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["request_snapshot"] = project_request_snapshot_for_client(instance.request_snapshot)
+        return data
 
 
 class RateWizardValueSerializer(serializers.Serializer):

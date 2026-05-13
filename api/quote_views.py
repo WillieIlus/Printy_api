@@ -18,6 +18,12 @@ from rest_framework.response import Response
 
 from notifications.models import Notification
 from notifications.services import notify_quote_event
+from jobs.managed_services import (
+    attach_production_order_to_assignment,
+    attach_production_order_to_managed_job,
+    create_assignment_for_managed_job,
+    create_managed_job_from_accepted_quote,
+)
 from quotes.choices import QuoteStatus, ShopQuoteStatus
 from quotes.messaging import create_quote_message, mark_message_read, mark_messages_read
 from quotes.models import QuoteRequest, QuoteRequestAttachment, QuoteRequestMessage, ShopQuote, ShopQuoteAttachment
@@ -25,6 +31,7 @@ from quotes.draft_pdf import render_quote_draft_pdf
 from quotes.request_brief import build_quote_request_brief, build_quote_request_whatsapp_handoff
 from shops.models import Shop
 
+from .visibility import CLIENT_ACTOR, project_identity
 from .quote_serializers import (
     QuoteInboxMessageSerializer,
     QuoteRequestAttachmentSerializer,
@@ -214,9 +221,11 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             message_kind=QuoteRequestMessage.MessageKind.STATUS,
             message_type=QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED,
             direction=QuoteRequestMessage.Direction.OUTBOUND,
-            subject=f"Quote request sent to {qr.shop.name}",
+            subject=f"Quote request sent to {project_identity(qr.shop.name, actor=CLIENT_ACTOR)}",
             body="Your quote request was sent successfully.",
             metadata={"status": QuoteStatus.SUBMITTED},
+            send_email_copy=bool(getattr(request.user, "email", "")),
+            create_failure_notice=True,
         )
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
             notify_quote_event(
@@ -230,7 +239,7 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
         notify_quote_event(
             recipient=request.user,
             notification_type=Notification.QUOTE_REQUEST_SENT,
-            message=f"Your quote request #{qr.id} was sent to {qr.shop.name}.",
+            message=f"Your quote request #{qr.id} was sent to {project_identity(qr.shop.name, actor=CLIENT_ACTOR)}.",
             object_type="quote_request",
             object_id=qr.id,
             actor=request.user,
@@ -294,10 +303,19 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             message_kind=QuoteRequestMessage.MessageKind.STATUS,
             message_type=QuoteRequestMessage.MessageType.QUOTE_ACCEPTED,
             direction=QuoteRequestMessage.Direction.OUTBOUND,
-            subject=f"Accepted quote from {qr.shop.name}",
+            subject=f"Accepted quote from {project_identity(qr.shop.name, actor=CLIENT_ACTOR)}",
             body="You accepted this quote in Printy.",
             shop_quote=shop_quote,
             metadata={"quote_status": ShopQuoteStatus.ACCEPTED},
+        )
+        managed_job = create_managed_job_from_accepted_quote(
+            quote_request=qr,
+            shop_quote=shop_quote,
+            accepted_by=request.user,
+        )
+        create_assignment_for_managed_job(
+            managed_job=managed_job,
+            shop_quote=shop_quote,
         )
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
             notify_quote_event(
@@ -500,7 +518,7 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
             notify_quote_event(
                 recipient=qr.created_by,
                 notification_type=Notification.SHOP_QUESTION_ASKED,
-                message=f"{qr.shop.name} asked a question about request #{qr.id}.",
+                message=f"{project_identity(qr.shop.name, actor=CLIENT_ACTOR)} asked a question about request #{qr.id}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -530,7 +548,7 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
             notify_quote_event(
                 recipient=qr.created_by,
                 notification_type=Notification.REQUEST_DECLINED,
-                message=f"{qr.shop.name} declined request #{qr.id}.",
+                message=f"{project_identity(qr.shop.name, actor=CLIENT_ACTOR)} declined request #{qr.id}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -639,7 +657,7 @@ class IncomingRequestViewSet(viewsets.ReadOnlyModelViewSet):
             notify_quote_event(
                 recipient=qr.created_by,
                 notification_type=Notification.SHOP_QUOTE_SENT,
-                message=f"{qr.shop.name} sent a quote for request #{qr.id}.",
+                message=f"{project_identity(qr.shop.name, actor=CLIENT_ACTOR)} sent a quote for request #{qr.id}.",
                 object_type="quote_request",
                 object_id=qr.id,
                 actor=request.user,
@@ -681,7 +699,7 @@ class ShopQuoteViewSet(viewsets.ModelViewSet):
     """
 
     permission_classes = [IsAuthenticated, IsShopQuoteOwner]
-    http_method_names = ["get", "head", "options", "patch"]
+    http_method_names = ["get", "head", "options", "patch", "post"]
 
     def get_queryset(self):
         user = self.request.user
@@ -763,7 +781,7 @@ class ShopQuoteViewSet(viewsets.ModelViewSet):
             notify_quote_event(
                 recipient=qr.created_by,
                 notification_type=Notification.SHOP_QUOTE_REVISED,
-                message=f"{quote.shop.name} revised the quote for request #{qr.id}.",
+                message=f"{project_identity(quote.shop.name, actor=CLIENT_ACTOR)} revised the quote for request #{qr.id}.",
                 object_type="shop_quote",
                 object_id=quote.id,
                 actor=request.user,
@@ -796,6 +814,23 @@ class ShopQuoteViewSet(viewsets.ModelViewSet):
         )
         serializer.is_valid(raise_exception=True)
         job = serializer.save()
+        managed_job = create_managed_job_from_accepted_quote(
+            quote_request=quote.quote_request,
+            shop_quote=quote,
+            accepted_by=request.user,
+        )
+        assignment = create_assignment_for_managed_job(
+            managed_job=managed_job,
+            shop_quote=quote,
+        )
+        attach_production_order_to_managed_job(
+            managed_job=managed_job,
+            production_order=job,
+        )
+        attach_production_order_to_assignment(
+            assignment=assignment,
+            production_order=job,
+        )
         return Response(
             ProductionOrderSerializer(job).data,
             status=status.HTTP_201_CREATED,

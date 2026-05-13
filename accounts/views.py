@@ -10,6 +10,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .models import User
+from .services.capabilities import get_account_capabilities
 from .serializers import CustomTokenObtainPairSerializer, UserCreateSerializer, UserSerializer
 
 
@@ -179,6 +180,7 @@ class GoogleSocialLoginView(APIView):
         role = (request.data.get("role") or "client").strip()
         if role not in ("client", "shop_owner"):
             role = "client"
+        partner_profile_enabled = bool(request.data.get("partner_profile_enabled", False))
 
         user, created = User.objects.get_or_create(
             email=email,
@@ -187,6 +189,7 @@ class GoogleSocialLoginView(APIView):
                 "first_name": given_name,
                 "last_name": family_name,
                 "role": role,
+                "partner_profile_enabled": partner_profile_enabled,
                 "is_active": True,
             },
         )
@@ -223,6 +226,8 @@ class GoogleSocialLoginView(APIView):
                     "email": user.email,
                     "name": user.name or name,
                     "role": user.role,
+                    "partner_profile_enabled": user.partner_profile_enabled,
+                    "capabilities": get_account_capabilities(user),
                     "is_email_verified": True,
                 },
             }

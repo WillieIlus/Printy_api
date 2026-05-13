@@ -1,7 +1,10 @@
 """JobShare API views."""
 from django.conf import settings
+from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext as _
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -9,16 +12,48 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from api.visibility import CLIENT_ACTOR, OPS_ACTOR, PARTNER_ACTOR, SHOP_ACTOR, resolve_actor
 from api.filters import JobRequestFilterSet
+from jobs.assignment_services import (
+    accept_assignment,
+    mark_assignment_completed,
+    mark_assignment_in_production,
+    mark_assignment_ready,
+    reject_assignment,
+    report_assignment_issue,
+)
+from jobs.file_services import (
+    approve_job_proof,
+    get_visible_job_files_for_actor,
+    mark_file_print_ready,
+    reject_job_proof,
+    request_revision,
+    upload_proof_for_managed_job,
+)
 from jobs.formatter import format_job_for_whatsapp_share
-from jobs.models import JobClaim, JobNotification, JobRequest
+from jobs.models import JobAssignment, JobClaim, JobFile, JobNotification, JobPayment, JobRequest, ManagedJob
+from jobs.payment_services import (
+    handle_job_mpesa_callback,
+    initialize_settlement_for_managed_job,
+    initiate_job_stk_push,
+    reconcile_job_payment_status,
+)
 from jobs.serializers import (
+    JobActionSerializer,
+    JobAssignmentSerializer,
+    JobPaymentQuerySerializer,
     JobClaimCreateSerializer,
     JobClaimSerializer,
+    JobFileSerializer,
+    ManagedJobStkInitiateSerializer,
+    ManagedJobEventSerializer,
+    ManagedJobSerializer,
+    JobPaymentSerializer,
     JobRequestCreateSerializer,
     JobRequestDetailSerializer,
     JobRequestListSerializer,
     JobRequestPublicSerializer,
+    JobSettlementSplitSerializer,
 )
 
 
@@ -189,3 +224,351 @@ class PublicJobView(APIView):
         data["claim_cta"] = _("Claim job")
         data["requires_login"] = True
         return Response(data)
+
+
+def _can_access_managed_job(*, user, managed_job: ManagedJob, actor: str) -> bool:
+    if actor == OPS_ACTOR:
+        return True
+    if actor == SHOP_ACTOR:
+        if managed_job.assigned_shop_id and getattr(managed_job.assigned_shop, "owner_id", None) == user.id:
+            return True
+        return managed_job.assignments.filter(
+            reassigned_from__isnull=True,
+            assigned_shop__owner=user,
+        ).exists()
+    if actor == PARTNER_ACTOR:
+        return managed_job.broker_id == user.id
+    return managed_job.client_id == user.id or managed_job.created_by_id == user.id
+
+
+def _can_manage_assignment(*, user, assignment: JobAssignment, actor: str) -> bool:
+    if actor == OPS_ACTOR:
+        return True
+    if actor == SHOP_ACTOR:
+        if assignment.assigned_shop_id and getattr(assignment.assigned_shop, "owner_id", None) == user.id:
+            return True
+        return False
+    return False
+
+
+class ManagedJobFileListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        files = get_visible_job_files_for_actor(managed_job=managed_job, actor=actor)
+        return Response(JobFileSerializer(files, many=True, context={"request": request}).data)
+
+
+class ManagedJobListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        actor = resolve_actor(request.user)
+        queryset = ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by").prefetch_related("job_files", "payments")
+        if actor == OPS_ACTOR:
+            items = queryset.order_by("-operational_priority_level", "-created_at")
+        elif actor == SHOP_ACTOR:
+            items = queryset.filter(assigned_shop__owner=request.user).order_by("-operational_priority_level", "-created_at")
+        elif actor == PARTNER_ACTOR:
+            items = queryset.filter(broker=request.user).order_by("-operational_priority_level", "-created_at")
+        else:
+            items = queryset.filter(client=request.user).order_by("-operational_priority_level", "-created_at")
+        return Response(ManagedJobSerializer(items, many=True, context={"request": request}).data)
+
+
+class ManagedJobPaymentListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        payments = JobPayment.objects.filter(managed_job=managed_job).order_by("-created_at")
+        return Response(JobPaymentSerializer(payments, many=True, context={"request": request}).data)
+
+
+class ManagedJobStkPushView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if actor not in {CLIENT_ACTOR, OPS_ACTOR}:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        if actor != OPS_ACTOR and not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = ManagedJobStkInitiateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payment = initiate_job_stk_push(
+                managed_job=managed_job,
+                payer=request.user,
+                phone_number=serializer.validated_data["phone_number"],
+                amount=serializer.validated_data.get("amount"),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            return Response(
+                {"detail": _("Failed to initiate payment. Please try again.")},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        return Response(JobPaymentSerializer(payment, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class ManagedJobPaymentQueryView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        managed_job = get_object_or_404(ManagedJob, pk=pk)
+        actor = resolve_actor(request.user)
+        if actor != OPS_ACTOR:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = JobPaymentQuerySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payment = get_object_or_404(
+            JobPayment.objects.filter(managed_job=managed_job),
+            checkout_request_id=serializer.validated_data["checkout_request_id"],
+        )
+        try:
+            reconcile_job_payment_status(job_payment=payment)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception:
+            return Response({"detail": _("Failed to query payment status.")}, status=status.HTTP_502_BAD_GATEWAY)
+        payment.refresh_from_db()
+        return Response(JobPaymentSerializer(payment, context={"request": request}).data)
+
+
+class ManagedJobSettlementDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        settlement = getattr(managed_job, "settlement_split", None)
+        if settlement is None:
+            settlement = initialize_settlement_for_managed_job(managed_job=managed_job)
+        return Response(JobSettlementSplitSerializer(settlement, context={"request": request}).data)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class ManagedJobMpesaCallbackView(APIView):
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        result = handle_job_mpesa_callback(payload=request.data if isinstance(request.data, dict) else {})
+        return Response({"ResultCode": 0, "ResultDesc": "Accepted", **result})
+
+
+class ManagedJobEventListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        events = managed_job.events.select_related("actor").order_by("-created_at", "-id")[:50]
+        return Response(ManagedJobEventSerializer(events, many=True).data)
+
+
+class ManagedJobProofUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        if actor not in {OPS_ACTOR, SHOP_ACTOR, PARTNER_ACTOR}:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": _("A proof file is required.")}, status=status.HTTP_400_BAD_REQUEST)
+        job_file = upload_proof_for_managed_job(
+            managed_job=managed_job,
+            assignment=managed_job.assignments.filter(reassigned_from__isnull=True).first(),
+            uploaded_by=request.user,
+            file=upload,
+            original_filename=getattr(upload, "name", ""),
+            notes=request.data.get("note", "") or "Proof uploaded for approval.",
+        )
+        return Response(JobFileSerializer(job_file, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
+class JobFileActionView(APIView):
+    permission_classes = [IsAuthenticated]
+    action_name = ""
+
+    def post(self, request, pk):
+        job_file = get_object_or_404(
+            JobFile.objects.select_related("managed_job__assigned_shop", "managed_job__client", "managed_job__broker", "managed_job__created_by", "assignment"),
+            pk=pk,
+        )
+        managed_job = job_file.managed_job
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = JobActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        note = serializer.validated_data.get("note", "")
+
+        if self.action_name in {"approve", "reject", "revision"} and actor not in {OPS_ACTOR, CLIENT_ACTOR, PARTNER_ACTOR}:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        if self.action_name == "print_ready" and actor not in {OPS_ACTOR, SHOP_ACTOR}:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+
+        if self.action_name == "approve":
+            job_file = approve_job_proof(job_file=job_file, actor=request.user, notes=note)
+        elif self.action_name == "reject":
+            job_file = reject_job_proof(job_file=job_file, actor=request.user, notes=note)
+        elif self.action_name == "revision":
+            job_file = request_revision(job_file=job_file, actor=request.user, notes=note)
+        else:
+            job_file = mark_file_print_ready(job_file=job_file, actor=request.user, notes=note)
+        return Response(JobFileSerializer(job_file, context={"request": request}).data)
+
+
+class JobFileApproveView(JobFileActionView):
+    action_name = "approve"
+
+
+class JobFileRejectView(JobFileActionView):
+    action_name = "reject"
+
+
+class JobFileRevisionView(JobFileActionView):
+    action_name = "revision"
+
+
+class JobFilePrintReadyView(JobFileActionView):
+    action_name = "print_ready"
+
+
+class ShopAssignmentListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        actor = resolve_actor(request.user)
+        if actor not in {OPS_ACTOR, SHOP_ACTOR}:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        queryset = JobAssignment.objects.select_related("managed_job", "assigned_shop", "production_order").filter(reassigned_from__isnull=True)
+        if actor == SHOP_ACTOR:
+            queryset = queryset.filter(assigned_shop__owner=request.user)
+        return Response(JobAssignmentSerializer(queryset.order_by("-operational_priority_level", "-created_at"), many=True, context={"request": request}).data)
+
+
+class JobAssignmentActionView(APIView):
+    permission_classes = [IsAuthenticated]
+    action_name = ""
+
+    def post(self, request, pk):
+        assignment = get_object_or_404(
+            JobAssignment.objects.select_related("managed_job", "assigned_shop", "production_order"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if not _can_manage_assignment(user=request.user, assignment=assignment, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        serializer = JobActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        note = serializer.validated_data.get("note", "")
+        if self.action_name == "accept":
+            assignment = accept_assignment(assignment=assignment, actor=request.user, note=note)
+        elif self.action_name == "reject":
+            assignment = reject_assignment(assignment=assignment, actor=request.user, note=note)
+        elif self.action_name == "in_production":
+            assignment = mark_assignment_in_production(assignment=assignment, actor=request.user, note=note)
+        elif self.action_name == "ready":
+            assignment = mark_assignment_ready(assignment=assignment, actor=request.user, note=note)
+        elif self.action_name == "completed":
+            assignment = mark_assignment_completed(assignment=assignment, actor=request.user, note=note)
+        else:
+            assignment = report_assignment_issue(assignment=assignment, actor=request.user, note=note)
+        return Response(JobAssignmentSerializer(assignment, context={"request": request}).data)
+
+
+class JobAssignmentAcceptView(JobAssignmentActionView):
+    action_name = "accept"
+
+
+class JobAssignmentRejectView(JobAssignmentActionView):
+    action_name = "reject"
+
+
+class JobAssignmentInProductionView(JobAssignmentActionView):
+    action_name = "in_production"
+
+
+class JobAssignmentReadyView(JobAssignmentActionView):
+    action_name = "ready"
+
+
+class JobAssignmentCompletedView(JobAssignmentActionView):
+    action_name = "completed"
+
+
+class JobAssignmentIssueView(JobAssignmentActionView):
+    action_name = "issue"
+
+
+class JobFileDownloadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        job_file = get_object_or_404(
+            JobFile.objects.select_related(
+                "managed_job__assigned_shop",
+                "managed_job__client",
+                "managed_job__broker",
+                "managed_job__created_by",
+            ),
+            pk=pk,
+        )
+        managed_job = job_file.managed_job
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        visible_ids = set(
+            get_visible_job_files_for_actor(managed_job=managed_job, actor=actor).values_list("id", flat=True)
+        )
+        if job_file.id not in visible_ids:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        if not job_file.file:
+            return Response({"detail": _("File is not available for download.")}, status=status.HTTP_404_NOT_FOUND)
+        return FileResponse(
+            job_file.file.open("rb"),
+            as_attachment=True,
+            filename=job_file.original_filename or job_file.file.name.rsplit("/", 1)[-1],
+        )

@@ -8,6 +8,7 @@ from rest_framework.test import APIClient
 from allauth.account.models import EmailAddress
 
 from .models import User, UserProfile
+from .services.capabilities import get_account_capabilities
 from shops.models import Shop, ShopMembership
 
 
@@ -122,6 +123,36 @@ class AccountProfileAPITestCase(TestCase):
 
         self.user.refresh_from_db()
         self.assertEqual(self.user.role, User.Role.STAFF)
+
+    def test_users_me_exposes_capability_foundations(self):
+        Shop.objects.create(name="Capability Shop", slug="capability-shop", owner=self.user)
+        self.user.partner_profile_enabled = True
+        self.user.capability_overrides = {"can_receive_payouts": False}
+        self.user.save(update_fields=["partner_profile_enabled", "capability_overrides", "updated_at"])
+
+        response = self.client.get("/api/users/me/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["role"], User.Role.SHOP_OWNER)
+        self.assertEqual(payload["partner_profile_enabled"], True)
+        self.assertEqual(payload["capability_overrides"], {"can_receive_payouts": False})
+        self.assertEqual(payload["capabilities"]["can_source_jobs"], True)
+        self.assertEqual(payload["capabilities"]["can_manage_clients"], True)
+        self.assertEqual(payload["capabilities"]["can_receive_payouts"], False)
+
+    def test_capability_resolution_allows_hybrid_partner_shop_accounts(self):
+        Shop.objects.create(name="Hybrid Shop", slug="hybrid-shop", owner=self.user)
+        self.user.partner_profile_enabled = True
+        self.user.save(update_fields=["partner_profile_enabled", "updated_at"])
+
+        capabilities = get_account_capabilities(self.user)
+
+        self.assertTrue(capabilities["can_manage_clients"])
+        self.assertTrue(capabilities["can_source_jobs"])
+        self.assertTrue(capabilities["can_receive_assignments"])
+        self.assertTrue(capabilities["can_manage_production"])
+        self.assertTrue(capabilities["can_receive_payouts"])
 
 
 @override_settings(

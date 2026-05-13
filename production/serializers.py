@@ -22,7 +22,18 @@ from .models import (
 class CustomerSerializer(serializers.ModelSerializer):
     class Meta:
         model = Customer
-        fields = ["id", "name", "email", "phone", "address", "notes"]
+        fields = [
+            "id",
+            "name",
+            "email",
+            "phone",
+            "address",
+            "notes",
+            "relationship_owner_type",
+            "relationship_owner_user",
+            "relationship_owner_shop",
+            "acquisition_source",
+        ]
 
 
 class ProductionProductSerializer(serializers.ModelSerializer):
@@ -283,6 +294,11 @@ class ProductionOrderWriteSerializer(serializers.ModelSerializer):
         customer, _ = Customer.objects.get_or_create(
             shop=shop,
             name=name[:255],
-            defaults={"email": email, "phone": quote_request.customer_phone or ""},
+            defaults={
+                "email": email,
+                "phone": quote_request.customer_phone or "",
+                "relationship_owner_type": Customer.RelationshipOwnerType.UNKNOWN,
+                "acquisition_source": Customer.AcquisitionSource.LEGACY_QUOTE,
+            },
         )
         return customer

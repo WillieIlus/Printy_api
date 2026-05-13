@@ -9,12 +9,16 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.services.capabilities import has_capability
 from accounts.services.roles import is_client
+from .visibility import CLIENT_ACTOR, TOPOLOGY_MANAGED, project_identity
 from notifications.models import Notification
 from notifications.services import notify_quote_event
+from jobs.managed_services import create_assignment_for_managed_job, create_managed_job_from_accepted_quote
 from quotes.choices import QuoteStatus, ShopQuoteStatus
 from quotes.messaging import create_quote_message
 from quotes.models import QuoteDraft, QuoteRequest, QuoteRequestMessage, ShopQuote
+from quotes.partner_services import build_partner_quote_preview, create_partner_quote
 from quotes.services_workflow import (
     create_quote_response,
     save_quote_draft,
@@ -27,6 +31,7 @@ from services.pricing.booklet_builder import build_booklet_preview
 from services.pricing.large_format_builder import build_large_format_preview
 from services.pricing.calculator_config import get_calculator_config
 from services.pricing.calculator_preview import build_public_calculator_preview
+from services.pricing.urgency import apply_priority_pricing
 from services.pricing.for_shops_wizard import (
     build_public_rate_wizard_config,
     build_public_rate_wizard_preview,
@@ -63,6 +68,8 @@ from .workflow_serializers import (
     MvpRateCardPublicSaveSerializer,
     MvpRateCardPreviewSerializer,
     MvpRateCardSetupSerializer,
+    PartnerQuoteCreateSerializer,
+    PartnerQuotePreviewSerializer,
     QuoteDraftCreateSerializer,
     QuoteDraftReadSerializer,
     QuoteDraftSendSerializer,
@@ -251,6 +258,12 @@ class DashboardCalculatorPreviewView(APIView):
             )
             
             data = result.to_dict()
+            data = apply_priority_pricing(
+                data,
+                urgency_type=validated.get("urgency_type"),
+                requested_deadline=validated.get("requested_deadline"),
+                requested_delivery_time=validated.get("requested_delivery_time"),
+            )
             contract = data.get("calculation_result", {})
             
             response_data = {
@@ -315,6 +328,12 @@ class CalculatorPreviewView(APIView):
             finishing_selections=validated.get("finishings") or [],
             width_mm=validated.get("width_mm"),
             height_mm=validated.get("height_mm"),
+        )
+        pricing = apply_priority_pricing(
+            pricing,
+            urgency_type=validated.get("urgency_type"),
+            requested_deadline=validated.get("requested_deadline"),
+            requested_delivery_time=validated.get("requested_delivery_time"),
         )
         return Response(pricing)
 
@@ -567,6 +586,13 @@ class BookletCalculatorPreviewView(APIView):
             binding_finishing_rate=validated.get("binding_finishing_rate"),
             turnaround_hours=validated.get("turnaround_hours"),
         )
+        pricing = apply_priority_pricing(
+            pricing,
+            urgency_type=validated.get("urgency_type"),
+            turnaround_hours=validated.get("turnaround_hours"),
+            requested_deadline=validated.get("requested_deadline"),
+            requested_delivery_time=validated.get("requested_delivery_time"),
+        )
         return Response(pricing)
 
 
@@ -587,6 +613,13 @@ class LargeFormatCalculatorPreviewView(APIView):
             finishing_selections=validated.get("finishings") or [],
             hardware_finishing_rate=validated.get("hardware_finishing_rate"),
             turnaround_hours=validated.get("turnaround_hours"),
+        )
+        pricing = apply_priority_pricing(
+            pricing,
+            urgency_type=validated.get("urgency_type"),
+            turnaround_hours=validated.get("turnaround_hours"),
+            requested_deadline=validated.get("requested_deadline"),
+            requested_delivery_time=validated.get("requested_delivery_time"),
         )
         return Response(pricing)
 
@@ -660,6 +693,88 @@ class QuoteDraftSendView(APIView):
         return Response(QuoteRequestReadSerializer(quote_requests, many=True).data, status=status.HTTP_201_CREATED)
 
 
+class PartnerQuotePreviewView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not has_capability(request.user, "can_source_jobs"):
+            return Response({"detail": "You cannot create partner quotes."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = PartnerQuotePreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payload = build_partner_quote_preview(
+                pricing_snapshot=serializer.validated_data["pricing_snapshot"],
+                shop=serializer.validated_data["shop"],
+                partner_markup=serializer.validated_data["partner_markup"],
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
+
+class PartnerQuoteCreateView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not has_capability(request.user, "can_source_jobs"):
+            return Response({"detail": "You cannot create partner quotes."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = PartnerQuoteCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payload = create_partner_quote(
+                partner_user=request.user,
+                shop=serializer.validated_data["shop"],
+                client_name=serializer.validated_data.get("client_name", ""),
+                client_email=serializer.validated_data.get("client_email", ""),
+                client_phone=serializer.validated_data.get("client_phone", ""),
+                calculator_inputs_snapshot=serializer.validated_data["calculator_inputs_snapshot"],
+                pricing_snapshot=serializer.validated_data["pricing_snapshot"],
+                partner_markup=serializer.validated_data["partner_markup"],
+                title=serializer.validated_data.get("title", ""),
+                note=serializer.validated_data.get("note", ""),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                "quote_request_id": payload["quote_request"].id,
+                "shop_quote": QuoteResponseReadSerializer(payload["shop_quote"], context={"request": request}).data,
+                "partner_preview": payload["preview"],
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PartnerQuoteListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        if not has_capability(request.user, "can_source_jobs"):
+            return Response({"detail": "You cannot access partner quotes."}, status=status.HTTP_403_FORBIDDEN)
+        responses = ShopQuote.objects.filter(
+            created_by=request.user,
+            quote_request__request_snapshot__quote_source="partner_quote_builder",
+        ).select_related("quote_request", "shop").order_by("-created_at")
+        payload = []
+        for response in responses:
+            request_snapshot = getattr(response.quote_request, "request_snapshot", {}) or {}
+            payload.append(
+                {
+                    "id": response.id,
+                    "quote_request_id": response.quote_request_id,
+                    "client_name": response.quote_request.customer_name,
+                    "shop_name": response.shop.name if response.shop_id else "",
+                    "status": response.status,
+                    "total": str(response.total) if response.total is not None else None,
+                    "partner_markup": request_snapshot.get("partner_markup"),
+                    "partner_brand_name": request_snapshot.get("partner_brand_name"),
+                    "share_token": response.share_links.first().token if response.share_links.exists() else None,
+                    "created_at": response.created_at,
+                }
+            )
+        return Response(payload)
+
+
 class QuoteRequestListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -701,7 +816,7 @@ class QuoteResponseListCreateView(APIView):
         responses = quote_request.shop_quotes.order_by("-created_at")
         if is_owner and not can_manage:
             responses = responses.exclude(status=ShopQuoteStatus.PENDING)
-        return Response(QuoteResponseReadSerializer(responses, many=True).data)
+        return Response(QuoteResponseReadSerializer(responses, many=True, context={"request": request}).data)
 
     def post(self, request, request_id):
         quote_request = get_object_or_404(QuoteRequest.objects.select_related("shop"), pk=request_id)
@@ -728,12 +843,12 @@ class QuoteResponseListCreateView(APIView):
             notify_quote_event(
                 recipient=quote_request.created_by,
                 notification_type=Notification.SHOP_QUOTE_SENT,
-                message=f"{quote_request.shop.name} sent a quote for request #{quote_request.id}.",
+                message=f"{project_identity(quote_request.shop.name, actor=CLIENT_ACTOR)} sent a quote for request #{quote_request.id}.",
                 object_type="quote_request",
                 object_id=quote_request.id,
                 actor=request.user,
             )
-        return Response(QuoteResponseReadSerializer(response).data, status=status.HTTP_201_CREATED)
+        return Response(QuoteResponseReadSerializer(response, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
 class QuoteResponseDetailView(APIView):
@@ -745,7 +860,7 @@ class QuoteResponseDetailView(APIView):
         can_manage = can_manage_quotes(response.shop, request.user)
         if not is_owner and not can_manage:
             return Response({"detail": "You cannot access this quote response."}, status=status.HTTP_403_FORBIDDEN)
-        return Response(QuoteResponseReadSerializer(response).data)
+        return Response(QuoteResponseReadSerializer(response, context={"request": request}).data)
 
     def patch(self, request, pk):
         response = get_object_or_404(ShopQuote.objects.select_related("quote_request", "shop"), pk=pk)
@@ -767,12 +882,12 @@ class QuoteResponseDetailView(APIView):
             notify_quote_event(
                 recipient=updated.quote_request.created_by,
                 notification_type=Notification.SHOP_QUOTE_REVISED,
-                message=f"{updated.shop.name} revised the quote for request #{updated.quote_request.id}.",
+                message=f"{project_identity(updated.shop.name, actor=CLIENT_ACTOR)} revised the quote for request #{updated.quote_request.id}.",
                 object_type="shop_quote",
                 object_id=updated.id,
                 actor=request.user,
             )
-        return Response(QuoteResponseReadSerializer(updated).data)
+        return Response(QuoteResponseReadSerializer(updated, context={"request": request}).data)
 
 
 class ShopHomeDashboardView(APIView):
@@ -904,6 +1019,11 @@ class GuestQuoteRequestView(APIView):
                             "name": customer_name,
                             "email": customer_email,
                             "phone": customer_phone,
+                        },
+                        "visibility": {
+                            "actor": CLIENT_ACTOR,
+                            "topology_mode": TOPOLOGY_MANAGED,
+                            "exposes_internal_economics": False,
                         },
                     },
                 )
@@ -1088,9 +1208,18 @@ class ClientResponseAcceptView(APIView):
                 message_kind=QuoteRequestMessage.MessageKind.STATUS,
                 message_type=QuoteRequestMessage.MessageType.QUOTE_ACCEPTED,
                 direction=QuoteRequestMessage.Direction.OUTBOUND,
-                subject=f"Accepted quote from {shop_quote.shop.name}",
+                subject="Accepted quote in Printy",
                 body="You accepted this quote in Printy.",
                 metadata={"quote_status": ShopQuoteStatus.ACCEPTED},
+            )
+            managed_job = create_managed_job_from_accepted_quote(
+                quote_request=quote_request,
+                shop_quote=shop_quote,
+                accepted_by=request.user,
+            )
+            create_assignment_for_managed_job(
+                managed_job=managed_job,
+                shop_quote=shop_quote,
             )
 
         if shop_quote.shop.owner_id and shop_quote.shop.owner_id != request.user.id:
@@ -1248,7 +1377,7 @@ class ShopResponseReplyView(APIView):
             notify_quote_event(
                 recipient=shop_quote.quote_request.created_by,
                 notification_type=Notification.SHOP_QUESTION_ASKED,
-                message=f"{shop_quote.shop.name} replied to your quote follow-up for Request #{shop_quote.quote_request_id}.",
+                message=f"{project_identity(shop_quote.shop.name, actor=CLIENT_ACTOR)} replied to your quote follow-up for Request #{shop_quote.quote_request_id}.",
                 object_type="shop_quote",
                 object_id=shop_quote.id,
                 actor=request.user,

@@ -38,6 +38,7 @@ class User(AbstractUser, TimeStampedModel):
 
     class Role(models.TextChoices):
         CLIENT = "client", "Client"
+        BROKER = "broker", "Broker"
         SHOP_OWNER = "shop_owner", "Shop Owner"
         STAFF = "staff", "Staff"
 
@@ -49,6 +50,18 @@ class User(AbstractUser, TimeStampedModel):
         choices=Role.choices,
         default=Role.CLIENT,
         help_text="Primary account role used by the dashboard UI.",
+    )
+    partner_profile_enabled = models.BooleanField(
+        default=False,
+        help_text="Enables future partner/broker capabilities without changing the primary dashboard role yet.",
+    )
+    capability_overrides = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Optional additive capability overrides. Keys mirror capability names such as "
+            "can_manage_clients or can_source_jobs."
+        ),
     )
     preferred_language = models.CharField(
         max_length=10,
@@ -74,12 +87,20 @@ class User(AbstractUser, TimeStampedModel):
         return self.role == self.Role.CLIENT
 
     @property
+    def is_broker_role(self) -> bool:
+        return self.role == self.Role.BROKER
+
+    @property
     def is_shop_owner_role(self) -> bool:
         return self.role == self.Role.SHOP_OWNER
 
     @property
     def is_staff_role(self) -> bool:
         return self.role == self.Role.STAFF
+
+    @property
+    def is_hybrid_partner_account(self) -> bool:
+        return bool(self.partner_profile_enabled and self.role in {self.Role.SHOP_OWNER, self.Role.STAFF, self.Role.BROKER})
 
 
 class UserProfile(TimeStampedModel):

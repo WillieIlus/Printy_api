@@ -1,6 +1,7 @@
 """Notification serializers."""
 from rest_framework import serializers
 
+from api.visibility import can_actor_view_email, resolve_actor
 from .models import Notification
 
 
@@ -9,7 +10,7 @@ class NotificationSerializer(serializers.ModelSerializer):
         source="get_notification_type_display", read_only=True
     )
     is_read = serializers.BooleanField(read_only=True)
-    actor_email = serializers.CharField(source="actor.email", read_only=True, allow_null=True)
+    actor_email = serializers.SerializerMethodField()
     target_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -29,6 +30,14 @@ class NotificationSerializer(serializers.ModelSerializer):
             "target_url",
         ]
         read_only_fields = fields
+
+    def get_actor_email(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        if not can_actor_view_email(actor=actor, topology_mode="managed"):
+            return None
+        actor_user = getattr(obj, "actor", None)
+        return getattr(actor_user, "email", None)
 
     def get_target_url(self, obj):
         """Build frontend URL for the notification target (recipient-specific)."""
@@ -55,5 +64,7 @@ class NotificationSerializer(serializers.ModelSerializer):
             except ShopQuote.DoesNotExist:
                 return None
         if ot == "production_order":
+            return f"/dashboard/jobs/{oid}"
+        if ot == "managed_job":
             return f"/dashboard/jobs/{oid}"
         return None

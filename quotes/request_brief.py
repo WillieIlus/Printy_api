@@ -3,6 +3,7 @@ from __future__ import annotations
 from urllib.parse import quote
 
 from quotes.choices import ShopQuoteStatus
+from api.visibility import CLIENT_ACTOR, project_identity
 
 
 def _string(value) -> str:
@@ -353,6 +354,14 @@ def build_quote_request_brief(quote_request, *, include_buyer_contact: bool, vie
         "email": _string(quote_request.customer_email) if include_buyer_contact else "",
         "phone": _string(quote_request.customer_phone) if include_buyer_contact else "",
     }
+    
+    actor = CLIENT_ACTOR if viewer_role == "buyer" else "ops"
+    matched_shops = _matched_shops(quote_request)
+    for shop in matched_shops:
+        shop["name"] = project_identity(shop["name"], actor=actor)
+        if actor == CLIENT_ACTOR:
+            shop["slug"] = "partner" # Hide slug too if client
+            
     created_label = quote_request.created_at.strftime("%d %b %Y, %H:%M")
     brief = {
         "request_id": quote_request.id,
@@ -368,7 +377,7 @@ def build_quote_request_brief(quote_request, *, include_buyer_contact: bool, vie
         "notes": _first(_request_details(quote_request).get("notes"), quote_request.notes),
         "artwork_files": _artwork_files(quote_request),
         "production_preview": _production_summary(quote_request),
-        "matched_shops": _matched_shops(quote_request),
+        "matched_shops": matched_shops,
         "needs_confirmation": _needs_confirmation(quote_request),
         "whatsapp": build_quote_request_whatsapp_handoff(quote_request, viewer_role=viewer_role),
         "download_filename": f"quote-request-{quote_request.id}.pdf",

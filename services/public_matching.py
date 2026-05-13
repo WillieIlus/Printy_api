@@ -9,6 +9,7 @@ from common.geo import haversine_km
 from inventory.models import Machine, Paper
 from locations.models import Location
 from pricing.models import FinishingRate, Material, PrintingRate
+from api.visibility import project_public_marketplace_response
 from services.pricing.engine import calculate_sheet_pricing
 from services.pricing.large_format import calculate_large_format_preview
 from quotes.turnaround import derive_product_turnaround_hours, estimate_turnaround, humanize_working_hours
@@ -154,7 +155,7 @@ def _build_marketplace_response(*, successful_rows: list[dict[str, Any]], failed
 
     best_match = selected_rows[0] if selected_rows else (failed_rows[0] if failed_rows else None)
 
-    return {
+    response = {
         "mode": mode,
         "can_calculate": bool(successful_rows),
         "matches_count": len(successful_rows),
@@ -172,6 +173,7 @@ def _build_marketplace_response(*, successful_rows: list[dict[str, Any]], failed
         "suggestions": ["Detailed shop-spec matching is not fully connected yet."] if not successful_rows else [],
         "exact_or_estimated": bool(selected_rows) and all(row.get("exact_or_estimated", False) for row in selected_rows),
     }
+    return project_public_marketplace_response(response)
 
 
 def get_marketplace_matches(payload: dict[str, Any]) -> dict[str, Any]:
@@ -187,7 +189,7 @@ def get_marketplace_matches(payload: dict[str, Any]) -> dict[str, Any]:
 def get_shop_specific_preview(shop: Shop, payload: dict[str, Any]) -> dict[str, Any]:
     row = try_preview_for_shop(shop, payload)
     selected_rows = [row] if row and row["can_calculate"] else []
-    return {
+    response = {
         "mode": "single-shop",
         "can_calculate": row["can_calculate"] if row else False,
         "matches_count": 1 if row and row["can_calculate"] else 0,
@@ -206,6 +208,7 @@ def get_shop_specific_preview(shop: Shop, payload: dict[str, Any]) -> dict[str, 
         "suggestions": [],
         "exact_or_estimated": bool(row and row.get("exact_or_estimated")),
     }
+    return project_public_marketplace_response(response)
 
 
 def filter_candidate_shops(payload: dict[str, Any]):

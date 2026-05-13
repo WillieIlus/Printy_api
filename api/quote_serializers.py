@@ -30,6 +30,15 @@ from quotes.status_normalization import (
 )
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours, humanize_working_hours
 
+from .visibility import (
+    CLIENT_ACTOR,
+    project_client_counterparty_name,
+    project_client_identity,
+    project_identity,
+    project_participant_name,
+    resolve_actor,
+    resolve_topology_mode_for_quote_request,
+)
 
 # ---------------------------------------------------------------------------
 # Nested / shared
@@ -273,13 +282,20 @@ class QuoteRequestMessageSerializer(serializers.ModelSerializer):
         sender = obj.sender
         if not sender:
             return "System"
-        return getattr(sender, "name", "") or getattr(sender, "email", "") or "User"
+        
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        
+        raw_name = getattr(sender, "name", "") or getattr(sender, "email", "") or "User"
+        
+        # Project based on role
+        return project_participant_name(raw_name, obj.sender_role, actor=actor)
 
 
 class QuoteInboxMessageSerializer(serializers.ModelSerializer):
     quote_request_id = serializers.IntegerField(read_only=True)
     quote_response_id = serializers.IntegerField(source="shop_quote_id", read_only=True)
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_name = serializers.SerializerMethodField()
     client_name = serializers.SerializerMethodField()
     snippet = serializers.SerializerMethodField()
     has_attachment = serializers.SerializerMethodField()
@@ -308,11 +324,29 @@ class QuoteInboxMessageSerializer(serializers.ModelSerializer):
             "action_url",
         ]
 
+    def get_shop_name(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        topology_mode = resolve_topology_mode_for_quote_request(obj.quote_request)
+        if actor == CLIENT_ACTOR:
+            return project_client_counterparty_name(
+                fallback_name=obj.shop.name if obj.shop_id else None,
+                topology_mode=topology_mode,
+                request_snapshot=getattr(obj.quote_request, "request_snapshot", None),
+            )
+        return project_identity(obj.shop.name if obj.shop_id else None, actor=actor, topology_mode=topology_mode)
+
     def get_client_name(self, obj):
         request = self.context.get("request")
         if request and getattr(request.user, "id", None) == obj.quote_request.created_by_id:
             return ""
-        return obj.quote_request.customer_name or ""
+        actor = resolve_actor(getattr(request, "user", None))
+        topology_mode = resolve_topology_mode_for_quote_request(obj.quote_request)
+        return project_client_identity(
+            obj.quote_request.customer_name or "",
+            actor=actor,
+            topology_mode=topology_mode,
+        )
 
     def get_snippet(self, obj):
         return (obj.body or "").strip()[:140]
@@ -415,7 +449,7 @@ class QuoteRequestCustomerUpdateSerializer(serializers.ModelSerializer):
 class QuoteRequestCustomerListSerializer(serializers.ModelSerializer):
     """Customer: list own quote requests — no shop internals."""
 
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_name = serializers.SerializerMethodField()
     shop_slug = serializers.CharField(source="shop.slug", read_only=True)
     shop_currency = serializers.CharField(source="shop.currency", read_only=True)
     quote_draft_file_id = serializers.IntegerField(read_only=True)
@@ -443,6 +477,16 @@ class QuoteRequestCustomerListSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def get_shop_name(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        if actor == CLIENT_ACTOR:
+            return project_client_counterparty_name(
+                fallback_name=obj.shop.name if obj.shop_id else None,
+                request_snapshot=getattr(obj, "request_snapshot", None),
+            )
+        return project_identity(obj.shop.name, actor=actor)
+
     def get_items_count(self, obj):
         return obj.items.count()
 
@@ -462,7 +506,7 @@ class QuoteRequestCustomerListSerializer(serializers.ModelSerializer):
 class QuoteRequestCustomerDetailSerializer(serializers.ModelSerializer):
     """Customer: detail for own quote request — items + latest sent quote, no pricing breakdown."""
 
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_name = serializers.SerializerMethodField()
     shop_slug = serializers.CharField(source="shop.slug", read_only=True)
     shop_currency = serializers.CharField(source="shop.currency", read_only=True)
     quote_draft_file_id = serializers.IntegerField(read_only=True)
@@ -506,6 +550,16 @@ class QuoteRequestCustomerDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_shop_name(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        if actor == CLIENT_ACTOR:
+            return project_client_counterparty_name(
+                fallback_name=obj.shop.name if obj.shop_id else None,
+                request_snapshot=getattr(obj, "request_snapshot", None),
+            )
+        return project_identity(obj.shop.name, actor=actor)
 
     def get_whatsapp_summary(self, obj):
         from quotes.summary_service import get_quote_request_summary_text
@@ -915,7 +969,7 @@ class ShopQuoteListSerializer(serializers.ModelSerializer):
     """List shop quotes — for quote_request or shop views."""
 
     quote_request_id = serializers.IntegerField(source="quote_request_id", read_only=True)
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_name = serializers.SerializerMethodField()
     customer_name = serializers.CharField(source="quote_request.customer_name", read_only=True)
     estimated_working_hours = serializers.IntegerField(source="turnaround_hours", read_only=True)
     raw_status = serializers.CharField(source="status", read_only=True)
@@ -945,6 +999,17 @@ class ShopQuoteListSerializer(serializers.ModelSerializer):
             "created_at",
         ]
 
+    def get_shop_name(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        if actor == CLIENT_ACTOR:
+            return project_client_counterparty_name(
+                fallback_name=obj.shop.name if obj.shop_id else None,
+                request_snapshot=getattr(obj.quote_request, "request_snapshot", None),
+                response_snapshot=obj.response_snapshot,
+            )
+        return project_identity(obj.shop.name, actor=actor)
+
     def get_status(self, obj):
         return normalize_quote_response_status(obj.status)
 
@@ -955,7 +1020,7 @@ class ShopQuoteListSerializer(serializers.ModelSerializer):
 class ShopQuoteDetailSerializer(serializers.ModelSerializer):
     """Full shop quote with items — for shop and customer."""
 
-    shop_name = serializers.CharField(source="shop.name", read_only=True)
+    shop_name = serializers.SerializerMethodField()
     shop_currency = serializers.CharField(source="shop.currency", read_only=True)
     quote_request_summary = serializers.SerializerMethodField()
     items = serializers.SerializerMethodField()
@@ -998,6 +1063,17 @@ class ShopQuoteDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_shop_name(self, obj):
+        request = self.context.get("request")
+        actor = resolve_actor(getattr(request, "user", None))
+        if actor == CLIENT_ACTOR:
+            return project_client_counterparty_name(
+                fallback_name=obj.shop.name if obj.shop_id else None,
+                request_snapshot=getattr(obj.quote_request, "request_snapshot", None),
+                response_snapshot=obj.response_snapshot,
+            )
+        return project_identity(obj.shop.name, actor=actor)
 
     def get_whatsapp_summary(self, obj):
         from quotes.summary_service import get_shop_quote_summary_text
@@ -1082,7 +1158,12 @@ class QuoteSharePublicSerializer(serializers.Serializer):
         items = instance.items.select_related("product").prefetch_related("finishings__finishing_rate")
         return {
             "id": instance.id,
-            "shop_name": instance.shop.name,
+            "shop_name": project_client_counterparty_name(
+                fallback_name=instance.shop.name,
+                topology_mode=resolve_topology_mode_for_quote_request(qr),
+                request_snapshot=getattr(qr, "request_snapshot", None),
+                response_snapshot=instance.response_snapshot,
+            ),
             "customer_name": qr.customer_name,
             "status": instance.status,
             "total": instance.total,

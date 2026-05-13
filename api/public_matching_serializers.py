@@ -58,6 +58,13 @@ class PublicCalculatorPayloadSerializer(serializers.Serializer):
     turnaround_days = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     turnaround_mode = serializers.ChoiceField(choices=["standard", "rush"], required=False, default="standard")
+    urgency_type = serializers.ChoiceField(
+        choices=["standard", "same_day", "express", "after_hours", "emergency"],
+        required=False,
+        default="standard",
+    )
+    requested_deadline = serializers.DateTimeField(required=False, allow_null=True)
+    requested_delivery_time = serializers.DateTimeField(required=False, allow_null=True)
     custom_title = serializers.CharField(required=False, allow_blank=True, default="")
     custom_brief = serializers.CharField(required=False, allow_blank=True, default="")
     notes = serializers.CharField(required=False, allow_blank=True, default="", source="custom_brief")
@@ -318,3 +325,4 @@ class PublicCalculatorResponseSerializer(serializers.Serializer):
     suggestions = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     exact_or_estimated = serializers.BooleanField(required=False, default=False)
     warnings = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    visibility = serializers.JSONField(required=False, allow_null=True)

@@ -55,3 +55,15 @@ Scaffolding for incremental feature migration from the old monorepo. **Do not im
 - [ ] **CORS**: printy.ke, localhost:3000, localhost:5173 (Vite) in `CORS_ALLOWED_ORIGINS`
 - [ ] **JWT**: SimpleJWT with access + refresh; blacklist on logout
 - [ ] **Logging**: API errors and payment callbacks logged to `api` and `payments` loggers
+
+---
+
+## Phase 2: Managed Job & Visibility
+
+- [x] **Visibility Layer**: Centralized projection in `api/visibility.py` (actor-aware)
+- [x] **Customer Pricing**: Migration-safe layering via `customer_pricing` data
+- [x] **ManagedJob Foundation**: Create platform-owned operational center groundwork without forcing migration
+- [ ] **JobAssignment**: Decouple shop production from quote ownership
+- [ ] **Communication Topology**: Isolated threads by relationship boundary (2B focus)
+- [ ] **Participant Projection**: Identity anonymization for clients/partners (2B focus)
+- [ ] **Notification Scrubbing**: Remove shop identity/phone from client notifications

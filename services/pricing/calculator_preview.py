@@ -6,6 +6,7 @@ from typing import Any
 from services.public_matching import get_booklet_marketplace_matches, get_marketplace_matches
 
 from .calculator_config import get_product_definition, resolve_finished_size, resolve_stock_option
+from .urgency import apply_priority_pricing
 
 
 def _parse_tier_gsm(raw: str | None) -> int | None:
@@ -25,6 +26,10 @@ PRODUCT_FAMILY_BY_TYPE = {
     "booklet": "booklet",
     "large_format": "large_format",
 }
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _has_requested_paper(payload: dict[str, Any], *, booklet: bool = False, prefix: str = "") -> bool:
@@ -280,6 +285,66 @@ def _extract_pricing_breakdown(matches: list[dict[str, Any]]) -> dict[str, Any] 
     }
 
 
+def _apply_urgency_to_response(response: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    urgency_type = payload.get("urgency_type")
+    turnaround_hours = payload.get("turnaround_hours")
+    requested_deadline = payload.get("requested_deadline")
+    requested_delivery_time = payload.get("requested_delivery_time")
+
+    if not urgency_type and not requested_deadline and not requested_delivery_time:
+        return response
+
+    updated = deepcopy(response)
+    matches = []
+    for row in updated.get("matches", []):
+        match = dict(row)
+        preview = match.get("preview")
+        if isinstance(preview, dict):
+            match["preview"] = apply_priority_pricing(
+                preview,
+                urgency_type=urgency_type,
+                turnaround_hours=turnaround_hours,
+                turnaround_label=preview.get("turnaround_label"),
+                requested_deadline=requested_deadline,
+                requested_delivery_time=requested_delivery_time,
+            )
+        matches.append(match)
+    updated["matches"] = matches
+    updated["shops"] = matches
+    updated["selected_shops"] = matches
+    updated["production_preview"] = _extract_production_preview(matches, updated.get("product_type") or payload.get("product_type") or "")
+    updated["pricing_breakdown"] = _extract_pricing_breakdown(matches)
+
+    if updated.get("pricing_breakdown"):
+        breakdown = dict(updated["pricing_breakdown"])
+        for row in matches[:1]:
+            preview = row.get("preview") or {}
+            breakdown["urgency_type"] = preview.get("urgency_type")
+            breakdown["urgency_fee"] = preview.get("urgency_fee")
+            breakdown["after_hours_fee"] = preview.get("after_hours_fee")
+            breakdown["operational_priority_level"] = preview.get("operational_priority_level")
+            break
+        updated["pricing_breakdown"] = breakdown
+
+    if matches:
+        totals = _as_dict((matches[0].get("preview") or {}).get("totals"))
+        updated["total"] = totals.get("grand_total") or updated.get("total")
+        all_totals = [
+            value for value in [
+                _as_dict((match.get("preview") or {}).get("totals")).get("grand_total")
+                for match in matches
+            ] if value is not None
+        ]
+        if all_totals:
+            try:
+                numeric_totals = [float(value) for value in all_totals]
+                updated["min_price"] = f"{min(numeric_totals):.2f}"
+                updated["max_price"] = f"{max(numeric_totals):.2f}"
+            except Exception:
+                pass
+    return updated
+
+
 def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
     product_type = (payload.get("product_type") or "").strip()
     definition = get_product_definition(product_type)
@@ -351,7 +416,7 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         response["missing_fields"] = response.get("missing_requirements", [])
         response["production_preview"] = response.get("production_preview")
         response["pricing_breakdown"] = response.get("pricing_breakdown")
-        return response
+        return _apply_urgency_to_response(response, request_payload)
 
     finished_size_raw = payload.get("finished_size") or ""
     custom_warnings: list[str] = []
@@ -408,7 +473,7 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         response["production_preview"] = _extract_production_preview(matches, product_type)
         response["pricing_breakdown"] = _extract_pricing_breakdown(matches)
 
-        return _attach_booklet_match_metadata(response, request_payload)
+        return _apply_urgency_to_response(_attach_booklet_match_metadata(response, request_payload), request_payload)
 
     paper_stock_raw = payload.get("paper_stock") or ""
     stock = resolve_stock_option(paper_stock_raw, usage="sticker" if product_type == "label_sticker" else "")
@@ -458,4 +523,4 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
     response["production_preview"] = _extract_production_preview(matches, product_type)
     response["pricing_breakdown"] = _extract_pricing_breakdown(matches)
 
-    return _attach_flat_match_metadata(response, request_payload)
+    return _apply_urgency_to_response(_attach_flat_match_metadata(response, request_payload), request_payload)

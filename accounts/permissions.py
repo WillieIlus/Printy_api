@@ -3,6 +3,7 @@
 from rest_framework import permissions
 
 from accounts.models import User
+from accounts.services.capabilities import has_capability
 from accounts.services.roles import has_role
 
 
@@ -29,3 +30,17 @@ class IsShopOwnerRole(HasAccountRole):
 
 class IsAccountStaffRole(HasAccountRole):
     allowed_roles = (User.Role.STAFF,)
+
+
+class HasAccountCapability(permissions.BasePermission):
+    """Foundation permission for future capability-based access checks."""
+
+    required_capability: str = ""
+
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and self.required_capability
+            and has_capability(request.user, self.required_capability)
+        )

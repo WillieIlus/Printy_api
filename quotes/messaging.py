@@ -5,6 +5,7 @@ from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
 from django.utils import timezone
 
+from api.visibility import CLIENT_ACTOR, project_identity
 from quotes.models import QuoteRequestMessage
 
 
@@ -35,8 +36,14 @@ def _absolute_url(path: str) -> str:
     return f"{_frontend_base_url()}{path}"
 
 
-def _default_subject(*, quote_request, message_type: str) -> str:
-    shop_name = getattr(getattr(quote_request, "shop", None), "name", "") or "Shop"
+def _default_subject(*, quote_request, message_type: str, recipient_role: str = "") -> str:
+    raw_shop_name = getattr(getattr(quote_request, "shop", None), "name", "") or "Shop"
+    
+    # Project shop name if recipient is client
+    is_client_recipient = recipient_role == QuoteRequestMessage.RecipientRole.CLIENT
+    actor = CLIENT_ACTOR if is_client_recipient else "ops" # Ops or Shop see raw name
+    shop_name = project_identity(raw_shop_name, actor=actor)
+    
     client_name = quote_request.customer_name or getattr(getattr(quote_request, "created_by", None), "email", "") or "client"
     if message_type == QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED:
         return f"New quote request from {client_name}"
@@ -150,12 +157,18 @@ def _build_email_payload(message):
     quote_request = message.quote_request
     shop_quote = message.shop_quote
     default_action_url = _absolute_url((message.metadata or {}).get("action_url", ""))
+    
+    raw_shop_name = getattr(getattr(quote_request, "shop", None), "name", "") or "Print shop"
+    is_client_recipient = message.recipient_role == QuoteRequestMessage.RecipientRole.CLIENT
+    actor = CLIENT_ACTOR if is_client_recipient else "ops"
+    shop_name = project_identity(raw_shop_name, actor=actor)
+    
     common = {
         "brand_name": "Printy",
         "preheader": message.subject,
         "subject": message.subject,
         "greeting_name": quote_request.customer_name or "there",
-        "shop_name": getattr(getattr(quote_request, "shop", None), "name", "") or "Print shop",
+        "shop_name": shop_name,
         "client_name": quote_request.customer_name or "Client",
         "request_id": quote_request.id,
         "request_reference": quote_request.request_reference or f"QR-{quote_request.id}",
@@ -305,7 +318,7 @@ def create_quote_message(
         message_kind=message_kind,
         message_type=message_type,
         direction=direction,
-        subject=subject or _default_subject(quote_request=quote_request, message_type=message_type),
+        subject=subject or _default_subject(quote_request=quote_request, message_type=message_type, recipient_role=recipient_role),
         body=body or "",
         sent_at=timezone.now(),
         metadata=payload,

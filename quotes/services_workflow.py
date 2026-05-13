@@ -7,6 +7,14 @@ from inventory.models import Machine, Paper
 from locations.models import Location
 from notifications.models import Notification
 from notifications.services import notify_quote_event
+from api.visibility import (
+    CLIENT_ACTOR,
+    TOPOLOGY_MANAGED,
+    project_identity,
+    project_match_summary,
+    project_pricing_breakdown,
+    project_production_intelligence,
+)
 from pricing.models import FinishingRate, Material
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
 from quotes.messaging import create_quote_message
@@ -97,6 +105,7 @@ def _build_buyer_snapshot(*, draft: QuoteDraft, merged_request_details: dict):
 def _build_request_snapshot(*, draft: QuoteDraft, shop: Shop, merged_request_details: dict):
     selected_shop_preview = _extract_shop_preview(draft.pricing_snapshot, shop) or {}
     return {
+        "source": "calculator_draft_send",
         "draft_reference": draft.draft_reference,
         "calculator_inputs": draft.calculator_inputs_snapshot or {},
         "production_preview_snapshot": (draft.pricing_snapshot or {}).get("production_preview"),
@@ -110,6 +119,23 @@ def _build_request_snapshot(*, draft: QuoteDraft, shop: Shop, merged_request_det
         "selected_shop_ids": merged_request_details.get("selected_shop_ids") or [],
         "selected_shop": {"id": shop.id, "slug": shop.slug, "name": shop.name},
         "buyer": _build_buyer_snapshot(draft=draft, merged_request_details=merged_request_details),
+        "customer_pricing": {
+            "currency": (draft.pricing_snapshot or {}).get("currency") or "KES",
+            "min_price": (draft.pricing_snapshot or {}).get("min_price"),
+            "max_price": (draft.pricing_snapshot or {}).get("max_price"),
+            "production_preview": project_production_intelligence((draft.pricing_snapshot or {}).get("production_preview")),
+            "pricing_summary": project_pricing_breakdown((draft.pricing_snapshot or {}).get("pricing_preview"), actor=CLIENT_ACTOR),
+            "selected_shop_preview": project_match_summary(
+                selected_shop_preview,
+                actor=CLIENT_ACTOR,
+                topology_mode=TOPOLOGY_MANAGED,
+            ),
+        },
+        "visibility": {
+            "actor": CLIENT_ACTOR,
+            "topology_mode": TOPOLOGY_MANAGED,
+            "exposes_internal_economics": False,
+        },
     }
 
 
@@ -131,6 +157,16 @@ def _build_item_spec_snapshot(*, draft: QuoteDraft, merged_request_details: dict
             "id": shop.id,
             "slug": shop.slug,
             "name": shop.name,
+        },
+        "customer_pricing": {
+            "currency": (draft.pricing_snapshot or {}).get("currency") or "KES",
+            "production_preview": project_production_intelligence((draft.pricing_snapshot or {}).get("production_preview")),
+            "pricing_summary": project_pricing_breakdown((draft.pricing_snapshot or {}).get("pricing_preview"), actor=CLIENT_ACTOR),
+        },
+        "visibility": {
+            "actor": CLIENT_ACTOR,
+            "topology_mode": TOPOLOGY_MANAGED,
+            "exposes_internal_economics": False,
         },
     }
 
@@ -354,8 +390,8 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                 message_kind=QuoteRequestMessage.MessageKind.STATUS,
                 message_type=QuoteRequestMessage.MessageType.QUOTE_REQUEST_CREATED,
                 direction=QuoteRequestMessage.Direction.OUTBOUND,
-                subject=f"Quote request sent to {shop.name}",
-                body=quote_request.notes or f"Your quote request was sent to {shop.name}.",
+                subject=f"Quote request sent to {project_identity(shop.name, actor=CLIENT_ACTOR)}",
+                body=quote_request.notes or f"Your quote request was sent to {project_identity(shop.name, actor=CLIENT_ACTOR)}.",
                 metadata={"status": QuoteStatus.SUBMITTED, "source": "calculator_draft_send"},
             )
             if shop.owner_id and shop.owner_id != draft.user.id:
@@ -371,7 +407,7 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                 notify_quote_event(
                     recipient=draft.user,
                     notification_type=Notification.QUOTE_REQUEST_SENT,
-                    message=f"Your quote request #{quote_request.id} was sent to {shop.name}.",
+                    message=f"Your quote request #{quote_request.id} was sent to {project_identity(shop.name, actor=CLIENT_ACTOR)}.",
                     object_type="quote_request",
                     object_id=quote_request.id,
                     actor=draft.user,
@@ -392,9 +428,40 @@ def _request_status_for_response_status(response_status: str) -> str:
 
 def _assert_response_transition(current_status: str | None, next_status: str):
     allowed = {
-        None: {ShopQuoteStatus.PENDING, ShopQuoteStatus.MODIFIED, ShopQuoteStatus.ACCEPTED, ShopQuoteStatus.REJECTED},
-        ShopQuoteStatus.PENDING: {ShopQuoteStatus.PENDING, ShopQuoteStatus.MODIFIED, ShopQuoteStatus.ACCEPTED, ShopQuoteStatus.REJECTED},
-        ShopQuoteStatus.MODIFIED: {ShopQuoteStatus.MODIFIED, ShopQuoteStatus.ACCEPTED, ShopQuoteStatus.REJECTED},
+        None: {
+            ShopQuoteStatus.PENDING,
+            ShopQuoteStatus.MODIFIED,
+            ShopQuoteStatus.SENT,
+            ShopQuoteStatus.REVISED,
+            ShopQuoteStatus.ACCEPTED,
+            ShopQuoteStatus.REJECTED,
+        },
+        ShopQuoteStatus.PENDING: {
+            ShopQuoteStatus.PENDING,
+            ShopQuoteStatus.MODIFIED,
+            ShopQuoteStatus.SENT,
+            ShopQuoteStatus.REVISED,
+            ShopQuoteStatus.ACCEPTED,
+            ShopQuoteStatus.REJECTED,
+        },
+        ShopQuoteStatus.MODIFIED: {
+            ShopQuoteStatus.MODIFIED,
+            ShopQuoteStatus.SENT,
+            ShopQuoteStatus.REVISED,
+            ShopQuoteStatus.ACCEPTED,
+            ShopQuoteStatus.REJECTED,
+        },
+        ShopQuoteStatus.SENT: {
+            ShopQuoteStatus.SENT,
+            ShopQuoteStatus.REVISED,
+            ShopQuoteStatus.ACCEPTED,
+            ShopQuoteStatus.REJECTED,
+        },
+        ShopQuoteStatus.REVISED: {
+            ShopQuoteStatus.REVISED,
+            ShopQuoteStatus.ACCEPTED,
+            ShopQuoteStatus.REJECTED,
+        },
         ShopQuoteStatus.ACCEPTED: set(),
         ShopQuoteStatus.REJECTED: set(),
     }
@@ -451,7 +518,7 @@ def create_quote_response(*, quote_request: QuoteRequest, shop, user, status: st
             message_kind=QuoteRequestMessage.MessageKind.QUOTE,
             message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
             direction=QuoteRequestMessage.Direction.INBOUND,
-            subject=f"{quote_request.shop.name} sent a quote",
+            subject=f"{project_identity(quote_request.shop.name, actor=CLIENT_ACTOR)} sent a quote",
             body=note or "A shop sent you a quote in Printy.",
             metadata={
                 "status": quote_request.status, 
@@ -542,7 +609,7 @@ def update_quote_response(
             message_kind=QuoteRequestMessage.MessageKind.QUOTE,
             message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
             direction=QuoteRequestMessage.Direction.INBOUND,
-            subject=f"{quote_request.shop.name} sent a quote",
+            subject=f"{project_identity(quote_request.shop.name, actor=CLIENT_ACTOR)} sent a quote",
             body=response.note or "A shop updated your quote in Printy.",
             metadata={
                 "status": quote_request.status, 

@@ -8,10 +8,10 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import ProgrammingError
 from django.test import TestCase, override_settings
 from django.utils import timezone
-from rest_framework.test import APIClient
+from rest_framework.test import APIClient, APIRequestFactory
 
 from api.public_matching_serializers import PublicCalculatorPayloadSerializer
-from api.workflow_serializers import CalculatorPreviewSerializer
+from api.workflow_serializers import CalculatorPreviewSerializer, QuoteResponseReadSerializer
 from accounts.models import User, UserProfile
 from common.models import AnalyticsEvent
 from catalog.choices import PricingMode, ProductKind, ProductStatus
@@ -20,10 +20,13 @@ from inventory.choices import MachineType, PaperCategory, PaperType, SheetSize
 from inventory.models import Machine, Paper, ProductionPaperSize
 from locations.models import Location
 from notifications.models import Notification
+from notifications.serializers import NotificationSerializer
 from pricing.choices import ChargeUnit, ColorMode, FinishingBillingBasis, FinishingSideMode, Sides
 from pricing.models import FinishingRate, Material, PrintingRate, VolumeDiscount
+from production.models import Customer
 from quotes.choices import QuoteStatus, ShopQuoteStatus
 from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteRequest, QuoteRequestMessage, ShopQuote
+from jobs.models import JobAssignment, JobFile, ManagedJob
 from services.public_matching import recompute_shop_match_readiness
 from shops.models import Shop
 
@@ -2719,6 +2722,139 @@ class QuoteWorkflowAPITestCase(TestCase):
         self.assertIn("whatsapp_available", response_list.json()[0])
         self.assertIn("whatsapp_label", response_list.json()[0])
 
+    def test_workflow_accept_creates_managed_job_idempotently(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.customer,
+            customer_name="Workflow Client",
+            customer_email="workflow-client@test.com",
+            status=QuoteStatus.QUOTED,
+            request_snapshot={
+                "source": "calculator_draft_send",
+                "visibility": {
+                    "actor": "client",
+                    "topology_mode": "managed",
+                    "exposes_internal_economics": False,
+                },
+            },
+        )
+        shop_quote = ShopQuote.objects.create(
+            quote_request=quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("2550.00"),
+            response_snapshot={"pricing": {"grand_total": "2550.00"}},
+        )
+        quote_request.attachments.create(
+            file=SimpleUploadedFile("workflow-brief.pdf", b"workflow brief", content_type="application/pdf"),
+            name="Workflow brief",
+        )
+        shop_quote.attachments.create(
+            file=SimpleUploadedFile("workflow-proof.pdf", b"workflow proof", content_type="application/pdf"),
+            name="Workflow proof",
+        )
+
+        self.client.force_authenticate(user=self.customer)
+        accept_response = self.client.post(
+            f"/api/client/responses/{shop_quote.id}/accept/",
+            {},
+            format="json",
+        )
+        self.assertEqual(accept_response.status_code, 200)
+        self.assertEqual(ManagedJob.objects.filter(source_shop_quote=shop_quote).count(), 1)
+        self.assertEqual(JobAssignment.objects.filter(source_shop_quote=shop_quote).count(), 1)
+        self.assertEqual(JobFile.objects.filter(managed_job__source_shop_quote=shop_quote).count(), 2)
+
+        managed_job = ManagedJob.objects.get(source_shop_quote=shop_quote)
+        assignment = JobAssignment.objects.get(source_shop_quote=shop_quote)
+        self.assertEqual(managed_job.source_quote_request_id, quote_request.id)
+        self.assertEqual(managed_job.client_id, self.customer.id)
+        self.assertEqual(managed_job.assigned_shop_id, self.shop.id)
+        self.assertEqual(managed_job.status, "awaiting_payment")
+        self.assertEqual(managed_job.topology_type, "client_printy_support")
+        self.assertEqual(
+            managed_job.commercial_snapshot["visibility"]["exposes_internal_economics"],
+            False,
+        )
+        self.assertEqual(assignment.managed_job_id, managed_job.id)
+        self.assertEqual(assignment.assigned_shop_id, self.shop.id)
+        self.assertEqual(assignment.status, "pending")
+        self.assertEqual(
+            set(JobFile.objects.filter(managed_job=managed_job).values_list("original_filename", flat=True)),
+            {"Workflow brief", "Workflow proof"},
+        )
+
+        self.client.force_authenticate(user=self.owner)
+        create_job_response = self.client.post(
+            f"/api/sent-quotes/{shop_quote.id}/create-job/",
+            {
+                "title": "Workflow production job",
+                "quantity": 100,
+                "status": "pending",
+                "delivery_status": "pending",
+            },
+            format="json",
+        )
+        self.assertEqual(create_job_response.status_code, 201)
+        self.assertEqual(ManagedJob.objects.filter(source_shop_quote=shop_quote).count(), 1)
+        self.assertEqual(JobAssignment.objects.filter(source_shop_quote=shop_quote).count(), 1)
+        managed_job.refresh_from_db()
+        assignment.refresh_from_db()
+        self.assertIsNotNone(managed_job.source_production_order_id)
+        self.assertEqual(managed_job.operational_snapshot["production_order_id"], managed_job.source_production_order_id)
+        self.assertEqual(assignment.production_order_id, managed_job.source_production_order_id)
+        self.assertEqual(assignment.status, "accepted")
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class LegacyQuoteAcceptanceManagedJobTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(email="legacy-client@test.com", password="pass12345", role="client")
+        self.owner = User.objects.create_user(email="legacy-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Legacy Shop", slug="legacy-shop", is_active=True)
+
+    def test_legacy_accept_action_creates_managed_job(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.customer,
+            customer_name="Legacy Client",
+            customer_email="legacy-client@test.com",
+            status=QuoteStatus.QUOTED,
+            request_snapshot={
+                "source": "calculator_draft_send",
+                "visibility": {
+                    "actor": "client",
+                    "topology_mode": "managed",
+                    "exposes_internal_economics": False,
+                },
+            },
+        )
+        shop_quote = ShopQuote.objects.create(
+            quote_request=quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("3200.00"),
+            response_snapshot={"pricing": {"grand_total": "3200.00"}},
+        )
+
+        self.client.force_authenticate(user=self.customer)
+        response = self.client.post(
+            f"/api/quote-requests/{quote_request.id}/accept/",
+            {"sent_quote_id": shop_quote.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(ManagedJob.objects.filter(source_shop_quote=shop_quote).count(), 1)
+        self.assertEqual(JobAssignment.objects.filter(source_shop_quote=shop_quote).count(), 1)
+        managed_job = ManagedJob.objects.get(source_shop_quote=shop_quote)
+        assignment = JobAssignment.objects.get(source_shop_quote=shop_quote)
+        self.assertEqual(managed_job.source_quote_request_id, quote_request.id)
+        self.assertEqual(managed_job.client_total, Decimal("3200.00"))
+        self.assertEqual(assignment.assigned_shop_id, self.shop.id)
+
 
 class CalculatorPreviewAPITestCase(TestCase):
     def setUp(self):
@@ -3404,6 +3540,26 @@ class PublicCalculatorPayloadSerializerTestCase(TestCase):
         self.assertEqual(serializer.validated_data["print_sides"], "DUPLEX")
         self.assertEqual(serializer.validated_data["colour_mode"], "COLOR")
 
+    def test_serializer_accepts_urgency_fields(self):
+        serializer = PublicCalculatorPayloadSerializer(
+            data={
+                "pricing_mode": "custom",
+                "quantity": 100,
+                "custom_title": "Urgent flyers",
+                "size_mode": "custom",
+                "width_mm": 210,
+                "height_mm": 297,
+                "urgency_type": "after_hours",
+                "requested_deadline": "2026-05-14T21:00:00+03:00",
+                "requested_delivery_time": "2026-05-14T22:00:00+03:00",
+            }
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertEqual(serializer.validated_data["urgency_type"], "after_hours")
+        self.assertIsNotNone(serializer.validated_data["requested_deadline"])
+        self.assertIsNotNone(serializer.validated_data["requested_delivery_time"])
+
 
 class PublicMatchShopsAPITestCase(TestCase):
     def setUp(self):
@@ -3509,6 +3665,122 @@ class PublicMatchShopsAPITestCase(TestCase):
         slugs = [match["slug"] for match in response.json()["matches"]]
         self.assertIn("large-shop", slugs)
         self.assertNotIn("flat-shop", slugs)
+
+    def test_public_match_scrubs_raw_pricing_details(self):
+        response = self.client.post(
+            "/api/public/match-shops/",
+            {
+                "pricing_mode": "custom",
+                "product_family": "flat",
+                "quantity": 100,
+                "width_mm": 210,
+                "height_mm": 297,
+                "paper_gsm": 300,
+                "paper_type": "GLOSS",
+                "print_sides": "SIMPLEX",
+                "colour_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["visibility"]["exposes_internal_economics"])
+        self.assertIsNone(payload["pricing_breakdown"])
+        self.assertTrue(payload["matches"])
+        self.assertIsNone(payload["matches"][0]["preview"])
+        self.assertNotIn("selection", payload["matches"][0])
+
+
+class ClientVisibilitySerializerTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.factory = APIRequestFactory()
+        self.customer = User.objects.create_user(email="customer@test.com", password="pass12345")
+        self.owner = User.objects.create_user(email="visibility-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Visibility Shop", slug="visibility-shop", is_active=True)
+        self.quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.customer,
+            customer_name="Client One",
+            customer_email="customer@test.com",
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={
+                "calculator_inputs": {"quantity": 100, "width_mm": 90, "height_mm": 55},
+                "pricing_snapshot": {
+                    "selected_shops": [
+                        {
+                            "id": self.shop.id,
+                            "slug": self.shop.slug,
+                            "name": self.shop.name,
+                            "preview": {"totals": {"grand_total": "320.00"}},
+                            "selection": {"paper_id": 1, "machine_id": 2},
+                        }
+                    ]
+                },
+                "selected_shop_preview": {
+                    "id": self.shop.id,
+                    "slug": self.shop.slug,
+                    "name": self.shop.name,
+                    "preview": {"totals": {"grand_total": "320.00"}},
+                    "selection": {"paper_id": 1, "machine_id": 2},
+                    "production_preview": {"sheets_required": 4, "imposition_label": "4-up"},
+                },
+                "production_preview_snapshot": {"sheets_required": 4, "imposition_label": "4-up"},
+                "pricing_preview_snapshot": {"currency": "KES", "formula": "paper+print", "rate": 24.0},
+                "customer_pricing": {"currency": "KES", "min_price": "320.00", "max_price": "320.00"},
+            },
+        )
+        self.quote_item = QuoteItem.objects.create(
+            quote_request=self.quote_request,
+            item_type="CUSTOM",
+            title="Business cards",
+            quantity=100,
+            pricing_mode="SHEET",
+            sides="SIMPLEX",
+            color_mode="COLOR",
+            pricing_snapshot={"sheets_needed": 4, "imposition_count": 4, "rate": 24.0},
+        )
+        self.shop_quote = ShopQuote.objects.create(
+            quote_request=self.quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("320.00"),
+            response_snapshot={
+                "currency": "KES",
+                "shop_note": "Production ready.",
+                "terms": "50% upfront",
+                "pricing": {"grand_total": "320.00"},
+                "pricing_breakdown": {"currency": "KES", "formula": "paper+print", "rate": 24.0},
+            },
+            revised_pricing_snapshot={"currency": "KES", "formula": "paper+print", "rate": 24.0},
+        )
+
+    def test_client_request_detail_projects_customer_safe_visibility(self):
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.get(f"/api/client/requests/{self.quote_request.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertNotIn("pricing_snapshot", payload["items"][0])
+        self.assertNotIn("pricing_snapshot", payload["request_snapshot"])
+        self.assertNotIn("preview", payload["request_snapshot"]["selected_shop_preview"])
+        self.assertNotIn("selection", payload["request_snapshot"]["selected_shop_preview"])
+        self.assertIsNone(payload["request_snapshot"]["pricing_preview_snapshot"])
+        self.assertEqual(payload["responses"][0]["response_snapshot"]["currency"], "KES")
+        self.assertIsNone(payload["responses"][0]["response_snapshot"]["pricing_summary"])
+        self.assertNotIn("rate", payload["responses"][0]["response_snapshot"])
+
+    def test_shop_response_serializer_keeps_raw_snapshot_for_shop_actor(self):
+        request = self.factory.get("/api/shop/responses/")
+        request.user = self.owner
+
+        payload = QuoteResponseReadSerializer(self.shop_quote, context={"request": request}).data
+
+        self.assertEqual(payload["response_snapshot"]["pricing_breakdown"]["rate"], 24.0)
+        self.assertEqual(payload["revised_pricing_snapshot"]["rate"], 24.0)
 
 
 class CalculatorPreviewSerializerTestCase(TestCase):
@@ -4224,6 +4496,105 @@ class QuoteMessagingInboxAPITestCase(TestCase):
         self.assertEqual(client_message["direction"], "inbound")
         self.assertEqual(client_message["shop_name"], self.shop.name)
 
+    def test_managed_mode_masks_shop_identity_in_client_message_payload(self):
+        quote_request = self._create_and_submit_request()
+        quote_request.request_snapshot = {
+            **(quote_request.request_snapshot or {}),
+            "visibility": {
+                "actor": "client",
+                "topology_mode": "managed",
+                "exposes_internal_economics": False,
+            },
+        }
+        quote_request.save(update_fields=["request_snapshot", "updated_at"])
+
+        self.client.force_authenticate(user=self.owner)
+        send_quote_response = self.client.post(
+            f"/api/shops/{self.shop.slug}/incoming-requests/{quote_request.id}/send-quote/",
+            {
+                "status": "sent",
+                "total": "3500.00",
+                "note": "Ready in three working days.",
+                "turnaround_days": 3,
+            },
+            format="json",
+        )
+        self.assertEqual(send_quote_response.status_code, 201)
+
+        self.client.force_authenticate(user=self.customer)
+        inbox_response = self.client.get("/api/client/messages/")
+        self.assertEqual(inbox_response.status_code, 200)
+        self.assertEqual(len(inbox_response.json()), 1)
+        client_message = inbox_response.json()[0]
+        self.assertEqual(client_message["shop_name"], "Verified Print Partner")
+
+    def test_managed_mode_hides_client_identity_in_shop_message_payload(self):
+        quote_request = self._create_and_submit_request()
+        quote_request.request_snapshot = {
+            **(quote_request.request_snapshot or {}),
+            "visibility": {
+                "actor": "client",
+                "topology_mode": "managed",
+                "exposes_internal_economics": False,
+            },
+        }
+        quote_request.save(update_fields=["request_snapshot", "updated_at"])
+
+        self.client.force_authenticate(user=self.owner)
+        inbox_response = self.client.get("/api/shop/messages/")
+        self.assertEqual(inbox_response.status_code, 200)
+        self.assertEqual(len(inbox_response.json()), 1)
+        shop_message = inbox_response.json()[0]
+        self.assertEqual(shop_message["client_name"], "Client")
+
+    def test_ops_serializer_keeps_raw_shop_identity(self):
+        quote_request = self._create_and_submit_request()
+        quote_request.request_snapshot = {
+            **(quote_request.request_snapshot or {}),
+            "visibility": {
+                "actor": "client",
+                "topology_mode": "managed",
+                "exposes_internal_economics": False,
+            },
+        }
+        quote_request.save(update_fields=["request_snapshot", "updated_at"])
+
+        response = ShopQuote.objects.create(
+            quote_request=quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("3500.00"),
+            response_snapshot={"pricing": {"grand_total": "3500.00"}},
+        )
+        staff_user = User.objects.create_user(
+            email="messages-staff@test.com",
+            password="pass12345",
+            role="staff",
+            is_staff=True,
+        )
+        request = APIRequestFactory().get("/api/")
+        request.user = staff_user
+
+        payload = QuoteResponseReadSerializer(response, context={"request": request}).data
+        self.assertEqual(payload["shop_name"], self.shop.name)
+        self.assertEqual(payload["shop_slug"], self.shop.slug)
+
+    def test_client_notification_payload_hides_actor_email(self):
+        notification = Notification.objects.create(
+            user=self.customer,
+            actor=self.owner,
+            notification_type=Notification.SHOP_QUESTION_ASKED,
+            message="Inbox Shop replied to your request.",
+            object_type="shop_quote",
+            object_id=123,
+        )
+        request = APIRequestFactory().get("/api/me/notifications/")
+        request.user = self.customer
+
+        payload = NotificationSerializer(notification, context={"request": request}).data
+        self.assertIsNone(payload["actor_email"])
+
     def test_email_failure_does_not_rollback_message(self):
         self.client.force_authenticate(user=self.customer)
         create_response = self.client.post(
@@ -4426,3 +4797,81 @@ class QuoteDocumentAccessAPITestCase(TestCase):
         quote_response = self.client.get(f"/api/sent-quotes/{self.shop_quote.id}/")
         self.assertIn(request_response.status_code, (403, 404))
         self.assertIn(quote_response.status_code, (403, 404))
+
+
+class PartnerQuoteBuilderAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.partner = User.objects.create_user(
+            email="partner-builder@test.com",
+            password="pass12345",
+            role="broker",
+            name="Brian Print Solutions",
+        )
+        self.owner = User.objects.create_user(email="partner-shop@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Partner Builder Shop", slug="partner-builder-shop", is_active=True)
+
+    def _pricing_snapshot(self):
+        return {
+            "currency": "KES",
+            "selected_shops": [
+                {
+                    "id": self.shop.id,
+                    "slug": self.shop.slug,
+                    "preview": {
+                        "totals": {"subtotal": "1000.00"},
+                        "breakdown": {"imposition": {"good_sheets": 4}},
+                    },
+                }
+            ],
+        }
+
+    def test_partner_quote_preview_applies_markup(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.post(
+            "/api/partner/quotes/preview/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "300.00",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["production_estimate"], "1000.00")
+        self.assertEqual(response.json()["client_price"], "1300.00")
+        self.assertEqual(response.json()["broker_markup"], "300.00")
+
+    def test_partner_quote_create_sets_attribution_and_white_label_projection(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.post(
+            "/api/partner/quotes/create/",
+            {
+                "shop": self.shop.id,
+                "title": "Partner quote",
+                "client_name": "Acme Client",
+                "client_email": "acme@example.com",
+                "calculator_inputs_snapshot": {"quantity": 100, "pricing_mode": "SHEET"},
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "300.00",
+                "note": "White-label quote ready.",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=response.json()["quote_request_id"])
+        shop_quote = ShopQuote.objects.get(pk=response.json()["shop_quote"]["id"])
+        customer = Customer.objects.get(pk=quote_request.customer_id)
+
+        self.assertEqual(customer.relationship_owner_type, "user")
+        self.assertEqual(customer.relationship_owner_user_id, self.partner.id)
+        self.assertEqual(quote_request.request_snapshot["quote_source"], "partner_quote_builder")
+        self.assertEqual(quote_request.request_snapshot["partner_brand_name"], "Brian Print Solutions")
+        self.assertTrue(quote_request.request_snapshot["white_label_mode"])
+        self.assertEqual(str(shop_quote.total), "1300.00")
+
+        request = APIRequestFactory().get("/")
+        payload = QuoteResponseReadSerializer(shop_quote, context={"request": request}).data
+        self.assertEqual(payload["shop_name"], "Brian Print Solutions")
+        self.assertEqual(payload["response_snapshot"]["estimated_total"], "1300.00")
+        self.assertIsNone(payload["response_snapshot"]["pricing_summary"])
