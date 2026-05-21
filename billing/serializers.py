@@ -9,6 +9,7 @@ from billing.models import (
     ShopSubscription,
     SubscriptionShop,
 )
+from billing.services.mpesa_status import canonical_label, canonicalize_billing_status
 from billing.services.payments import normalize_phone_number
 
 
@@ -102,6 +103,8 @@ class SubscriptionDetailSerializer(ShopSubscriptionSerializer):
 
 class PaymentTransactionSerializer(serializers.ModelSerializer):
     plan_name = serializers.CharField(source="plan.name", read_only=True, default="")
+    status_code = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = PaymentTransaction
@@ -115,6 +118,8 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             "amount",
             "currency",
             "status",
+            "status_code",
+            "status_label",
             "phone_number",
             "account_reference",
             "transaction_desc",
@@ -133,6 +138,12 @@ class PaymentTransactionSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_status_code(self, obj: PaymentTransaction) -> str:
+        return canonicalize_billing_status(status=obj.status, result_desc=obj.result_desc)
+
+    def get_status_label(self, obj: PaymentTransaction) -> str:
+        return canonical_label(self.get_status_code(obj))
 
 
 def _validate_phone(value: str) -> str:

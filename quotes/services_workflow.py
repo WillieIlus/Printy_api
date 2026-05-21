@@ -1,5 +1,7 @@
 """Canonical draft/request/response workflow services."""
 
+from accounts.models import User
+from accounts.services.roles import is_broker
 from django.db import transaction
 from django.utils import timezone
 
@@ -350,6 +352,12 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
         **(request_details_snapshot or {}),
     }
     merged_request_details["selected_shop_ids"] = [shop.id for shop in shops]
+    on_behalf_of = None
+    client_id = merged_request_details.get("client_id") or merged_request_details.get("on_behalf_of")
+    if client_id:
+        on_behalf_of = User.objects.filter(pk=client_id).first()
+    if is_broker(draft.user) and on_behalf_of is None:
+        raise ValueError("client_id is required for partner quote requests.")
     created_requests = []
 
     with transaction.atomic():
@@ -357,6 +365,7 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
             quote_request = QuoteRequest.objects.create(
                 shop=shop,
                 created_by=draft.user,
+                on_behalf_of=on_behalf_of,
                 customer_name=merged_request_details.get("customer_name") or getattr(draft.user, "name", "") or draft.user.email,
                 customer_email=merged_request_details.get("customer_email") or draft.user.email,
                 customer_phone=merged_request_details.get("customer_phone", ""),

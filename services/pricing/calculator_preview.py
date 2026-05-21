@@ -138,7 +138,7 @@ def _attach_flat_match_metadata(response: dict[str, Any], payload: dict[str, Any
         match = _build_match_note(
             requested_category=requested_category,
             requested_gsm=requested_gsm,
-            matched_label=selection.get("paper_label"),
+            matched_label=selection.get("paper_label") or preview.get("selected_paper_label"),
         )
         if match:
             preview["matched_stock"] = match
@@ -155,12 +155,12 @@ def _attach_booklet_match_metadata(response: dict[str, Any], payload: dict[str, 
         cover_match = _build_match_note(
             requested_category=payload.get("cover_paper_type"),
             requested_gsm=payload.get("cover_paper_gsm"),
-            matched_label=selection.get("cover_paper_label"),
+            matched_label=selection.get("cover_paper_label") or preview.get("selected_cover_paper_label"),
         )
         insert_match = _build_match_note(
             requested_category=payload.get("insert_paper_type"),
             requested_gsm=payload.get("insert_paper_gsm"),
-            matched_label=selection.get("insert_paper_label"),
+            matched_label=selection.get("insert_paper_label") or preview.get("selected_insert_paper_label"),
         )
         if cover_match:
             matches.append({"slot": "cover", **cover_match})
@@ -177,7 +177,13 @@ def _extract_production_preview(matches: list[dict[str, Any]], product_type: str
         return None
 
     top_match = matches[0]
+    existing_projection = top_match.get("production_preview")
+    if isinstance(existing_projection, dict) and existing_projection:
+        return existing_projection
     preview_data = top_match.get("preview") or {}
+    preview_projection = preview_data.get("production_preview") or {}
+    if isinstance(preview_projection, dict) and preview_projection:
+        return preview_projection
     breakdown = preview_data.get("breakdown") or {}
     imposition = preview_data.get("imposition") or breakdown.get("imposition") or {}
     paper = breakdown.get("paper") or {}
@@ -250,7 +256,35 @@ def _extract_pricing_breakdown(matches: list[dict[str, Any]]) -> dict[str, Any] 
         return None
 
     top_match = matches[0]
+    existing_projection = top_match.get("pricing_breakdown")
+    if isinstance(existing_projection, dict) and existing_projection:
+        return existing_projection
     preview_data = top_match.get("preview") or {}
+    preview_projection = preview_data.get("pricing_breakdown") or {}
+    if isinstance(preview_projection, dict) and preview_projection:
+        return {
+            "currency": top_match.get("currency", "KES"),
+            "base_price": None,
+            "broker_margin_percent": None,
+            "broker_margin_amount": None,
+            "service_margin_percent": None,
+            "service_margin_amount": None,
+            "client_price": None,
+            "paper_price": None,
+            "print_price_front": None,
+            "print_price_back": None,
+            "total_per_sheet": None,
+            "estimated_total": None,
+            "price_range": None,
+            "formula": None,
+            "method": preview_projection.get("method"),
+            "rate": preview_projection.get("rate"),
+            "charged_area_m2": preview_projection.get("charged_area_m2"),
+            "charged_length_m": preview_projection.get("charged_length_m"),
+            "minimum_charge": preview_projection.get("minimum_charge"),
+            "minimum_charge_applied": preview_projection.get("minimum_charge_applied"),
+            "lines": [],
+        }
     breakdown = preview_data.get("breakdown") or {}
     per_sheet = preview_data.get("per_sheet_pricing") or breakdown.get("per_sheet_pricing") or {}
     totals = preview_data.get("totals") or {}
@@ -258,9 +292,32 @@ def _extract_pricing_breakdown(matches: list[dict[str, Any]]) -> dict[str, Any] 
     pricing = breakdown.get("pricing") or preview_data.get("pricing") or {}
     material = breakdown.get("material") or {}
     material_rate = pricing.get("rate") if pricing.get("rate") is not None else material.get("rate_per_unit")
+    marketplace = breakdown.get("marketplace_pricing") or preview_data.get("marketplace_pricing") or {}
+    pricing_lines = [
+        {
+            "label": item.get("label") or item.get("code") or "Line item",
+            "amount": item.get("amount"),
+            "formula": item.get("formula"),
+        }
+        for item in line_items
+    ]
+    pricing_lines.extend(
+        {
+            "label": line.get("label") or "Marketplace line",
+            "amount": line.get("amount"),
+            "formula": None,
+        }
+        for line in marketplace.get("lines") or []
+    )
 
     return {
         "currency": top_match.get("currency", "KES"),
+        "base_price": marketplace.get("base_price") or totals.get("shop_total"),
+        "broker_margin_percent": marketplace.get("broker_margin_percent"),
+        "broker_margin_amount": marketplace.get("broker_margin_amount"),
+        "service_margin_percent": marketplace.get("service_margin_percent"),
+        "service_margin_amount": marketplace.get("service_margin_amount"),
+        "client_price": marketplace.get("client_price") or totals.get("grand_total"),
         "paper_price": per_sheet.get("paper_price"),
         "print_price_front": per_sheet.get("print_price_front"),
         "print_price_back": per_sheet.get("print_price_back"),
@@ -274,14 +331,7 @@ def _extract_pricing_breakdown(matches: list[dict[str, Any]]) -> dict[str, Any] 
         "charged_length_m": pricing.get("charged_length_m"),
         "minimum_charge": pricing.get("minimum_charge"),
         "minimum_charge_applied": pricing.get("minimum_charge_applied"),
-        "lines": [
-            {
-                "label": item.get("label") or item.get("code") or "Line item",
-                "amount": item.get("amount"),
-                "formula": item.get("formula"),
-            }
-            for item in line_items
-        ],
+        "lines": pricing_lines,
     }
 
 
@@ -414,8 +464,9 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         response["can_calculate"] = bool(response.get("matches_count"))
         response["price_mode"] = "exact" if response.get("exact_or_estimated") else "estimate"
         response["missing_fields"] = response.get("missing_requirements", [])
-        response["production_preview"] = response.get("production_preview")
-        response["pricing_breakdown"] = response.get("pricing_breakdown")
+        matches = response.get("matches", [])
+        response["production_preview"] = _extract_production_preview(matches, product_type)
+        response["pricing_breakdown"] = _extract_pricing_breakdown(matches)
         return _apply_urgency_to_response(response, request_payload)
 
     finished_size_raw = payload.get("finished_size") or ""

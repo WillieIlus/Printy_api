@@ -6,6 +6,8 @@ from django.db import models
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
+from common.models import TimeStampedModel
+from common.payment_constants import PaymentStatus
 from shops.models import Shop
 
 
@@ -285,20 +287,19 @@ class PaymentTransaction(models.Model):
         (METHOD_MANUAL, "Manual (Admin)"),
     ]
 
-    STATUS_PENDING = "pending"
-    STATUS_PROCESSING = "processing"
-    STATUS_SUCCESS = "success"
-    STATUS_FAILED = "failed"
-    STATUS_CANCELLED = "cancelled"
-    STATUS_TIMED_OUT = "timed_out"
-    STATUS_CHOICES = [
-        (STATUS_PENDING, "Pending"),
-        (STATUS_PROCESSING, "Processing"),
-        (STATUS_SUCCESS, "Success"),
-        (STATUS_FAILED, "Failed"),
-        (STATUS_CANCELLED, "Cancelled"),
-        (STATUS_TIMED_OUT, "Timed out"),
-    ]
+    STATUS_INITIATED = PaymentStatus.INITIATED
+    STATUS_PENDING = PaymentStatus.PENDING
+    STATUS_PAID = PaymentStatus.PAID
+    STATUS_FAILED = PaymentStatus.FAILED
+    STATUS_CANCELLED = PaymentStatus.CANCELLED
+    STATUS_NEEDS_REVIEW = PaymentStatus.NEEDS_REVIEW
+
+    # For backward compatibility during migration
+    STATUS_SUCCESS = PaymentStatus.PAID
+    STATUS_PROCESSING = PaymentStatus.PENDING
+    STATUS_TIMED_OUT = PaymentStatus.FAILED
+
+    STATUS_CHOICES = PaymentStatus.choices
 
     subscription = models.ForeignKey(
         ShopSubscription,

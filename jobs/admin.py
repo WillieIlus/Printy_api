@@ -15,9 +15,11 @@ class JobRequestAdmin(admin.ModelAdmin):
     def public_link(self, obj):
         if obj.public_token:
             from django.conf import settings
-            url = f"{getattr(settings, 'FRONTEND_URL', '')}/job/{obj.public_token}"
+
+            url = f"{getattr(settings, 'FRONTEND_URL', '').rstrip('/')}/track-job/{obj.public_token}"
             return format_html('<a href="{}" target="_blank">{}</a>', url, "View")
-        return "—"
+        return "-"
+
     public_link.short_description = "Public link"
 
 

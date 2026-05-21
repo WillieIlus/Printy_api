@@ -2,6 +2,8 @@
 > Django + PostgreSQL + Gunicorn + Nginx on Ubuntu LTS  
 > Root-only deployment under `/root/apps/printy_api`
 
+> Archived reference. The canonical launch runbook is `docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md`.
+
 ---
 
 ## FIXED PATHS — NEVER DEVIATE

@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from decimal import Decimal
+from django.contrib.auth import get_user_model
 
 from catalog.models import Product
 from inventory.models import Machine, Paper
@@ -31,6 +32,11 @@ from quotes.status_normalization import (
     quote_request_status_label,
     quote_response_status_label,
 )
+from services.pricing.mvp_rate_card import FINISHING_DEFINITION_BY_KEY, PAPER_DEFINITION_BY_KEY
+
+
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours
 from shops.models import Shop
 from .serializers import QuoteItemReadSerializer
@@ -381,6 +387,12 @@ class PartnerQuotePreviewSerializer(serializers.Serializer):
 class PartnerQuoteCreateSerializer(serializers.Serializer):
     shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all())
     title = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    client_id = serializers.PrimaryKeyRelatedField(
+        queryset=get_user_model().objects.all(),
+        required=False,
+        allow_null=True,
+        source="client_user",
+    )
     client_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
     client_email = serializers.EmailField(required=False, allow_blank=True)
     client_phone = serializers.CharField(required=False, allow_blank=True, max_length=50)
@@ -665,6 +677,7 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
     conversation = serializers.SerializerMethodField()
     response_snapshot = serializers.SerializerMethodField()
     revised_pricing_snapshot = serializers.SerializerMethodField()
+    total = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopQuote
@@ -706,6 +719,19 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
 
     def get_status(self, obj):
         return normalize_quote_response_status(obj.status)
+
+    def get_total(self, obj):
+        actor = self._visibility_actor(obj)
+        if actor in {SHOP_ACTOR, OPS_ACTOR, PARTNER_ACTOR}:
+            return obj.total
+        response_snapshot = _as_dict(obj.response_snapshot)
+        customer_pricing = _as_dict(response_snapshot.get("customer_pricing"))
+        return (
+            obj.client_total
+            or customer_pricing.get("final_client_price")
+            or customer_pricing.get("estimated_total")
+            or obj.total
+        )
 
     def get_shop_name(self, obj):
         actor = self._visibility_actor(obj)
@@ -1008,6 +1034,9 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
     attachments = QuoteRequestAttachmentSerializer(many=True, read_only=True)
     sibling_responses = serializers.SerializerMethodField()
     responses = serializers.SerializerMethodField()
+    managed_job = serializers.SerializerMethodField()
+    tracking_token = serializers.SerializerMethodField()
+    public_token = serializers.SerializerMethodField()
     raw_status = serializers.CharField(source="status", read_only=True)
     status = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
@@ -1036,6 +1065,9 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
             "attachments",
             "responses",
             "sibling_responses",
+            "managed_job",
+            "tracking_token",
+            "public_token",
             "created_at",
             "updated_at",
         ]
@@ -1078,6 +1110,29 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
                 # We want the full QuoteResponseReadSerializer to give all the details requested
                 responses.append(QuoteResponseReadSerializer(latest, context=self.context).data)
         return responses
+
+    def get_managed_job(self, obj):
+        managed_job = obj.managed_jobs.order_by("-id").first()
+        if not managed_job:
+            return None
+        return {
+            "id": managed_job.id,
+            "status": managed_job.status,
+            "payment_status": managed_job.payment_status,
+            "assignment_status": managed_job.assignment_status,
+            "client_total": str(managed_job.client_total) if managed_job.client_total is not None else None,
+            "tracking_token": str(managed_job.tracking_token) if managed_job.tracking_token else None,
+            "public_token": None,
+        }
+
+    def get_tracking_token(self, obj):
+        managed_job = obj.managed_jobs.order_by("-id").first()
+        if not managed_job or not managed_job.tracking_token:
+            return None
+        return str(managed_job.tracking_token)
+
+    def get_public_token(self, obj):
+        return None
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -1140,6 +1195,16 @@ class MvpRateCardPublicShopSerializer(serializers.Serializer):
     location = serializers.CharField(required=False, allow_blank=True, default="")
 
 
+def _validate_mvp_rate_card_keys(*, rows, field_name: str, allowed_keys: set[str]):
+    invalid_rows = []
+    for idx, row in enumerate(rows or []):
+        key = str((row or {}).get("key") or "").strip()
+        if key and key not in allowed_keys:
+            invalid_rows.append({idx: {"key": ["Unknown predefined product key."]}})
+    if invalid_rows:
+        raise serializers.ValidationError({field_name: invalid_rows})
+
+
 class MvpRateCardPreviewSerializer(serializers.Serializer):
     paper_prices = MvpRateCardPaperRowSerializer(many=True, required=False, default=list)
     finishings = MvpRateCardFinishingRowSerializer(many=True, required=False, default=list)
@@ -1149,6 +1214,16 @@ class MvpRateCardPreviewSerializer(serializers.Serializer):
     def validate(self, attrs):
         attrs["paper_rows"] = attrs.get("paper_prices") or attrs.get("paper_rows") or []
         attrs["finishing_rows"] = attrs.get("finishings") or attrs.get("finishing_rows") or []
+        _validate_mvp_rate_card_keys(
+            rows=attrs["paper_rows"],
+            field_name="paper_prices",
+            allowed_keys=set(PAPER_DEFINITION_BY_KEY.keys()),
+        )
+        _validate_mvp_rate_card_keys(
+            rows=attrs["finishing_rows"],
+            field_name="finishings",
+            allowed_keys=set(FINISHING_DEFINITION_BY_KEY.keys()),
+        )
         return attrs
 
 
@@ -1162,6 +1237,16 @@ class MvpRateCardSetupSerializer(serializers.Serializer):
     def validate(self, attrs):
         attrs["paper_rows"] = attrs.get("paper_prices") or attrs.get("paper_rows") or []
         attrs["finishing_rows"] = attrs.get("finishings") or attrs.get("finishing_rows") or []
+        _validate_mvp_rate_card_keys(
+            rows=attrs["paper_rows"],
+            field_name="paper_prices",
+            allowed_keys=set(PAPER_DEFINITION_BY_KEY.keys()),
+        )
+        _validate_mvp_rate_card_keys(
+            rows=attrs["finishing_rows"],
+            field_name="finishings",
+            allowed_keys=set(FINISHING_DEFINITION_BY_KEY.keys()),
+        )
         return attrs
 
 
@@ -1178,4 +1263,14 @@ class MvpRateCardPublicSaveSerializer(serializers.Serializer):
         }
         attrs["paper_rows"] = attrs.get("paper_prices") or []
         attrs["finishing_rows"] = attrs.get("finishings") or []
+        _validate_mvp_rate_card_keys(
+            rows=attrs["paper_rows"],
+            field_name="paper_prices",
+            allowed_keys=set(PAPER_DEFINITION_BY_KEY.keys()),
+        )
+        _validate_mvp_rate_card_keys(
+            rows=attrs["finishing_rows"],
+            field_name="finishings",
+            allowed_keys=set(FINISHING_DEFINITION_BY_KEY.keys()),
+        )
         return attrs

@@ -1,5 +1,6 @@
 """Quote builder helpers for shop-scoped client draft actions."""
 
+from accounts.services.roles import is_broker
 from django.db import transaction
 from django.utils import timezone
 
@@ -73,11 +74,14 @@ def send_quote_request_item_to_shop(*, draft: QuoteRequest, item: QuoteItem, use
         raise ValueError("Only draft quote requests can send individual items.")
     if item.quote_request_id != draft.id:
         raise ValueError("This item does not belong to the selected draft.")
+    if is_broker(user) and draft.on_behalf_of_id is None:
+        raise ValueError("client_id is required for partner quote requests.")
 
     with transaction.atomic():
         single_request = QuoteRequest.objects.create(
             shop=draft.shop,
             created_by=user,
+            on_behalf_of=draft.on_behalf_of,
             customer_name=draft.customer_name,
             customer_email=draft.customer_email,
             customer_phone=draft.customer_phone,

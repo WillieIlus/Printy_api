@@ -4,6 +4,7 @@ from decimal import Decimal
 from django.urls import reverse
 from rest_framework import serializers
 
+from billing.services.mpesa_status import canonical_label, canonicalize_job_status
 from api.visibility import (
     CLIENT_ACTOR,
     OPS_ACTOR,
@@ -223,6 +224,55 @@ class ManagedJobSerializer(serializers.ModelSerializer):
         return getattr(obj, "get_urgency_type_display", lambda: "")() or ""
 
 
+class ManagedJobPublicTrackingSerializer(serializers.ModelSerializer):
+    job_status = serializers.SerializerMethodField()
+    estimated_ready = serializers.SerializerMethodField()
+    proof_preview_url = serializers.SerializerMethodField()
+    partner_name = serializers.SerializerMethodField()
+    partner_contact = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ManagedJob
+        fields = [
+            "job_status",
+            "estimated_ready",
+            "proof_preview_url",
+            "partner_name",
+            "partner_contact",
+        ]
+
+    def get_job_status(self, obj):
+        return getattr(obj, "get_status_display", lambda: obj.status)()
+
+    def get_estimated_ready(self, obj):
+        estimated_ready = obj.ready_at or getattr(getattr(obj, "source_shop_quote", None), "estimated_ready_at", None)
+        return estimated_ready
+
+    def get_proof_preview_url(self, obj):
+        proof = obj.job_files.filter(
+            file_type="proof",
+            status="proof_approved",
+        ).exclude(file="").order_by("-created_at", "-id").first()
+        if not proof or not proof.file:
+            return None
+        url = proof.file.url
+        request = self.context.get("request")
+        return request.build_absolute_uri(url) if request else url
+
+    def get_partner_name(self, obj):
+        broker = getattr(obj, "broker", None)
+        if broker is None:
+            return "Printy support"
+        return getattr(broker, "name", "") or getattr(broker, "email", "") or "Partner"
+
+    def get_partner_contact(self, obj):
+        broker = getattr(obj, "broker", None)
+        if broker is None:
+            return ""
+        profile = getattr(broker, "profile", None)
+        return getattr(profile, "phone", "") or getattr(broker, "email", "")
+
+
 class JobAssignmentSerializer(serializers.ModelSerializer):
     shop_name = serializers.SerializerMethodField()
     managed_reference = serializers.CharField(source="managed_job.managed_reference", read_only=True)
@@ -346,6 +396,8 @@ class JobPaymentSerializer(serializers.ModelSerializer):
     checkout_request_id = serializers.SerializerMethodField()
     merchant_request_id = serializers.SerializerMethodField()
     mpesa_receipt_number = serializers.SerializerMethodField()
+    status_code = serializers.SerializerMethodField()
+    status_label = serializers.SerializerMethodField()
 
     class Meta:
         model = JobPayment
@@ -359,6 +411,8 @@ class JobPaymentSerializer(serializers.ModelSerializer):
             "payment_channel",
             "payment_status",
             "reconciliation_status",
+            "status_code",
+            "status_label",
             "account_reference",
             "payer_phone",
             "checkout_request_id",
@@ -431,6 +485,15 @@ class JobPaymentSerializer(serializers.ModelSerializer):
         if actor == OPS_ACTOR:
             return obj.mpesa_receipt_number
         return ""
+
+    def get_status_code(self, obj):
+        return canonicalize_job_status(
+            payment_status=obj.payment_status,
+            reconciliation_status=obj.reconciliation_status,
+        )
+
+    def get_status_label(self, obj):
+        return canonical_label(self.get_status_code(obj))
 
 
 class ManagedJobStkInitiateSerializer(serializers.Serializer):

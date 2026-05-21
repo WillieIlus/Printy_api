@@ -5,7 +5,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from billing import views as billing_views
-from . import public_matching_views, quote_views, views, workflow_views
+from . import dashboard_views, public_matching_views, quote_views, views, workflow_views
 from .workflow_views import GuestQuoteRequestView
 from .analytics_views import AnalyticsEventIngestView
 from .admin_views import (
@@ -49,12 +49,12 @@ from jobs.views import (
     ManagedJobEventListView,
     ManagedJobFileListView,
     ManagedJobListView,
-    ManagedJobMpesaCallbackView,
     ManagedJobPaymentListView,
     ManagedJobPaymentQueryView,
     ManagedJobProofUploadView,
     ManagedJobSettlementDetailView,
     ManagedJobStkPushView,
+    PublicManagedJobTrackingView,
     PublicJobView,
     ShopAssignmentListView,
 )
@@ -138,6 +138,30 @@ urlpatterns = [
     path("quote-requests/<int:request_id>/responses/", workflow_views.QuoteResponseListCreateView.as_view(), name="quote-request-response-list-create"),
     path("workflow/quote-responses/<int:pk>/", workflow_views.QuoteResponseDetailView.as_view(), name="workflow-quote-response-detail"),
     path("dashboard/shop-home/", workflow_views.ShopHomeDashboardView.as_view(), name="dashboard-shop-home"),
+    path("dashboard/admin/", dashboard_views.AdminDashboardHomeView.as_view(), name="dashboard-admin-home"),
+    path("dashboard/client-home/", dashboard_views.ClientDashboardHomeView.as_view(), name="dashboard-client-home"),
+    path("dashboard/partner-home/", dashboard_views.PartnerDashboardHomeView.as_view(), name="dashboard-partner-home"),
+    path("dashboard/production-home/", dashboard_views.ProductionDashboardHomeView.as_view(), name="dashboard-production-home"),
+    path("dashboard/client/quotes/", dashboard_views.ClientQuoteListView.as_view(), name="dashboard-client-quotes"),
+    path("dashboard/client/quotes/<int:pk>/", dashboard_views.ClientQuoteDetailView.as_view(), name="dashboard-client-quote-detail"),
+    path("dashboard/client/jobs/", dashboard_views.ClientJobListView.as_view(), name="dashboard-client-jobs"),
+    path("dashboard/client/jobs/<int:pk>/", dashboard_views.ClientJobDetailView.as_view(), name="dashboard-client-job-detail"),
+    path("dashboard/client/payments/", dashboard_views.ClientPaymentListView.as_view(), name="dashboard-client-payments"),
+    path("dashboard/partner/quotes/", dashboard_views.PartnerQuoteListDetailView.as_view(), name="dashboard-partner-quotes"),
+    path("dashboard/partner/quotes/<int:pk>/", dashboard_views.PartnerQuoteListDetailView.as_view(), name="dashboard-partner-quote-detail"),
+    path("dashboard/partner/quotes/<int:pk>/send-to-client/", dashboard_views.PartnerQuoteSendToClientView.as_view(), name="dashboard-partner-quote-send-to-client"),
+    path("dashboard/partner/jobs/", dashboard_views.PartnerJobListDetailView.as_view(), name="dashboard-partner-jobs"),
+    path("dashboard/partner/jobs/<int:pk>/", dashboard_views.PartnerJobListDetailView.as_view(), name="dashboard-partner-job-detail"),
+    path("dashboard/partner/jobs/<int:pk>/dispatch/", dashboard_views.PartnerJobDispatchView.as_view(), name="dashboard-partner-job-dispatch"),
+    path("dashboard/partner/clients/", dashboard_views.PartnerClientListView.as_view(), name="dashboard-partner-clients"),
+    path("dashboard/partner/production-shops/", dashboard_views.PartnerProductionShopListView.as_view(), name="dashboard-partner-production-shops"),
+    path("dashboard/partner/payments/", dashboard_views.PartnerPaymentListView.as_view(), name="dashboard-partner-payments"),
+    path("dashboard/production/jobs/", dashboard_views.ProductionJobListDetailView.as_view(), name="dashboard-production-jobs"),
+    path("dashboard/production/jobs/<int:pk>/", dashboard_views.ProductionJobListDetailView.as_view(), name="dashboard-production-job-detail"),
+    path("dashboard/production/pricing/", dashboard_views.ProductionPricingListView.as_view(), name="dashboard-production-pricing"),
+    path("dashboard/production/paper-stock/", dashboard_views.ProductionPaperStockListView.as_view(), name="dashboard-production-paper-stock"),
+    path("dashboard/production/finishings/", dashboard_views.ProductionFinishingListView.as_view(), name="dashboard-production-finishings"),
+    path("dashboard/production/payments/", dashboard_views.ProductionPaymentListView.as_view(), name="dashboard-production-payments"),
     path("dashboard/calculator/preview/", workflow_views.DashboardCalculatorPreviewView.as_view(), name="dashboard-calculator-preview"),
     path("shops/<slug:shop_slug>/dashboard-home/", workflow_views.ShopHomeDashboardView.as_view(), name="shop-dashboard-home"),
     path("quote-requests/guest-send/", GuestQuoteRequestView.as_view(), name="guest-quote-request-send"),
@@ -179,7 +203,6 @@ urlpatterns = [
     path("managed-jobs/<int:pk>/payments/mpesa/query/", ManagedJobPaymentQueryView.as_view(), name="managed-job-payment-query"),
     path("managed-jobs/<int:pk>/settlement/", ManagedJobSettlementDetailView.as_view(), name="managed-job-settlement"),
     path("managed-jobs/<int:pk>/events/", ManagedJobEventListView.as_view(), name="managed-job-events"),
-    path("managed-jobs/payments/mpesa/callback/", ManagedJobMpesaCallbackView.as_view(), name="managed-job-mpesa-callback"),
     path("job-files/<int:pk>/download/", JobFileDownloadView.as_view(), name="job-file-download"),
     path("job-files/<int:pk>/approve/", JobFileApproveView.as_view(), name="job-file-approve"),
     path("job-files/<int:pk>/reject/", JobFileRejectView.as_view(), name="job-file-reject"),
@@ -195,6 +218,8 @@ urlpatterns = [
     path("shops/nearby/", views.ShopsNearbyView.as_view(), name="shops-nearby"),
     path("shops/<slug:shop_slug>/incoming-requests/", include(incoming_router.urls)),
     path("", include(seller_router.urls)),
+    path("public/managed-jobs/track/<uuid:token>/", PublicManagedJobTrackingView.as_view(), name="public-managed-job-track"),
+    path("managed-jobs/public/<uuid:token>/", PublicManagedJobTrackingView.as_view(), name="managed-job-public-track"),
     path("public/job/<str:token>/", PublicJobView.as_view(), name="public-job"),
     path("share/<str:token>/", views.QuoteSharePublicView.as_view(), name="quote-share-public"),
     # Subscription & payments

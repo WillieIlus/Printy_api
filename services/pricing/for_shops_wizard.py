@@ -20,6 +20,10 @@ from pricing.choices import (
 from pricing.models import FinishingCategory, FinishingRate, Material, PrintingRate
 from services.pricing.imposition import build_imposition_breakdown
 from services.pricing.booklet_builder import build_booklet_preview
+from services.pricing.marketplace_pricing import (
+    build_marketplace_pricing_summary,
+    get_marketplace_margin_settings,
+)
 from services.pricing.quote_builder import build_quote_preview
 from services.public_matching import recompute_shop_match_readiness
 from setup.services import get_setup_status_for_shop
@@ -33,9 +37,6 @@ BOOKLET_WIDTH_MM = 148
 BOOKLET_HEIGHT_MM = 210
 SRA3_WIDTH_MM = 320
 SRA3_HEIGHT_MM = 450
-PUBLIC_SUGGESTED_PRICE_MULTIPLIER = Decimal("1.55")
-
-
 STEP_DEFINITIONS: list[dict[str, Any]] = [
     {
         "key": "business_cards",
@@ -485,15 +486,16 @@ def _step_completion(step: dict[str, Any], field_payloads: list[dict[str, Any]])
 
 
 def _sheet_machine(shop) -> Machine | None:
-    return (
+    queryset = (
         Machine.objects.filter(shop=shop, is_active=True)
         .exclude(machine_type=MachineType.LARGE_FORMAT)
         .order_by(
             "machine_type",
             "id",
         )
-        .first()
     )
+    preferred = queryset.exclude(name="Primary Digital Press").first()
+    return preferred or queryset.first()
 
 
 def _find_step(step_key: str) -> dict[str, Any]:
@@ -529,6 +531,10 @@ def _resolve_printing_rate(shop, lookup: dict[str, Any]) -> tuple[Machine | None
         is_active=True,
     ).order_by("id").first()
     return machine, rate
+
+
+def _is_placeholder_sheet_machine(machine: Machine | None) -> bool:
+    return bool(machine and (machine.name or "").strip() == "Primary Digital Press")
 
 
 def _resolve_finishing(shop, lookup: dict[str, Any]) -> FinishingRate | None:
@@ -587,6 +593,8 @@ def _build_field_payload(shop, field_definition: dict[str, Any]) -> dict[str, An
             save_error = "Create this paper in your materials first so the wizard can update its shop price."
     elif field_definition["kind"] == "printing":
         machine, record = _resolve_printing_rate(shop, lookup)
+        if machine and record is None and _is_placeholder_sheet_machine(machine):
+            machine = None
         saved_value = getattr(record, field_definition["field"], None) if record else None
         lookup["machine_id"] = machine.id if machine else None
         lookup["machine_name"] = machine.name if machine else None
@@ -661,7 +669,12 @@ def _money_to_decimal(value: Any) -> Decimal:
 
 def build_rate_wizard_config(shop) -> dict[str, Any]:
     machine = _sheet_machine(shop)
+    has_sheet_machine = bool(
+        machine
+        and PrintingRate.objects.filter(machine=machine, is_active=True).exists()
+    )
     setup_status = get_setup_status_for_shop(shop)
+    pricing_settings = get_marketplace_margin_settings(shop)
     step_payloads: list[dict[str, Any]] = []
     for index, step in enumerate(STEP_DEFINITIONS, start=1):
         fields = [_build_field_payload(shop, field) for field in step["fields"]]
@@ -695,14 +708,14 @@ def build_rate_wizard_config(shop) -> dict[str, Any]:
         "shop_has_completed_onboarding": wizard_complete,
         "setup_status": setup_status,
         "requirements": {
-            "sheet_machine_required": machine is not None,
+            "sheet_machine_required": has_sheet_machine,
             "sheet_machine": {
-                "id": machine.id if machine else None,
-                "name": machine.name if machine else None,
-                "machine_type": machine.machine_type if machine else None,
+                "id": machine.id if has_sheet_machine else None,
+                "name": machine.name if has_sheet_machine else None,
+                "machine_type": machine.machine_type if has_sheet_machine else None,
             },
             "note": ""
-            if machine is not None
+            if has_sheet_machine
             else "No active digital/offset machine is configured yet, so printing-rate fields cannot be saved until one exists.",
         },
         "save_endpoint": "/api/for-shops/rate-wizard/save-step/",
@@ -732,6 +745,12 @@ def build_rate_wizard_config(shop) -> dict[str, Any]:
             }
             for material in Material.objects.filter(shop=shop, is_active=True).order_by("material_type", "id")
         ],
+        "pricing_settings": {
+            "broker_margin_percent": _decimal_to_string(pricing_settings["broker_margin_percent"]),
+            "service_margin_percent": _decimal_to_string(pricing_settings["service_margin_percent"]),
+            "broker_margin_locked": pricing_settings["broker_margin_locked"],
+            "service_margin_locked": pricing_settings["service_margin_locked"],
+        },
         "available_papers": [
             {
                 "id": paper.id,
@@ -1047,6 +1066,7 @@ def _public_market_field(*, key: str, label: str, unit: str, values: list[Decima
 
 
 def build_public_rate_wizard_config() -> dict[str, Any]:
+    pricing_settings = get_marketplace_margin_settings()
     paper_values = [
         Decimal(str(value))
         for value in Paper.objects.filter(
@@ -1165,6 +1185,12 @@ def build_public_rate_wizard_config() -> dict[str, Any]:
                 values=cutting_values,
             ),
         ],
+        "pricing_settings": {
+            "broker_margin_percent": _decimal_to_string(pricing_settings["broker_margin_percent"]),
+            "service_margin_percent": _decimal_to_string(pricing_settings["service_margin_percent"]),
+            "broker_margin_locked": pricing_settings["broker_margin_locked"],
+            "service_margin_locked": pricing_settings["service_margin_locked"],
+        },
     }
 
 
@@ -1223,7 +1249,7 @@ def build_public_rate_wizard_preview(*, quantity: int, rates: dict[str, Any]) ->
         },
     ]
     production_cost = sum((_money_to_decimal(item["total"]) for item in line_items), Decimal("0"))
-    suggested_price = (production_cost * PUBLIC_SUGGESTED_PRICE_MULTIPLIER).quantize(Decimal("0.01"))
+    marketplace_pricing = build_marketplace_pricing_summary(base_price=production_cost)
 
     return {
         "preset_key": "business_cards",
@@ -1235,7 +1261,9 @@ def build_public_rate_wizard_preview(*, quantity: int, rates: dict[str, Any]) ->
         },
         "breakdown": line_items,
         "production_cost": _decimal_to_string(production_cost),
-        "suggested_selling_price": _decimal_to_string(suggested_price),
+        "client_price": marketplace_pricing["client_price"],
+        "pricing_breakdown": marketplace_pricing,
+        "suggested_selling_price": marketplace_pricing["client_price"],
     }
 
 
@@ -1308,6 +1336,11 @@ def _build_sheet_preview(shop, step: dict[str, Any], *, quantity: int | None = N
     total = pricing.get("totals", {}).get("grand_total")
     warnings = pricing.get("explanations", [])
     line_items = _build_sheet_line_items(pricing, lamination_slug="matte-lamination")
+    marketplace_pricing = build_marketplace_pricing_summary(
+        base_price=total,
+        shop=shop,
+        currency=getattr(shop, "currency", "KES") or "KES",
+    )
     return {
         "step_key": step["key"],
         "preset_key": step["key"],
@@ -1321,9 +1354,11 @@ def _build_sheet_preview(shop, step: dict[str, Any], *, quantity: int | None = N
         },
         "sheet_count": pricing.get("good_sheets"),
         "production_cost": total,
-        "suggested_price": total,
-        "suggested_quote": total,
-        "pricing_note": "Existing wizard pricing fields are sell-side rates, so production_cost and suggested_quote are the same until separate internal cost fields exist.",
+        "client_price": marketplace_pricing["client_price"],
+        "suggested_price": marketplace_pricing["client_price"],
+        "suggested_quote": marketplace_pricing["client_price"],
+        "pricing_note": "Your shop enters the production price. Printy adds broker and service margins before showing the client price.",
+        "pricing_breakdown": marketplace_pricing,
         "cost_breakdown": _sheet_cost_breakdown(pricing),
         "retail_scenarios": _build_sheet_retail_scenarios(step, pricing),
         "line_items": line_items,
@@ -1375,6 +1410,11 @@ def _build_booklet_preview(shop, step: dict[str, Any], *, quantity: int | None =
     print_total = Decimal(str(totals.get("print_cost") or "0"))
     finishing_total = Decimal(str(totals.get("finishing_total") or "0"))
     grand_total = Decimal(str(totals.get("grand_total") or "0"))
+    marketplace_pricing = build_marketplace_pricing_summary(
+        base_price=total,
+        shop=shop,
+        currency=getattr(shop, "currency", "KES") or "KES",
+    )
     return {
         "step_key": step["key"],
         "can_calculate": pricing.get("can_calculate", False),
@@ -1387,8 +1427,10 @@ def _build_booklet_preview(shop, step: dict[str, Any], *, quantity: int | None =
         },
         "sheet_count": (pricing.get("cover_sheets") or 0) + (pricing.get("insert_sheets") or 0),
         "production_cost": total,
-        "suggested_quote": total,
-        "pricing_note": "Existing wizard pricing fields are sell-side rates, so production_cost and suggested_quote are the same until separate internal cost fields exist.",
+        "client_price": marketplace_pricing["client_price"],
+        "suggested_quote": marketplace_pricing["client_price"],
+        "pricing_note": "Your shop enters the production price. Printy adds broker and service margins before showing the client price.",
+        "pricing_breakdown": marketplace_pricing,
         "cost_breakdown": {
             "paper_total": _decimal_to_string(paper_total),
             "printing_total": _decimal_to_string(print_total),

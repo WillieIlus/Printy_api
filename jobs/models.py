@@ -2,6 +2,7 @@
 JobShare models: JobRequest (overflow work to share), JobClaim (printer claiming), JobNotification.
 """
 import secrets
+import uuid
 
 from django.conf import settings
 from django.db import models
@@ -237,6 +238,13 @@ class ManagedJob(TimeStampedModel):
         verbose_name=_("title"),
         help_text=_("Operational label for the managed job."),
     )
+    tracking_token = models.UUIDField(
+        default=uuid.uuid4,
+        unique=True,
+        editable=False,
+        verbose_name=_("tracking token"),
+        help_text=_("Public tracking token for managed job status links."),
+    )
     source_quote_request = models.ForeignKey(
         "quotes.QuoteRequest",
         on_delete=models.SET_NULL,
@@ -372,6 +380,15 @@ class ManagedJob(TimeStampedModel):
     relationship_snapshot = models.JSONField(default=dict, blank=True)
     accepted_at = models.DateTimeField(null=True, blank=True)
     payment_confirmed_at = models.DateTimeField(null=True, blank=True)
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+    dispatched_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="managed_jobs_dispatched",
+        verbose_name=_("dispatched by"),
+    )
     assigned_at = models.DateTimeField(null=True, blank=True)
     production_started_at = models.DateTimeField(null=True, blank=True)
     ready_at = models.DateTimeField(null=True, blank=True)

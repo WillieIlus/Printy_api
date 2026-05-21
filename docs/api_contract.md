@@ -1,6 +1,6 @@
 # API Contract — printy_api
 
-Key endpoints and request/response examples. Base URL: `/api/` (e.g. `https://printy.ke/api/`).
+Key endpoints and request/response examples. Public API origin: `https://api.printy.ke`. Base path: `/api/`.
 
 ---
 
@@ -333,7 +333,7 @@ Expired links return `410 Gone`.
 | GET | `/api/job-claims/?claimed_by=me` | Bearer | My claims |
 | POST | `/api/job-claims/{id}/accept/` | Bearer (owner) | Accept claim |
 | POST | `/api/job-claims/{id}/reject/` | Bearer (owner) | Reject claim |
-| GET | `/api/public/job/{token}/` | No | Public job view (token) |
+| GET | `/api/public/job/{token}/` | No | Public job view (token API) |
 
 ### POST /api/job-requests/{id}/whatsapp-share/
 
@@ -341,7 +341,7 @@ Expired links return `410 Gone`.
 ```json
 {
   "message": "📋 *Business Cards*\n\n• Quantity: 500\n\nInterested? Claim this job on Printy.",
-  "public_view_url": "https://printy.ke/public/job/abc123..."
+  "public_view_url": "https://printy.ke/track-job/abc123..."
 }
 ```
 
@@ -467,4 +467,4 @@ Daraja webhook (no auth, CSRF exempt). Callback behavior:
 - `ResultCode != 0`: Mark STK request FAILED.
 - Idempotent: duplicate callbacks (same `CheckoutRequestID`) do not create duplicate Payments.
 
-**Payments callback logging:** Uses `logging.getLogger("payments")` to log the full request body.
+**Payments callback logging:** Uses `logging.getLogger("payments")` and logs request identifiers, not secrets.

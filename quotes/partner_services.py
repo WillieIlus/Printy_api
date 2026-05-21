@@ -8,6 +8,7 @@ from typing import Any
 from django.db import transaction
 
 from api.visibility import TOPOLOGY_MANAGED
+from jobs.payment_services import calculate_partner_job_split, get_default_platform_service_percent
 from production.models import Customer
 from quotes.services_workflow import create_quote_response, save_quote_draft, send_quote_draft_to_shops
 from services.pricing.projections import project_broker_projection
@@ -43,7 +44,9 @@ def build_partner_quote_preview(*, pricing_snapshot: dict[str, Any], shop: Shop,
     production_estimate = _money(broker_projection.get("production_estimate"))
     minimum_price = production_estimate
     suggested_max = production_estimate + max(partner_markup, production_estimate * Decimal("0.35"))
-    final_client_price = production_estimate + partner_markup
+    platform_service_percent = get_default_platform_service_percent()
+    platform_service_amount = (production_estimate * platform_service_percent / Decimal("100")).quantize(Decimal("0.01"))
+    final_client_price = production_estimate + partner_markup + platform_service_amount
     broker_projection.update(
         {
             "production_estimate": str(production_estimate.quantize(Decimal("0.01"))),
@@ -52,6 +55,8 @@ def build_partner_quote_preview(*, pricing_snapshot: dict[str, Any], shop: Shop,
                 "max": str(suggested_max.quantize(Decimal("0.01"))),
             },
             "broker_markup": str(partner_markup.quantize(Decimal("0.01"))),
+            "platform_service_amount": str(platform_service_amount),
+            "platform_service_percent": str(platform_service_percent),
             "client_price": str(final_client_price.quantize(Decimal("0.01"))),
             "margin": str(partner_markup.quantize(Decimal("0.01"))),
         }
@@ -114,6 +119,7 @@ def create_partner_quote(
     *,
     partner_user,
     shop: Shop,
+    client_user=None,
     client_name: str,
     client_email: str = "",
     client_phone: str = "",
@@ -130,6 +136,13 @@ def create_partner_quote(
         partner_markup=partner_markup,
     )
     final_client_price = _money(preview.get("client_price"))
+    production_base_price = _money(preview.get("production_estimate"))
+    split = calculate_partner_job_split(
+        production_base_price,
+        broker_margin_percent=(partner_markup / production_base_price * Decimal("100")) if production_base_price > 0 else Decimal("0"),
+        platform_service_percent=get_default_platform_service_percent(),
+        partner_user=partner_user,
+    )
     partner_brand_name = getattr(partner_user, "name", "") or getattr(partner_user, "email", "") or "Partner"
 
     draft = save_quote_draft(
@@ -153,6 +166,7 @@ def create_partner_quote(
         draft=draft,
         shops=[shop],
         request_details_snapshot={
+            "client_id": getattr(client_user, "id", None),
             "customer_name": client_name,
             "customer_email": client_email,
             "customer_phone": client_phone,
@@ -187,18 +201,27 @@ def create_partner_quote(
         "exposes_internal_economics": False,
     }
     quote_request.customer = customer
+    quote_request.on_behalf_of = client_user
     quote_request.request_snapshot = request_snapshot
-    quote_request.save(update_fields=["customer", "request_snapshot", "updated_at"])
+    quote_request.save(update_fields=["customer", "on_behalf_of", "request_snapshot", "updated_at"])
 
     response_snapshot = {
         "currency": pricing_snapshot.get("currency") or "KES",
         "partner_brand_name": partner_brand_name,
         "white_label_mode": True,
+        "customer_pricing": {
+            "production_base_price": str(split["production_amount"]),
+            "broker_margin_percent": str(split["broker_margin_percent"]),
+            "broker_margin_amount": str(split["broker_margin_amount"]),
+            "platform_service_percent": str(split["platform_service_percent"]),
+            "platform_service_amount": str(split["platform_service_amount"]),
+            "final_client_price": str(split["client_total"]),
+        },
         "pricing": {
-            "grand_total": str(final_client_price.quantize(Decimal("0.01"))),
+            "grand_total": str(split["client_total"]),
         },
         "totals": {
-            "grand_total": str(final_client_price.quantize(Decimal("0.01"))),
+            "grand_total": str(split["client_total"]),
         },
         "payment_terms": "Pay through Printy before production starts.",
         "note": note or "Partner quote prepared in Printy.",
@@ -210,8 +233,33 @@ def create_partner_quote(
         status="sent",
         response_snapshot=response_snapshot,
         revised_pricing_snapshot=None,
-        total=final_client_price,
+        total=production_base_price,
         note=note or "Partner quote prepared in Printy.",
+    )
+    response.production_base_price = split["production_amount"]
+    response.broker_margin_type = "fixed"
+    response.broker_margin_value = partner_markup.quantize(Decimal("0.01"))
+    response.broker_margin_amount = split["broker_margin_amount"]
+    response.platform_service_percent = split["platform_service_percent"]
+    response.platform_service_amount = split["platform_service_amount"]
+    response.client_total = split["client_total"]
+    response.sent_to_client_at = response.sent_at
+    response.sent_to_client_by = partner_user
+    response.client_quote_status = "sent"
+    response.save(
+        update_fields=[
+            "production_base_price",
+            "broker_margin_type",
+            "broker_margin_value",
+            "broker_margin_amount",
+            "platform_service_percent",
+            "platform_service_amount",
+            "client_total",
+            "sent_to_client_at",
+            "sent_to_client_by",
+            "client_quote_status",
+            "updated_at",
+        ]
     )
     return {
         "draft": draft,

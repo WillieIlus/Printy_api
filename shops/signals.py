@@ -2,8 +2,7 @@
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
-from accounts.models import User
-from accounts.services.roles import promote_to_shop_owner, set_account_role
+from accounts.services.roles import assign_role, promote_to_shop_owner
 from catalog.models import Product
 from inventory.models import Machine, Paper
 from pricing.models import FinishingRate, Material, PrintingRate
@@ -63,14 +62,13 @@ def recompute_shop_readiness_after_shop_save(sender, instance, **kwargs):
 
 @receiver(post_save, sender=ShopMembership)
 def promote_shop_membership_role(sender, instance, **kwargs):
-    """Active delegated members are represented as staff accounts."""
+    """Active delegated members get persisted production access."""
     if not instance.is_active:
         return
     if instance.shop.owner_id == instance.user_id:
         promote_to_shop_owner(instance.user)
         return
-    if instance.user.role == User.Role.CLIENT:
-        set_account_role(instance.user, User.Role.STAFF)
+    assign_role(instance.user, "production", source="shop_membership")
 
 
 def _related_shop_for_instance(instance):

@@ -313,10 +313,6 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             shop_quote=shop_quote,
             accepted_by=request.user,
         )
-        create_assignment_for_managed_job(
-            managed_job=managed_job,
-            shop_quote=shop_quote,
-        )
         if qr.shop.owner_id and qr.shop.owner_id != request.user.id:
             notify_quote_event(
                 recipient=qr.shop.owner,

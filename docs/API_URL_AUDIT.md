@@ -1,68 +1,52 @@
-# API URL Audit — Frontend ↔ Backend
+# API URL Audit
 
-## Base URL
-- **Frontend apiBase**: `NUXT_PUBLIC_API_BASE_URL` + `/api` (e.g. `http://localhost:8000/api`)
-- **Backend**: `config/urls.py` mounts at `/api/`
+Current production domains:
+- Frontend: `https://printy.ke`
+- API: `https://api.printy.ke`
 
-## Auth (accounts app — `/api/auth/`)
-| Frontend path | Backend path | Method | Notes |
-|---------------|--------------|--------|-------|
-| `auth/token/` | `/api/auth/token/` | POST | Body: `{ email, password }` |
-| `auth/token/refresh/` | `/api/auth/token/refresh/` | POST | Body: `{ refresh }` |
-| `auth/me/` | `/api/auth/me/` | GET, PATCH | Current user |
-| `auth/register/` | `/api/auth/register/` | POST | Body: `{ email, password, name }` |
+## Canonical runtime URLs
 
-## Demo / Calculator
-| Frontend path | Backend path | Notes |
-|---------------|--------------|-------|
-| `shops/{slug}/rate-card-for-calculator/` | `/api/shops/{slug}/rate-card-for-calculator/` | **Primary** — real shop data |
-| `demo/rate-card/` | `/api/demo/rate-card/` | **Deprecated** — may 404 if demo app not deployed |
-| `demo/templates/` | `/api/demo/templates/` | Demo products |
-| `demo/quote/` | `/api/demo/quote/` | Demo quote calculation |
+- Frontend API base: `NUXT_PUBLIC_API_BASE_URL=https://api.printy.ke/api`
+- Backend API mount: `/api/`
+- Public job tracking frontend route: `/track-job/{token}`
+- Public job tracking API route: `/api/public/job/{token}/`
+- Canonical M-Pesa callback route: `/api/payments/mpesa/callback/`
 
-## Public shops
-| Frontend path | Backend path |
-|---------------|--------------|
-| `public/shops/` | `/api/public/shops/` |
-| `public/shops/{slug}/catalog/` | `/api/public/shops/{slug}/catalog/` |
-| `public/shops/{slug}/custom-options/` | `/api/public/shops/{slug}/custom-options/` |
+## Auth URLs
 
-## Shops (seller)
-| Frontend path | Backend path |
-|---------------|--------------|
-| `shops/` | `/api/shops/` |
-| `shops/{slug}/` | `/api/shops/{slug}/` |
-| `shops/{slug}/machines/` | `/api/shops/{slug}/machines/` |
-| `shops/{slug}/papers/` | `/api/shops/{slug}/papers/` |
-| `shops/{slug}/materials/` | `/api/shops/{slug}/materials/` |
-| `shops/{slug}/finishing-rates/` | `/api/shops/{slug}/finishing-rates/` |
-| `shops/{slug}/products/` | `/api/shops/{slug}/products/` |
-| `shops/{slug}/rate-card/` | `/api/shops/{slug}/rate-card/` |
-| `shops/{slug}/gallery/products/{slug}/calculate-price/` | `/api/shops/{slug}/gallery/products/{slug}/calculate-price/` |
+| Frontend route | Backend route |
+| --- | --- |
+| `/auth/login` | `/api/auth/token/` |
+| `/auth/register` | `/api/auth/register/` |
+| `/auth/confirm-email?key=...` | `/api/auth/confirm-email/` |
+| `/auth/forgot-password` | `/api/auth/password-reset/` |
+| `/auth/reset-password?key=...` | `/api/auth/password-reset/confirm/` |
 
-## Quote drafts (tweak & add)
-| Frontend path | Backend path |
-|---------------|--------------|
-| `quote-drafts/active/?shop={slug}` | `/api/quote-drafts/active/?shop={slug}` |
-| `quote-drafts/{id}/items/` | `/api/quote-drafts/{id}/items/` |
-| `quote-drafts/{id}/items/{itemId}/` | `/api/quote-drafts/{id}/items/{itemId}/` |
-| `quote-drafts/{id}/tweak-and-add/` | `/api/quote-drafts/{id}/tweak-and-add/` |
-| `tweaked-items/{id}/` | `/api/tweaked-items/{id}/` |
+## Public tracking URLs
 
-## Profiles
-| Frontend path | Backend path |
-|---------------|--------------|
-| `profiles/me/` | `/api/profiles/me/` |
-| `profiles/{id}/social-links/` | `/api/profiles/{id}/social-links/` |
+| Purpose | Canonical URL |
+| --- | --- |
+| frontend share/admin/email link | `https://printy.ke/track-job/{token}` |
+| backend token endpoint | `https://api.printy.ke/api/public/job/{token}/` |
 
-## Setup
-| Frontend path | Backend path |
-|---------------|--------------|
-| `setup/status/` | `/api/setup/status/` |
+Deprecated and no longer canonical:
+- `/job/{token}` as a frontend link
+- `/public/job/{token}` as a frontend link
 
-## Auth 400 on token
-Common causes:
-1. **Body format**: Must be JSON `{ "email": "...", "password": "..." }`
-2. **Content-Type**: `application/json`
-3. **Invalid credentials**: Email not found or wrong password
-4. **CORS**: Ensure backend allows frontend origin
+## M-Pesa URLs
+
+| Purpose | Canonical URL |
+| --- | --- |
+| Daraja callback | `https://api.printy.ke/api/payments/mpesa/callback/` |
+| managed-job STK initiation | `/api/managed-jobs/{id}/payments/mpesa/stk-push/` |
+| managed-job payment query | `/api/managed-jobs/{id}/payments/mpesa/query/` |
+
+Deprecated callback paths:
+- `/api/billing/mpesa/callback/`
+- `/api/managed-jobs/payments/mpesa/callback/`
+
+## Production checks
+
+- Frontend must not call `localhost` or `127.0.0.1`
+- email links must point to `https://printy.ke`
+- Daraja must target `https://api.printy.ke/api/payments/mpesa/callback/`

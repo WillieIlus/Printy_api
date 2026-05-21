@@ -20,9 +20,6 @@ urlpatterns = [
     path("initiate-renewal/", views.InitiateRenewalView.as_view(), name="billing-initiate-renewal"),
     path("mpesa/test-stk/", views.MpesaSandboxTestStkView.as_view(), name="billing-mpesa-test-stk"),
 
-    # M-Pesa callback (Daraja calls this - no auth)
-    path("mpesa/callback/", views.MpesaCallbackView.as_view(), name="billing-mpesa-callback"),
-
     # Payment history
     path("payments/", views.PaymentListView.as_view(), name="billing-payments"),
     path("payments/<int:pk>/", views.PaymentDetailView.as_view(), name="billing-payment-detail"),

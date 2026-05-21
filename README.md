@@ -8,7 +8,7 @@ Backend for a print-shop SaaS and marketplace focused on Kenyan print businesses
 - Catalog and pricing: products, categories, machines, papers, materials, printing rates, finishing rates, volume discounts, rate cards, and setup wizards.
 - Quote workflows: customer quote requests, seller responses, draft quotes, attachments, share links, inbox-style messaging, and calculator previews.
 - Public marketplace features: public shops, public products, SEO location/product endpoints, match-shops calculator flows, and guest quote submission.
-- Billing: subscription plans, entitlements, usage counters, M-Pesa STK push, callbacks, renewal retries, grace periods, and admin support actions.
+- Billing: subscription plans, entitlements, usage counters, M-Pesa STK push, the canonical `/api/payments/mpesa/callback/` webhook, renewal retries, grace periods, and admin support actions.
 - Production and jobs: production orders, job processes, operators, price cards, and overflow job requests/claims.
 - Artwork analysis: uploaded PDF analysis with size detection, booklet hints, preview generation, and product suggestions.
 - Platform support: JWT auth, allauth email verification, Google social login, analytics event ingestion, i18n, and Django admin tooling.
@@ -48,7 +48,7 @@ Backend for a print-shop SaaS and marketplace focused on Kenyan print businesses
 | `services` | Pricing engines and lower-level calculator services |
 | `setup` | Shop setup-status endpoints and seed helpers |
 | `shops` | Shop model, memberships, hours, ratings, related admin |
-| `subscriptions` | Legacy subscription/M-Pesa module still referenced by some API routes |
+| `subscriptions` | Legacy subscription module retained behind the canonical payment callback dispatcher |
 
 ## API shape
 
@@ -58,7 +58,7 @@ Important route groups:
 
 - `/api/auth/`: register, login, token refresh, profile/me, email verify/resend, Google social login
 - `/api/setup/`: setup status endpoints
-- `/api/billing/`: plans, subscription lifecycle, usage, payments, M-Pesa callbacks
+- `/api/billing/`: plans, subscription lifecycle, usage, and payment operations
 - `/api/leads/`: early-access spots, applications, demo actions
 - `/api/artwork/`: artwork upload and detail endpoints
 - `/api/public/...`: public shops, products, calculators, match-shops flows
@@ -75,7 +75,7 @@ The API is primarily JWT-protected. Public discovery and some guest quoting endp
 
 - Authentication uses JWT bearer tokens only for the API.
 - Registration and email confirmation are implemented with `django-allauth`.
-- Verification links are generated against `FRONTEND_URL` through `accounts.adapters.AccountAdapter`.
+- Verification links are generated against `FRONTEND_URL` through `accounts.adapters.AccountAdapter` and should resolve to `https://printy.ke` in production.
 - Authenticated language preference is stored on the user profile; unauthenticated requests can use `Accept-Language`.
 - Google social login is implemented; GitHub provider is installed but not exposed in `accounts/urls.py`.
 
@@ -97,7 +97,8 @@ The API is primarily JWT-protected. Public discovery and some guest quoting endp
 - Plans are seeded as code-based tiers such as `FREE`, `BIASHARA`, `BIASHARA_PLUS`, and `BIASHARA_MAX`.
 - Billing supports activation, upgrades, downgrades, cancellations, manual renewals, and retry/grace-period handling.
 - M-Pesa Daraja STK push and callback handling are implemented.
-- `subscriptions/` still exists as an older module and some `/api/...` routes still reference it, so both domains currently coexist.
+- The canonical callback route is `/api/payments/mpesa/callback/`.
+- `subscriptions/` still exists as an older module, but it no longer owns the webhook architecture.
 
 ## Artwork analysis
 
@@ -138,6 +139,11 @@ python manage.py runserver
 ## Environment
 
 The project loads environment variables from `.env` via `python-dotenv`.
+
+Template files:
+
+- `.env.example` for production-safe placeholders
+- `.env.local.example` for localhost development
 
 Core variables:
 
@@ -181,7 +187,7 @@ Billing variables:
 - `BILLING_GRACE_PERIOD_DAYS`
 - `BILLING_RETRY_SCHEDULE_HOURS`
 
-See `docs/env_vars.md` and `.env.example` for the fuller reference.
+See `docs/env_vars.md`, `docs/DARAJA_PRODUCTION_CHECKLIST.md`, `docs/PRODUCTION_DEPLOYMENT_RUNBOOK.md`, `.env.example`, and `.env.local.example` for the fuller reference.
 
 ## Useful management commands
 

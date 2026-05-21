@@ -8,6 +8,7 @@ from typing import Any
 from django.db import transaction
 from django.utils import timezone
 
+from accounts.services.roles import is_broker, is_client
 from api.visibility import (
     TOPOLOGY_MANAGED,
     resolve_topology_mode_for_quote_request,
@@ -40,7 +41,18 @@ def _resolve_source_draft(quote_request: QuoteRequest | None) -> QuoteDraft | No
 def _resolve_client(quote_request: QuoteRequest | None):
     if not quote_request:
         return None
-    return getattr(quote_request, "created_by", None)
+    on_behalf_of = getattr(quote_request, "on_behalf_of", None)
+    if on_behalf_of is not None:
+        return on_behalf_of
+
+    created_by = getattr(quote_request, "created_by", None)
+    if created_by and is_broker(created_by):
+        raise ValueError(
+            "Partner quote is missing client attribution. Set on_behalf_of before creating a managed job."
+        )
+    if created_by and is_client(created_by):
+        return created_by
+    return None
 
 
 def _resolve_customer(quote_request: QuoteRequest | None) -> Customer | None:
@@ -138,6 +150,13 @@ def _resolve_urgency_payload(*, quote_request: QuoteRequest | None, shop_quote: 
 
 def _build_commercial_snapshot(*, quote_request: QuoteRequest, shop_quote: ShopQuote, source_draft: QuoteDraft | None) -> dict[str, Any]:
     request_snapshot = _as_dict(getattr(quote_request, "request_snapshot", None))
+    customer_pricing = _as_dict(request_snapshot.get("customer_pricing"))
+    client_total = shop_quote.client_total if shop_quote.client_total is not None else customer_pricing.get("final_client_price")
+    production_base_price = (
+        shop_quote.production_base_price
+        if shop_quote.production_base_price is not None
+        else customer_pricing.get("production_base_price")
+    )
     return {
         "quote_request_id": quote_request.id,
         "quote_request_reference": quote_request.request_reference,
@@ -146,10 +165,18 @@ def _build_commercial_snapshot(*, quote_request: QuoteRequest, shop_quote: ShopQ
         "quote_status": quote_request.status,
         "shop_quote_status": shop_quote.status,
         "currency": getattr(shop_quote.shop, "currency", "KES") or "KES",
-        "client_total": str(shop_quote.total) if shop_quote.total is not None else None,
+        "client_total": str(client_total) if client_total is not None else None,
         "response_snapshot": _as_dict(shop_quote.response_snapshot),
         "revised_pricing_snapshot": _as_dict(shop_quote.revised_pricing_snapshot),
         "request_customer_pricing": _as_dict(request_snapshot.get("customer_pricing")),
+        "production_base_price": str(production_base_price) if production_base_price is not None else None,
+        "broker_margin_amount": str(shop_quote.broker_margin_amount) if shop_quote.broker_margin_amount is not None else customer_pricing.get("broker_margin_amount"),
+        "broker_margin_percent": customer_pricing.get("broker_margin_percent"),
+        "broker_margin_type": shop_quote.broker_margin_type or customer_pricing.get("broker_margin_type"),
+        "broker_margin_value": str(shop_quote.broker_margin_value) if shop_quote.broker_margin_value is not None else customer_pricing.get("broker_margin_value"),
+        "platform_service_amount": str(shop_quote.platform_service_amount) if shop_quote.platform_service_amount is not None else customer_pricing.get("platform_service_amount"),
+        "platform_service_percent": str(shop_quote.platform_service_percent) if shop_quote.platform_service_percent is not None else customer_pricing.get("platform_service_percent"),
+        "final_client_price": str(client_total) if client_total is not None else customer_pricing.get("final_client_price"),
         "source_draft_reference": getattr(source_draft, "draft_reference", ""),
         "visibility": {
             "topology_mode": TOPOLOGY_MANAGED,
@@ -224,6 +251,22 @@ def create_managed_job_from_accepted_quote(
     broker = _resolve_broker(customer)
     topology_mode = resolve_topology_mode_for_quote_request(quote_request)
     urgency_payload = _resolve_urgency_payload(quote_request=quote_request, shop_quote=shop_quote)
+    request_snapshot = _as_dict(getattr(quote_request, "request_snapshot", None))
+    customer_pricing = _as_dict(request_snapshot.get("customer_pricing"))
+    client_total = shop_quote.client_total
+    if client_total is None:
+        client_total = customer_pricing.get("final_client_price") or shop_quote.total
+    production_total = shop_quote.production_base_price
+    if production_total is None:
+        production_total = customer_pricing.get("production_base_price") or shop_quote.total
+    platform_fee = shop_quote.platform_service_amount
+    if platform_fee is None:
+        platform_fee = customer_pricing.get("platform_service_amount")
+    broker_commission = shop_quote.broker_margin_amount
+    if broker_commission is None:
+        broker_commission = customer_pricing.get("broker_margin_amount")
+    initial_assigned_shop = shop_quote.shop if broker is None else None
+    initial_assignment_status = "assignment_pending" if initial_assigned_shop else "unassigned"
 
     managed_job = ManagedJob.objects.create(
         title=shop_quote.note[:255] if shop_quote.note else (quote_request.notes[:255] if quote_request.notes else f"Managed job from quote {shop_quote.quote_reference or shop_quote.id}"),
@@ -232,11 +275,11 @@ def create_managed_job_from_accepted_quote(
         client=_resolve_client(quote_request),
         customer=customer,
         broker=broker,
-        assigned_shop=shop_quote.shop,
+        assigned_shop=initial_assigned_shop,
         created_by=accepted_by or _resolve_client(quote_request) or shop_quote.created_by,
         status=managed_status_from_shop_quote_status(shop_quote.status),
         payment_status="pending",
-        assignment_status="unassigned",
+        assignment_status=initial_assignment_status,
         exception_status="clear",
         fulfillment_mode=_resolve_fulfillment_mode(quote_request),
         topology_type=_resolve_topology_type(customer),
@@ -247,7 +290,10 @@ def create_managed_job_from_accepted_quote(
         requested_deadline=urgency_payload["requested_deadline"],
         requested_delivery_time=urgency_payload["requested_delivery_time"],
         operational_priority_level=urgency_payload["operational_priority_level"],
-        client_total=shop_quote.total,
+        client_total=client_total,
+        production_total=production_total,
+        platform_fee=platform_fee,
+        broker_commission=broker_commission,
         commercial_snapshot=_build_commercial_snapshot(
             quote_request=quote_request,
             shop_quote=shop_quote,
@@ -293,6 +339,11 @@ def create_managed_job_from_accepted_quote(
             "topology_mode": topology_mode,
         },
     )
+    if initial_assigned_shop is not None:
+        create_assignment_for_managed_job(
+            managed_job=managed_job,
+            shop_quote=shop_quote,
+        )
     return managed_job
 
 

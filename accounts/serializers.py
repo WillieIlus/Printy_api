@@ -4,7 +4,14 @@ from rest_framework_simplejwt.settings import api_settings
 
 from .models import User, UserProfile, UserSocialLink
 from .services.capabilities import capability_keys, get_account_capabilities, normalize_capability_overrides
-from .services.roles import get_assignable_roles, set_account_role
+from .services.roles import (
+    assign_role,
+    build_auth_role_payload,
+    get_public_assignable_roles,
+    normalize_role_value,
+    resolve_dashboard_role,
+    set_account_role,
+)
 
 PROFILE_FIELDS = (
     "bio",
@@ -23,6 +30,13 @@ def get_or_create_profile(user: User) -> UserProfile:
     return profile
 
 
+def _normalize_public_role(value: str) -> str:
+    normalized = normalize_role_value(value)
+    if normalized not in get_public_assignable_roles():
+        raise serializers.ValidationError("Role must be one of: client, partner, production.")
+    return normalized
+
+
 class UserSocialLinkSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserSocialLink
@@ -35,6 +49,14 @@ class UserSerializer(serializers.ModelSerializer):
 
     is_email_verified = serializers.SerializerMethodField()
     capabilities = serializers.SerializerMethodField()
+    dashboard_role = serializers.SerializerMethodField()
+    roles = serializers.SerializerMethodField()
+    primary_role = serializers.SerializerMethodField()
+    home_route = serializers.SerializerMethodField()
+    can_access_admin_dashboard = serializers.SerializerMethodField()
+    can_access_client_dashboard = serializers.SerializerMethodField()
+    can_access_partner_dashboard = serializers.SerializerMethodField()
+    can_access_production_dashboard = serializers.SerializerMethodField()
     bio = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     avatar = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     phone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
@@ -54,9 +76,17 @@ class UserSerializer(serializers.ModelSerializer):
             "first_name",
             "last_name",
             "role",
+            "roles",
+            "primary_role",
             "partner_profile_enabled",
             "capability_overrides",
             "capabilities",
+            "dashboard_role",
+            "home_route",
+            "can_access_admin_dashboard",
+            "can_access_client_dashboard",
+            "can_access_partner_dashboard",
+            "can_access_production_dashboard",
             "preferred_language",
             "is_email_verified",
             "is_active",
@@ -89,8 +119,34 @@ class UserSerializer(serializers.ModelSerializer):
     def get_capabilities(self, instance):
         return get_account_capabilities(instance)
 
+    def get_dashboard_role(self, instance):
+        return resolve_dashboard_role(instance)
+
+    def get_roles(self, instance):
+        return build_auth_role_payload(instance)["roles"]
+
+    def get_primary_role(self, instance):
+        return build_auth_role_payload(instance)["primary_role"]
+
+    def get_home_route(self, instance):
+        return build_auth_role_payload(instance)["home_route"]
+
+    def get_can_access_client_dashboard(self, instance):
+        return build_auth_role_payload(instance)["can_access_client_dashboard"]
+
+    def get_can_access_admin_dashboard(self, instance):
+        return build_auth_role_payload(instance)["can_access_admin_dashboard"]
+
+    def get_can_access_partner_dashboard(self, instance):
+        return build_auth_role_payload(instance)["can_access_partner_dashboard"]
+
+    def get_can_access_production_dashboard(self, instance):
+        return build_auth_role_payload(instance)["can_access_production_dashboard"]
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        role_payload = build_auth_role_payload(instance)
+        data["role"] = role_payload["primary_role"]
         profile = get_or_create_profile(instance)
         for field in PROFILE_FIELDS:
             data[field] = getattr(profile, field) or None
@@ -98,9 +154,7 @@ class UserSerializer(serializers.ModelSerializer):
         return data
 
     def validate_role(self, value):
-        if value not in get_assignable_roles():
-            raise serializers.ValidationError("Role must be one of: client, shop_owner, staff.")
-        return value
+        return _normalize_public_role(value)
 
     def validate_capability_overrides(self, value):
         if value in (None, ""):
@@ -178,11 +232,14 @@ class UserCreateSerializer(serializers.ModelSerializer):
             "capability_overrides",
         ]
         read_only_fields = ["id"]
+        extra_kwargs = {
+            "role": {"required": False},
+            "partner_profile_enabled": {"required": False},
+            "capability_overrides": {"required": False},
+        }
 
     def validate_role(self, value):
-        if value not in get_assignable_roles():
-            raise serializers.ValidationError("Role must be one of: client, shop_owner, staff.")
-        return value
+        return _normalize_public_role(value)
 
     def validate_capability_overrides(self, value):
         if value in (None, ""):
@@ -196,7 +253,13 @@ class UserCreateSerializer(serializers.ModelSerializer):
         return normalized
 
     def create(self, validated_data):
+        requested_role = validated_data.pop("role", None) or self.context.get("default_role") or User.Role.CLIENT
+        normalized_role = _normalize_public_role(requested_role)
+        validated_data["role"] = normalized_role
+        if normalized_role == User.Role.PARTNER:
+            validated_data["partner_profile_enabled"] = True
         user = User.objects.create_user(**validated_data)
+        assign_role(user, normalized_role, source=self.context.get("role_source", "signup"))
         from allauth.account.models import EmailAddress
         from django.conf import settings as django_settings
         email_verification = getattr(django_settings, "ACCOUNT_EMAIL_VERIFICATION", "none")
@@ -215,6 +278,15 @@ class UserCreateSerializer(serializers.ModelSerializer):
 
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
     """Token serializer that accepts email for login (email-based auth)."""
+
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+        role_payload = build_auth_role_payload(user)
+        token["primary_role"] = role_payload["primary_role"]
+        token["roles"] = role_payload["roles"]
+        token["home_route"] = role_payload["home_route"]
+        return token
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -257,6 +329,7 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
         data = {
             "refresh": str(refresh),
             "access": str(refresh.access_token),
+            "user": UserSerializer(self.user).data,
         }
 
         if api_settings.UPDATE_LAST_LOGIN:

@@ -25,6 +25,7 @@ from quotes.turnaround import (
     humanize_working_hours,
     schedule_summary,
 )
+from services.pricing.marketplace_pricing import build_marketplace_pricing_summary
 from shops.models import FavoriteShop, OpeningHours, Shop, ShopRating
 
 from .quote_serializers import (
@@ -41,6 +42,14 @@ from .quote_serializers import (
     ShopQuoteSummarySerializer,
     ShopQuoteUpdateSerializer,
 )
+
+
+def _serializer_marketplace_pricing(*, base_price, shop, currency: str = "KES") -> dict[str, object]:
+    return build_marketplace_pricing_summary(
+        base_price=base_price,
+        shop=shop,
+        currency=currency,
+    )
 
 from .validators import validate_shop_consistency
 
@@ -1299,6 +1308,10 @@ class PaperSerializer(serializers.ModelSerializer):
 class PrintingRateSerializer(serializers.ModelSerializer):
     """CRUD for machine printing rates (per-side print price + optional duplex override/surcharge)."""
 
+    base_price = serializers.DecimalField(source="single_price", max_digits=12, decimal_places=2, read_only=True)
+    client_price = serializers.SerializerMethodField()
+    pricing_breakdown = serializers.SerializerMethodField()
+
     class Meta:
         model = PrintingRate
         fields = [
@@ -1306,6 +1319,9 @@ class PrintingRateSerializer(serializers.ModelSerializer):
             "sheet_size",
             "color_mode",
             "single_price",
+            "base_price",
+            "client_price",
+            "pricing_breakdown",
             "double_price",
             "duplex_surcharge",
             "duplex_surcharge_enabled",
@@ -1313,6 +1329,18 @@ class PrintingRateSerializer(serializers.ModelSerializer):
             "is_active",
             "is_default",
         ]
+
+    def get_client_price(self, obj):
+        return self.get_pricing_breakdown(obj)["client_price"]
+
+    def get_pricing_breakdown(self, obj):
+        shop = getattr(getattr(obj, "machine", None), "shop", None)
+        currency = getattr(shop, "currency", "KES") or "KES"
+        return _serializer_marketplace_pricing(
+            base_price=obj.single_price,
+            shop=shop,
+            currency=currency,
+        )
 
     def validate(self, attrs):
         machine = self.context.get("machine")
@@ -1350,6 +1378,9 @@ class FinishingRateSerializer(serializers.ModelSerializer):
     charge_unit = StrictChoiceField(choices=ChargeUnit.choices, required=False)
     billing_basis = StrictChoiceField(choices=FinishingBillingBasis.choices, required=False)
     side_mode = StrictChoiceField(choices=FinishingSideMode.choices, required=False)
+    base_price = serializers.DecimalField(source="price", max_digits=12, decimal_places=2, read_only=True)
+    client_price = serializers.SerializerMethodField()
+    pricing_breakdown = serializers.SerializerMethodField()
 
     class Meta:
         model = FinishingRate
@@ -1363,6 +1394,9 @@ class FinishingRateSerializer(serializers.ModelSerializer):
             "billing_basis",
             "side_mode",
             "price",
+            "base_price",
+            "client_price",
+            "pricing_breakdown",
             "double_side_price",
             "setup_fee",
             "min_qty",
@@ -1372,6 +1406,18 @@ class FinishingRateSerializer(serializers.ModelSerializer):
             "help_text",
             "is_active",
         ]
+
+    def get_client_price(self, obj):
+        return self.get_pricing_breakdown(obj)["client_price"]
+
+    def get_pricing_breakdown(self, obj):
+        shop = getattr(obj, "shop", None)
+        currency = getattr(shop, "currency", "KES") or "KES"
+        return _serializer_marketplace_pricing(
+            base_price=obj.price,
+            shop=shop,
+            currency=currency,
+        )
 
     def _is_lamination(self, attrs, instance):
         name = (attrs.get("name", getattr(instance, "name", "")) or "").strip().lower()
@@ -1480,6 +1526,9 @@ class MaterialSerializer(serializers.ModelSerializer):
     """CRUD for shop materials."""
 
     production_size_detail = ProductionPaperSizeSerializer(source="production_size", read_only=True)
+    base_price = serializers.DecimalField(source="selling_price", max_digits=12, decimal_places=2, read_only=True)
+    client_price = serializers.SerializerMethodField()
+    pricing_breakdown = serializers.SerializerMethodField()
 
     class Meta:
         model = Material
@@ -1491,11 +1540,26 @@ class MaterialSerializer(serializers.ModelSerializer):
             "unit",
             "buying_price",
             "selling_price",
+            "base_price",
+            "client_price",
+            "pricing_breakdown",
             "print_price_per_sqm",
             "lead_in_mm",
             "lead_out_mm",
             "is_active",
         ]
+
+    def get_client_price(self, obj):
+        return self.get_pricing_breakdown(obj)["client_price"]
+
+    def get_pricing_breakdown(self, obj):
+        shop = getattr(obj, "shop", None)
+        currency = getattr(shop, "currency", "KES") or "KES"
+        return _serializer_marketplace_pricing(
+            base_price=obj.selling_price,
+            shop=shop,
+            currency=currency,
+        )
 
 
 class ProductImageUploadSerializer(serializers.ModelSerializer):

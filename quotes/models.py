@@ -149,6 +149,15 @@ class QuoteRequest(TimeStampedModel):
         verbose_name=_("created by"),
         help_text=_("User who created this quote request."),
     )
+    on_behalf_of = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="quotes_requested_for_me",
+        verbose_name=_("on behalf of"),
+        help_text=_("End client this request was created for when a partner submits on their behalf."),
+    )
     customer_name = models.CharField(
         max_length=255,
         default="",
@@ -345,6 +354,22 @@ class ShopQuote(TimeStampedModel):
         verbose_name=_("total"),
         help_text=_("Total price of the quote."),
     )
+    production_base_price = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    broker_margin_type = models.CharField(max_length=20, blank=True, default="")
+    broker_margin_value = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    broker_margin_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    platform_service_percent = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    platform_service_amount = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    client_total = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    sent_to_client_at = models.DateTimeField(null=True, blank=True)
+    sent_to_client_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="client_facing_shop_quotes",
+    )
+    client_quote_status = models.CharField(max_length=32, blank=True, default="")
     pricing_locked_at = models.DateTimeField(
         null=True,
         blank=True,

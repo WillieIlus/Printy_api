@@ -8,6 +8,7 @@ from django.db import OperationalError, ProgrammingError
 from rest_framework.exceptions import ValidationError
 
 from services.pricing.imposition import build_imposition_breakdown
+from services.pricing.marketplace_pricing import build_marketplace_pricing_summary, get_marketplace_margin_settings
 
 
 DEFAULT_PAPER_DEFINITIONS: list[dict[str, Any]] = [
@@ -152,10 +153,21 @@ def _resolve_finishing_definition(row: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _normalize_paper_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    input_rows = { _normalize_text(row.get("key")): row for row in (rows or []) if row.get("key") }
+    ordered_keys = [_normalize_text(row.get("key")) for row in (rows or []) if row.get("key")]
+    input_rows = {_normalize_text(row.get("key")): row for row in (rows or []) if row.get("key")}
+    ordered_definitions = [
+        PAPER_DEFINITION_BY_KEY[key]
+        for key in ordered_keys
+        if key in PAPER_DEFINITION_BY_KEY
+    ]
+    ordered_definitions.extend(
+        definition
+        for definition in DEFAULT_PAPER_DEFINITIONS
+        if definition["key"] not in input_rows
+    )
     normalized: list[dict[str, Any]] = []
 
-    for definition in DEFAULT_PAPER_DEFINITIONS:
+    for definition in ordered_definitions:
         row = input_rows.get(definition["key"])
         if row is None:
             # Re-add missing default as inactive
@@ -185,10 +197,21 @@ def _normalize_paper_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, A
 
 
 def _normalize_finishing_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    input_rows = { _normalize_text(row.get("key")): row for row in (rows or []) if row.get("key") }
+    ordered_keys = [_normalize_text(row.get("key")) for row in (rows or []) if row.get("key")]
+    input_rows = {_normalize_text(row.get("key")): row for row in (rows or []) if row.get("key")}
+    ordered_definitions = [
+        FINISHING_DEFINITION_BY_KEY[key]
+        for key in ordered_keys
+        if key in FINISHING_DEFINITION_BY_KEY
+    ]
+    ordered_definitions.extend(
+        definition
+        for definition in DEFAULT_FINISHING_DEFINITIONS
+        if definition["key"] not in input_rows
+    )
     normalized: list[dict[str, Any]] = []
 
-    for definition in DEFAULT_FINISHING_DEFINITIONS:
+    for definition in ordered_definitions:
         row = input_rows.get(definition["key"])
         if row is None:
             # Re-add missing default as inactive
@@ -401,6 +424,7 @@ def build_business_card_example(paper_rows: list[dict[str, Any]], finishing_rows
         cutting_total = _to_decimal(cutting.get("price"))
 
     estimated_total = print_total + lamination_total + cutting_total
+    marketplace_pricing = build_marketplace_pricing_summary(base_price=estimated_total)
     is_complete = not missing_fields
     return {
         "title": "Example: 100 business cards",
@@ -445,7 +469,10 @@ def build_business_card_example(paper_rows: list[dict[str, Any]], finishing_rows
                 "total": _decimal_string(cutting_total) if cutting is not None else None,
             },
         ],
-        "estimated_total": _decimal_string(estimated_total) if estimated_total > 0 else None,
+        "production_cost": _decimal_string(estimated_total) if estimated_total > 0 else None,
+        "client_price": marketplace_pricing["client_price"] if estimated_total > 0 else None,
+        "estimated_total": marketplace_pricing["client_price"] if estimated_total > 0 else None,
+        "pricing_breakdown": marketplace_pricing if estimated_total > 0 else None,
     }
 
 
@@ -500,6 +527,7 @@ def build_public_rate_card_builder_config() -> dict[str, Any]:
     paper_rows = _build_default_paper_rows()
     finishing_rows = _build_default_finishing_rows()
     summary = summarize_rate_card(paper_rows, finishing_rows)
+    pricing_settings = get_marketplace_margin_settings()
     return {
         "paper_rows": paper_rows,
         "finishing_rows": finishing_rows,
@@ -508,12 +536,19 @@ def build_public_rate_card_builder_config() -> dict[str, Any]:
         "market_guides": build_market_guides(paper_rows, finishing_rows),
         "example_quote": build_business_card_example(paper_rows, finishing_rows),
         "market_label": "Nairobi Market Guide",
+        "pricing_settings": {
+            "broker_margin_percent": _decimal_string(pricing_settings["broker_margin_percent"]),
+            "service_margin_percent": _decimal_string(pricing_settings["service_margin_percent"]),
+            "broker_margin_locked": pricing_settings["broker_margin_locked"],
+            "service_margin_locked": pricing_settings["service_margin_locked"],
+        },
     }
 
 
 def preview_public_rate_card_builder(*, paper_rows: list[dict[str, Any]], finishing_rows: list[dict[str, Any]]) -> dict[str, Any]:
     normalized_papers = _normalize_paper_rows(paper_rows)
     normalized_finishings = _normalize_finishing_rows(finishing_rows)
+    pricing_settings = get_marketplace_margin_settings()
     return {
         "paper_rows": normalized_papers,
         "finishing_rows": normalized_finishings,
@@ -521,6 +556,12 @@ def preview_public_rate_card_builder(*, paper_rows: list[dict[str, Any]], finish
         "market_guides": build_market_guides(normalized_papers, normalized_finishings),
         "example_quote": build_business_card_example(normalized_papers, normalized_finishings),
         "market_label": "Nairobi Market Guide",
+        "pricing_settings": {
+            "broker_margin_percent": _decimal_string(pricing_settings["broker_margin_percent"]),
+            "service_margin_percent": _decimal_string(pricing_settings["service_margin_percent"]),
+            "broker_margin_locked": pricing_settings["broker_margin_locked"],
+            "service_margin_locked": pricing_settings["service_margin_locked"],
+        },
     }
 
 
@@ -536,6 +577,7 @@ def build_shop_rate_card_setup(shop) -> dict[str, Any]:
             "location_area": getattr(shop, "service_area", "") or getattr(shop, "city", ""),
         }
     )
+    pricing_settings = get_marketplace_margin_settings(shop)
     return {
         "paper_rows": paper_rows,
         "finishing_rows": finishing_rows,
@@ -545,6 +587,12 @@ def build_shop_rate_card_setup(shop) -> dict[str, Any]:
         "example_quote": build_business_card_example(paper_rows, finishing_rows),
         "market_label": "Nairobi Market Guide",
         "completed": bool(saved.get("completed")),
+        "pricing_settings": {
+            "broker_margin_percent": _decimal_string(pricing_settings["broker_margin_percent"]),
+            "service_margin_percent": _decimal_string(pricing_settings["service_margin_percent"]),
+            "broker_margin_locked": pricing_settings["broker_margin_locked"],
+            "service_margin_locked": pricing_settings["service_margin_locked"],
+        },
     }
 
 
@@ -553,6 +601,7 @@ def save_shop_rate_card_setup(shop, *, paper_rows: list[dict[str, Any]], finishi
     normalized_finishings = _normalize_finishing_rows(finishing_rows)
     normalized_details = _normalize_shop_details(shop_details)
     summary = summarize_rate_card(normalized_papers, normalized_finishings)
+    pricing_settings = get_marketplace_margin_settings(shop)
 
     payload = {
         "paper_rows": normalized_papers,
@@ -563,6 +612,12 @@ def save_shop_rate_card_setup(shop, *, paper_rows: list[dict[str, Any]], finishi
         "example_quote": build_business_card_example(normalized_papers, normalized_finishings),
         "market_label": "Nairobi Market Guide",
         "completed": bool(completed),
+        "pricing_settings": {
+            "broker_margin_percent": _decimal_string(pricing_settings["broker_margin_percent"]),
+            "service_margin_percent": _decimal_string(pricing_settings["service_margin_percent"]),
+            "broker_margin_locked": pricing_settings["broker_margin_locked"],
+            "service_margin_locked": pricing_settings["service_margin_locked"],
+        },
     }
     shop.mvp_rate_card = payload
 

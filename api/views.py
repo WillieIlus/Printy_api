@@ -19,8 +19,9 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.serializers import ModelSerializer
 
-from accounts.models import UserProfile, UserSocialLink
+from accounts.models import User, UserProfile, UserSocialLink
 from accounts.serializers import UserSerializer, UserSocialLinkSerializer
+from accounts.services.roles import CANONICAL_PARTNER_ROLE, resolve_user_roles
 from accounts.services.roles import promote_to_shop_owner
 from catalog.models import Product
 from inventory.models import Machine, Paper
@@ -822,6 +823,7 @@ class QuoteDraftViewSet(viewsets.ViewSet):
     def active(self, request):
         shop_slug = request.query_params.get("shop")
         file_id = request.query_params.get("file")
+        client_id = request.query_params.get("client_id")
         company_name = request.query_params.get("company_name", "")
         if not shop_slug:
             return Response(
@@ -843,9 +845,12 @@ class QuoteDraftViewSet(viewsets.ViewSet):
             ).order_by("-created_at")
         )
         if not drafts:
+            if CANONICAL_PARTNER_ROLE in resolve_user_roles(user) and not client_id:
+                return Response({"detail": "client_id is required for partner quote requests."}, status=status.HTTP_400_BAD_REQUEST)
             draft = QuoteRequest.objects.create(
                 shop=shop,
                 created_by=user,
+                on_behalf_of=User.objects.filter(pk=client_id).first() if client_id else None,
                 status=QuoteStatus.DRAFT,
                 quote_draft_file=draft_file,
                 customer_name=draft_file.contact_name or draft_file.company_name,
@@ -854,6 +859,13 @@ class QuoteDraftViewSet(viewsets.ViewSet):
             )
         else:
             draft = drafts[0]
+            if CANONICAL_PARTNER_ROLE in resolve_user_roles(user) and draft.on_behalf_of_id is None and not client_id:
+                return Response({"detail": "client_id is required for partner quote requests."}, status=status.HTTP_400_BAD_REQUEST)
+            if client_id:
+                resolved_client = User.objects.filter(pk=client_id).first()
+                if resolved_client and draft.on_behalf_of_id != resolved_client.id:
+                    draft.on_behalf_of = resolved_client
+                    draft.save(update_fields=["on_behalf_of", "updated_at"])
             if draft.quote_draft_file_id is None:
                 draft.quote_draft_file = draft_file
                 draft.save(update_fields=["quote_draft_file", "updated_at"])

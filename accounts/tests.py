@@ -1,5 +1,6 @@
 from urllib.parse import parse_qs, urlparse
 
+from django.db import IntegrityError
 from django.core import mail
 from django.test import TestCase
 from django.test.utils import override_settings
@@ -7,8 +8,9 @@ from rest_framework.test import APIClient
 
 from allauth.account.models import EmailAddress
 
-from .models import User, UserProfile
+from .models import User, UserProfile, UserRole
 from .services.capabilities import get_account_capabilities
+from .services.roles import resolve_dashboard_role, resolve_user_roles
 from shops.models import Shop, ShopMembership
 
 
@@ -52,7 +54,7 @@ class AccountProfileAPITestCase(TestCase):
         self.assertEqual(self.user.first_name, "Amina")
         self.assertEqual(self.user.last_name, "Otieno")
         self.assertEqual(self.user.name, "Amina Otieno")
-        self.assertEqual(self.user.role, "shop_owner")
+        self.assertEqual(self.user.role, User.Role.PRODUCTION)
         self.assertEqual(self.user.preferred_language, "sw")
         self.assertEqual(profile.phone, "+254700000000")
         self.assertEqual(profile.city, "Westlands")
@@ -104,9 +106,9 @@ class AccountProfileAPITestCase(TestCase):
         Shop.objects.create(name="Role Sync Shop", slug="role-sync-shop", owner=self.user)
 
         self.user.refresh_from_db()
-        self.assertEqual(self.user.role, User.Role.SHOP_OWNER)
+        self.assertEqual(self.user.role, User.Role.PRODUCTION)
 
-    def test_active_membership_promotes_client_to_staff(self):
+    def test_active_membership_persists_production_role(self):
         owner = User.objects.create_user(
             email="owner2@test.com",
             password="pass12345",
@@ -122,7 +124,8 @@ class AccountProfileAPITestCase(TestCase):
         )
 
         self.user.refresh_from_db()
-        self.assertEqual(self.user.role, User.Role.STAFF)
+        self.assertEqual(self.user.role, User.Role.PRODUCTION)
+        self.assertEqual(resolve_user_roles(self.user), ["production", "client"])
 
     def test_users_me_exposes_capability_foundations(self):
         Shop.objects.create(name="Capability Shop", slug="capability-shop", owner=self.user)
@@ -134,9 +137,13 @@ class AccountProfileAPITestCase(TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["role"], User.Role.SHOP_OWNER)
         self.assertEqual(payload["partner_profile_enabled"], True)
         self.assertEqual(payload["capability_overrides"], {"can_receive_payouts": False})
+        self.assertEqual(payload["role"], "production")
+        self.assertEqual(payload["roles"], ["production", "partner", "client"])
+        self.assertEqual(payload["primary_role"], "production")
+        self.assertEqual(payload["home_route"], "/dashboard/production")
+        self.assertEqual(payload["dashboard_role"], "production")
         self.assertEqual(payload["capabilities"]["can_source_jobs"], True)
         self.assertEqual(payload["capabilities"]["can_manage_clients"], True)
         self.assertEqual(payload["capabilities"]["can_receive_payouts"], False)
@@ -153,6 +160,34 @@ class AccountProfileAPITestCase(TestCase):
         self.assertTrue(capabilities["can_receive_assignments"])
         self.assertTrue(capabilities["can_manage_production"])
         self.assertTrue(capabilities["can_receive_payouts"])
+        self.assertEqual(resolve_dashboard_role(self.user), "production")
+
+    def test_dashboard_role_resolution_prioritizes_partner_before_client(self):
+        self.user.role = User.Role.PARTNER
+        self.user.partner_profile_enabled = True
+        self.user.save(update_fields=["role", "partner_profile_enabled", "updated_at"])
+
+        self.assertEqual(resolve_dashboard_role(self.user), "partner")
+
+    def test_role_resolution_normalizes_legacy_aliases(self):
+        self.user.role = User.Role.BROKER
+        self.user.save(update_fields=["role", "updated_at"])
+        self.assertEqual(resolve_user_roles(self.user)[0], "partner")
+        self.assertIn("partner", resolve_user_roles(self.user))
+
+        self.user.role = User.Role.SHOP_OWNER
+        self.user.save(update_fields=["role", "updated_at"])
+        self.assertEqual(resolve_user_roles(self.user)[0], "production")
+        self.assertIn("production", resolve_user_roles(self.user))
+
+    def test_superuser_resolves_to_super_admin_home_route(self):
+        admin_user = User.objects.create_superuser(
+            email="super-admin@test.com",
+            password="pass12345",
+        )
+
+        self.assertEqual(resolve_user_roles(admin_user), ["super_admin"])
+        self.assertEqual(resolve_dashboard_role(admin_user), "super_admin")
 
 
 @override_settings(
@@ -173,6 +208,12 @@ class EmailVerificationFlowAPITestCase(TestCase):
                 return key
         self.fail("Could not extract confirmation key from email body.")
 
+    def _extract_link_with_key(self, message_body: str) -> str:
+        for token in message_body.split():
+            if "key=" in token:
+                return token.strip()
+        self.fail("Could not extract keyed link from email body.")
+
     def test_register_sends_verification_email_and_blocks_login_until_confirmed(self):
         register_response = self.client.post(
             "/api/auth/register/",
@@ -187,6 +228,11 @@ class EmailVerificationFlowAPITestCase(TestCase):
 
         self.assertEqual(register_response.status_code, 201)
         self.assertEqual(len(mail.outbox), 1)
+        confirmation_link = self._extract_link_with_key(mail.outbox[0].body)
+        parsed_confirmation = urlparse(confirmation_link)
+        self.assertEqual(parsed_confirmation.scheme, "https")
+        self.assertEqual(parsed_confirmation.netloc, "printy.ke")
+        self.assertEqual(parsed_confirmation.path, "/auth/confirm-email")
 
         email_address = EmailAddress.objects.get(email="new-user@test.com")
         self.assertFalse(email_address.verified)
@@ -199,6 +245,119 @@ class EmailVerificationFlowAPITestCase(TestCase):
 
         self.assertEqual(login_response.status_code, 400)
         self.assertIn("not verified", login_response.json()["message"].lower())
+
+    def test_client_signup_creates_client_role(self):
+        response = self.client.post(
+            "/api/auth/register/",
+            {
+                "email": "client-signup@test.com",
+                "password": "Pass12345",
+                "name": "Client Signup",
+                "role": "client",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="client-signup@test.com")
+        self.assertEqual(user.role, User.Role.CLIENT)
+        self.assertEqual(resolve_user_roles(user), ["client"])
+        self.assertEqual(list(user.user_roles.filter(is_active=True).values_list("role", flat=True)), ["client"])
+
+    def test_generic_signup_defaults_to_client_when_role_missing(self):
+        response = self.client.post(
+            "/api/auth/register/",
+            {
+                "email": "default-client@test.com",
+                "password": "Pass12345",
+                "name": "Default Client",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="default-client@test.com")
+        self.assertEqual(resolve_user_roles(user), ["client"])
+        self.assertEqual(user.user_roles.filter(role="client", is_active=True).count(), 1)
+
+    def test_partner_signup_creates_partner_role_not_client(self):
+        response = self.client.post(
+            "/api/auth/register/",
+            {
+                "email": "partner-signup@test.com",
+                "password": "Pass12345",
+                "name": "Partner Signup",
+                "role": "partner",
+                "partner_profile_enabled": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="partner-signup@test.com")
+        self.assertEqual(user.role, User.Role.PARTNER)
+        self.assertEqual(resolve_user_roles(user), ["partner"])
+        self.assertEqual(user.user_roles.filter(role="partner", is_active=True).count(), 1)
+
+    def test_production_signup_creates_production_role_not_client(self):
+        response = self.client.post(
+            "/api/auth/register/",
+            {
+                "email": "production-signup@test.com",
+                "password": "Pass12345",
+                "name": "Production Signup",
+                "role": "production",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="production-signup@test.com")
+        self.assertEqual(user.role, User.Role.PRODUCTION)
+        self.assertEqual(resolve_user_roles(user), ["production"])
+        self.assertEqual(user.user_roles.filter(role="production", is_active=True).count(), 1)
+
+    def test_dedicated_partner_signup_endpoint_assigns_partner(self):
+        response = self.client.post(
+            "/api/auth/register/partner/",
+            {
+                "email": "partner-dedicated@test.com",
+                "password": "Pass12345",
+                "name": "Partner Dedicated",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="partner-dedicated@test.com")
+        self.assertEqual(resolve_user_roles(user), ["partner"])
+        self.assertTrue(user.partner_profile_enabled)
+
+    def test_dedicated_production_signup_endpoint_assigns_production(self):
+        response = self.client.post(
+            "/api/auth/register/production/",
+            {
+                "email": "production-dedicated@test.com",
+                "password": "Pass12345",
+                "name": "Production Dedicated",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        user = User.objects.get(email="production-dedicated@test.com")
+        self.assertEqual(resolve_user_roles(user), ["production"])
+
+    def test_duplicate_active_user_role_is_not_created(self):
+        user = User.objects.create_user(
+            email="hybrid@test.com",
+            password="Pass12345",
+            name="Hybrid User",
+        )
+
+        self.assertEqual(UserRole.objects.filter(user=user, role="client").count(), 1)
+        with self.assertRaises(IntegrityError):
+            UserRole.objects.create(user=user, role="client", source="test-repeat")
 
     def test_resend_alias_and_confirm_alias_complete_verification_flow(self):
         self.client.post(
@@ -245,6 +404,81 @@ class EmailVerificationFlowAPITestCase(TestCase):
         self.assertEqual(login_response.status_code, 200)
         self.assertIn("access", login_response.json())
 
+    def test_partner_login_returns_partner_roles_and_home_route(self):
+        user = User.objects.create_user(
+            email="partner-login@test.com",
+            password="Pass12345",
+            name="Partner Login",
+            role=User.Role.PARTNER,
+            partner_profile_enabled=True,
+            is_active=True,
+        )
+        EmailAddress.objects.create(user=user, email=user.email, primary=True, verified=True)
+
+        response = self.client.post(
+            "/api/auth/token/",
+            {"email": user.email, "password": "Pass12345"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["user"]
+        self.assertEqual(payload["role"], "partner")
+        self.assertEqual(payload["roles"], ["partner"])
+        self.assertEqual(payload["primary_role"], "partner")
+        self.assertEqual(payload["home_route"], "/dashboard/partner")
+        self.assertEqual(payload["can_access_partner_dashboard"], True)
+        self.assertEqual(payload["can_access_client_dashboard"], False)
+
+    def test_production_login_returns_production_roles_and_home_route(self):
+        user = User.objects.create_user(
+            email="production-login@test.com",
+            password="Pass12345",
+            name="Production Login",
+            role=User.Role.PRODUCTION,
+            is_active=True,
+        )
+        EmailAddress.objects.create(user=user, email=user.email, primary=True, verified=True)
+
+        response = self.client.post(
+            "/api/auth/token/",
+            {"email": user.email, "password": "Pass12345"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["user"]
+        self.assertEqual(payload["role"], "production")
+        self.assertEqual(payload["roles"], ["production"])
+        self.assertEqual(payload["primary_role"], "production")
+        self.assertEqual(payload["home_route"], "/dashboard/production")
+        self.assertEqual(payload["can_access_production_dashboard"], True)
+        self.assertEqual(payload["can_access_client_dashboard"], False)
+
+    def test_super_admin_login_returns_admin_home_route_and_access_flags(self):
+        user = User.objects.create_superuser(
+            email="admin-login@test.com",
+            password="Pass12345",
+        )
+        EmailAddress.objects.create(user=user, email=user.email, primary=True, verified=True)
+
+        response = self.client.post(
+            "/api/auth/token/",
+            {"email": user.email, "password": "Pass12345"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["user"]
+        self.assertEqual(payload["role"], "super_admin")
+        self.assertEqual(payload["roles"], ["super_admin"])
+        self.assertEqual(payload["primary_role"], "super_admin")
+        self.assertEqual(payload["home_route"], "/dashboard/admin")
+        self.assertEqual(payload["can_access_admin_dashboard"], True)
+        self.assertEqual(payload["can_access_client_dashboard"], True)
+        self.assertEqual(payload["can_access_partner_dashboard"], True)
+        self.assertEqual(payload["can_access_production_dashboard"], True)
+
     def test_resend_for_missing_email_is_safe_and_does_not_leak(self):
         response = self.client.post(
             "/api/auth/email/resend/",
@@ -262,3 +496,86 @@ class EmailVerificationFlowAPITestCase(TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response["Content-Type"], "application/json")
         self.assertEqual(response.json()["code"], "NOT_FOUND")
+
+    def test_password_reset_flow_generates_frontend_link_and_accepts_new_password(self):
+        user = User.objects.create_user(
+            email="reset-me@test.com",
+            password="Pass12345",
+            name="Reset Me",
+            role="client",
+            is_active=True,
+        )
+        EmailAddress.objects.create(user=user, email=user.email, primary=True, verified=True)
+
+        request_response = self.client.post(
+            "/api/auth/password-reset/",
+            {"email": user.email},
+            format="json",
+        )
+
+        self.assertEqual(request_response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+
+        reset_link = self._extract_link_with_key(mail.outbox[0].body)
+        parsed_reset = urlparse(reset_link)
+        self.assertEqual(parsed_reset.scheme, "https")
+        self.assertEqual(parsed_reset.netloc, "printy.ke")
+        self.assertEqual(parsed_reset.path, "/auth/reset-password")
+        reset_key = parse_qs(parsed_reset.query).get("key", [None])[0]
+        self.assertTrue(reset_key)
+
+        confirm_response = self.client.post(
+            "/api/auth/password-reset/confirm/",
+            {"key": reset_key, "password": "NewPass12345"},
+            format="json",
+        )
+        self.assertEqual(confirm_response.status_code, 200)
+
+        login_response = self.client.post(
+            "/api/auth/token/",
+            {"email": user.email, "password": "NewPass12345"},
+            format="json",
+        )
+        self.assertEqual(login_response.status_code, 200)
+        self.assertIn("access", login_response.json())
+
+    def test_password_reset_email_is_printy_branded(self):
+        user = User.objects.create_user(
+            email="brand-reset@test.com",
+            password="Pass12345",
+            name="Brand Reset",
+            role="client",
+            is_active=True,
+        )
+        EmailAddress.objects.create(user=user, email=user.email, primary=True, verified=True)
+
+        response = self.client.post(
+            "/api/auth/password-reset/",
+            {"email": user.email},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        message = mail.outbox[0]
+        self.assertEqual(message.subject.strip(), "Reset your Printy password")
+        self.assertIn("Hello from Printy!", message.body)
+        self.assertIn("We received a request to reset the password for your Printy account.", message.body)
+        self.assertIn("Print work, clearer.", message.body)
+        self.assertNotIn("example.com", message.body)
+        self.assertNotIn("/accounts/signup/", message.body)
+        self.assertIn("https://printy.ke/auth/reset-password?key=", message.body)
+
+    def test_password_reset_for_unknown_email_returns_generic_success_without_sending_email(self):
+        response = self.client.post(
+            "/api/auth/password-reset/",
+            {"email": "missing-reset@test.com"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["detail"],
+            "If that email exists, a password reset link has been sent.",
+        )
+        self.assertEqual(len(mail.outbox), 0)

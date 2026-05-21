@@ -5,10 +5,12 @@ from unittest.mock import Mock, patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from accounts.models import User
 from artwork.models import UploadedArtwork
+from jobs.admin import JobRequestAdmin
 from jobs.file_services import (
     approve_job_proof,
     attach_uploaded_artwork_to_managed_job,
@@ -146,7 +148,7 @@ class JobRequestTokenSecurityTestCase(TestCase):
         r2 = self.client.post(f"/api/job-requests/{job_id}/whatsapp-share/", {}, format="json")
         self.assertEqual(r2.status_code, 200)
         url = r2.json()["public_view_url"]
-        token = url.split("/job/")[-1].rstrip("/")
+        token = url.split("/track-job/")[-1].rstrip("/")
         # Base64url: A-Za-z0-9_- only, typically 43 chars for 32 bytes
         self.assertTrue(re.match(r"^[A-Za-z0-9_-]{40,50}$", token), f"Token format invalid: {token!r}")
         self.assertGreaterEqual(len(token), 40)
@@ -167,7 +169,7 @@ class JobRequestTokenSecurityTestCase(TestCase):
                 {},
                 format="json",
             )
-            tokens.append(r2.json()["public_view_url"].split("/job/")[-1].rstrip("/"))
+            tokens.append(r2.json()["public_view_url"].split("/track-job/")[-1].rstrip("/"))
         # All tokens must be unique and not sequential
         self.assertEqual(len(set(tokens)), 3)
         for t in tokens:
@@ -188,7 +190,7 @@ class JobRequestTokenSecurityTestCase(TestCase):
         self.assertEqual(r.status_code, 201)
         job_id = r.json()["id"]
         r2 = self.client.post(f"/api/job-requests/{job_id}/whatsapp-share/", {}, format="json")
-        token = r2.json()["public_view_url"].split("/job/")[-1].rstrip("/")
+        token = r2.json()["public_view_url"].split("/track-job/")[-1].rstrip("/")
         # Public view — no auth
         r3 = self.client.get(f"/api/public/job/{token}/")
         self.assertEqual(r3.status_code, 200)
@@ -207,6 +209,22 @@ class JobRequestTokenSecurityTestCase(TestCase):
         """Invalid token returns 404."""
         r = self.client.get("/api/public/job/invalid-token-xyz/")
         self.assertEqual(r.status_code, 404)
+
+    @override_settings(FRONTEND_URL="https://printy.ke")
+    def test_admin_public_link_uses_track_job_route(self):
+        job = JobRequest.objects.create(
+            created_by=self.user,
+            title="Admin link job",
+            status=JobRequest.OPEN,
+            public_token="test-public-token",
+        )
+        admin_instance = JobRequestAdmin(JobRequest, None)
+
+        html = admin_instance.public_link(job)
+
+        self.assertIn("/track-job/test-public-token", str(html))
+        self.assertNotIn("/public/job/", str(html))
+        self.assertNotIn("/job/test-public-token", str(html))
 
 
 class JobClaimAPITestCase(TestCase):
@@ -705,12 +723,12 @@ class JobPaymentSettlementFoundationTestCase(TestCase):
             payer=self.client_user,
             payment_method="cash",
         )
-        self.assertEqual(payment.payment_status, "manual_payment_pending")
+        self.assertEqual(payment.payment_status, "pending")
 
         mark_payment_confirmed(job_payment=payment, raw_gateway_payload={"confirmed_by": "ops"})
         payment.refresh_from_db()
         self.managed_job.refresh_from_db()
-        self.assertEqual(payment.payment_status, "confirmed")
+        self.assertEqual(payment.payment_status, "paid")
         self.assertIsNotNone(payment.confirmed_at)
         self.assertEqual(self.managed_job.payment_status, "confirmed")
         self.assertEqual(self.managed_job.status, "payment_confirmed")
@@ -730,7 +748,7 @@ class JobPaymentSettlementFoundationTestCase(TestCase):
             payer=self.client_user,
             amount=Decimal("1600.00"),
             payment_method="mpesa",
-            payment_status="confirmed",
+            payment_status="paid",
             external_reference="PAY-123",
         )
         settlement = initialize_settlement_for_managed_job(managed_job=self.managed_job)
@@ -827,7 +845,7 @@ class JobPaymentSettlementFoundationTestCase(TestCase):
 
 @override_settings(
     MPESA_BASE_URL="https://sandbox.safaricom.co.ke",
-    MPESA_CALLBACK_URL="https://api.printy.ke/api/managed-jobs/payments/mpesa/callback/",
+    MPESA_CALLBACK_URL="https://api.printy.ke/api/payments/mpesa/callback/",
     MPESA_CONSUMER_KEY="test-key",
     MPESA_CONSUMER_SECRET="test-secret",
     MPESA_SHORTCODE="174379",
@@ -911,7 +929,7 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
         self.assertEqual(payment.account_reference, f"MJ-{self.managed_job.id}")
         self.assertEqual(payment.checkout_request_id, "ws_CO_123456789")
         self.assertEqual(payment.merchant_request_id, "29115-34620561-1")
-        self.assertEqual(payment.payment_status, "stk_push_sent")
+        self.assertEqual(payment.payment_status, "pending")
         self.assertEqual(payment.reconciliation_status, "pending")
         self.managed_job.refresh_from_db()
         self.assertEqual(self.managed_job.payment_status, "confirmation_pending")
@@ -939,6 +957,54 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
         self.assertEqual(first.json()["checkout_request_id"], "")
         self.assertEqual(second.json()["id"], first.json()["id"])
 
+    @patch("jobs.payment_services.requests.post")
+    @patch("jobs.payment_services.get_mpesa_token", return_value="test-token")
+    def test_stk_endpoint_ignores_lower_client_amount_and_uses_managed_job_client_total(self, _token, mock_post):
+        mock_post.return_value = self._stk_success_response()
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.post(
+            f"/api/managed-jobs/{self.managed_job.id}/payments/mpesa/stk-push/",
+            {"phone_number": "0712345678", "amount": "1200.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payment = JobPayment.objects.get(managed_job=self.managed_job)
+        self.assertEqual(payment.expected_amount, Decimal("2500.00"))
+        self.assertEqual(payment.amount, Decimal("2500.00"))
+
+    @patch("jobs.payment_services.requests.post")
+    @patch("jobs.payment_services.get_mpesa_token", return_value="test-token")
+    def test_stk_endpoint_ignores_higher_client_amount_and_uses_managed_job_client_total(self, _token, mock_post):
+        mock_post.return_value = self._stk_success_response()
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.post(
+            f"/api/managed-jobs/{self.managed_job.id}/payments/mpesa/stk-push/",
+            {"phone_number": "0712345678", "amount": "9999.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payment = JobPayment.objects.get(managed_job=self.managed_job)
+        self.assertEqual(payment.expected_amount, Decimal("2500.00"))
+        self.assertEqual(payment.amount, Decimal("2500.00"))
+
+    def test_stk_endpoint_rejects_missing_or_zero_client_total(self):
+        self.client.force_authenticate(user=self.client_user)
+        self.managed_job.client_total = Decimal("0.00")
+        self.managed_job.save(update_fields=["client_total", "updated_at"])
+
+        response = self.client.post(
+            f"/api/managed-jobs/{self.managed_job.id}/payments/mpesa/stk-push/",
+            {"phone_number": "0712345678"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Job pricing is not finalised. Cannot initiate payment.")
+
     def test_stk_callback_confirms_payment_and_updates_managed_job(self):
         payment = create_job_payment(
             managed_job=self.managed_job,
@@ -953,15 +1019,15 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
         )
         payment.checkout_request_id = "ws_CO_123456789"
         payment.merchant_request_id = "29115-34620561-1"
-        payment.payment_status = "stk_push_sent"
+        payment.payment_status = "pending"
         payment.save(update_fields=["checkout_request_id", "merchant_request_id", "payment_status", "updated_at"])
 
-        response = self.client.post("/api/managed-jobs/payments/mpesa/callback/", self._stk_callback_payload(), format="json")
+        response = self.client.post("/api/payments/mpesa/callback/", self._stk_callback_payload(), format="json")
         payment.refresh_from_db()
         self.managed_job.refresh_from_db()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payment.payment_status, "confirmed")
+        self.assertEqual(payment.payment_status, "paid")
         self.assertEqual(payment.reconciliation_status, "confirmed")
         self.assertEqual(payment.mpesa_receipt_number, "TIH8QNX7PY")
         self.assertEqual(str(payment.received_amount), "2500.00")
@@ -979,17 +1045,17 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
             account_reference=f"MJ-{self.managed_job.id}",
         )
         payment.checkout_request_id = "ws_CO_123456789"
-        payment.payment_status = "stk_push_sent"
+        payment.payment_status = "pending"
         payment.save(update_fields=["checkout_request_id", "payment_status", "updated_at"])
 
         payload = self._stk_callback_payload()
-        first = self.client.post("/api/managed-jobs/payments/mpesa/callback/", payload, format="json")
-        second = self.client.post("/api/managed-jobs/payments/mpesa/callback/", payload, format="json")
+        first = self.client.post("/api/payments/mpesa/callback/", payload, format="json")
+        second = self.client.post("/api/payments/mpesa/callback/", payload, format="json")
         payment.refresh_from_db()
 
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 200)
-        self.assertEqual(payment.payment_status, "confirmed")
+        self.assertEqual(payment.payment_status, "paid")
         self.assertEqual(payment.mpesa_receipt_number, "TIH8QNX7PY")
 
     def test_manual_paybill_confirmation_matches_by_account_reference(self):
@@ -1004,7 +1070,7 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
         )
 
         response = self.client.post(
-            "/api/managed-jobs/payments/mpesa/callback/",
+            "/api/payments/mpesa/callback/",
             self._c2b_payload(account_reference=payment.account_reference),
             format="json",
         )
@@ -1012,7 +1078,7 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
         self.managed_job.refresh_from_db()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payment.payment_status, "confirmed")
+        self.assertEqual(payment.payment_status, "paid")
         self.assertEqual(payment.payment_channel, "paybill_manual")
         self.assertEqual(self.managed_job.payment_status, "confirmed")
 
@@ -1028,7 +1094,7 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
         )
 
         response = self.client.post(
-            "/api/managed-jobs/payments/mpesa/callback/",
+            "/api/payments/mpesa/callback/",
             self._c2b_payload(amount="2000.00", account_reference=payment.account_reference, receipt="QWE12346"),
             format="json",
         )
@@ -1036,13 +1102,13 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
         self.managed_job.refresh_from_db()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payment.payment_status, "confirmation_pending")
+        self.assertEqual(payment.payment_status, "needs_review")
         self.assertEqual(payment.reconciliation_status, "amount_mismatch")
         self.assertEqual(self.managed_job.payment_status, "pending")
 
     def test_unknown_account_reference_is_acknowledged_without_matching_payment(self):
         response = self.client.post(
-            "/api/managed-jobs/payments/mpesa/callback/",
+            "/api/payments/mpesa/callback/",
             self._c2b_payload(account_reference="MJ-UNKNOWN"),
             format="json",
         )
@@ -1062,14 +1128,14 @@ class ManagedJobMpesaHardeningTestCase(TestCase):
             account_reference=f"MJ-{self.managed_job.id}",
         )
         payment.checkout_request_id = "ws_CO_123456789"
-        payment.payment_status = "stk_push_sent"
+        payment.payment_status = "pending"
         payment.save(update_fields=["checkout_request_id", "payment_status", "updated_at"])
 
         reconcile_job_payment_status(job_payment=payment)
         payment.refresh_from_db()
         self.managed_job.refresh_from_db()
 
-        self.assertEqual(payment.payment_status, "confirmed")
+        self.assertEqual(payment.payment_status, "paid")
         self.assertEqual(payment.reconciliation_status, "confirmed")
         self.assertEqual(self.managed_job.payment_status, "confirmed")
 
@@ -1409,6 +1475,60 @@ class ManagedJobVisibilityEndpointsTestCase(TestCase):
         self.client.force_authenticate(user=self.other_client)
         other_response = self.client.get(f"/api/managed-jobs/{self.managed_job.id}/events/")
         self.assertEqual(other_response.status_code, 403)
+
+
+class ManagedJobPublicTrackingTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client_user = User.objects.create_user(email="tracking-client@test.com", password="pass12345", role="client")
+        self.partner = User.objects.create_user(email="tracking-partner@test.com", password="pass12345", role="partner")
+        self.owner = User.objects.create_user(email="tracking-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Tracking Shop", slug="tracking-shop", is_active=True, phone_number="+254700000111")
+        self.customer = Customer.objects.create(shop=self.shop, name="Tracking Customer", email="tracking-client@test.com")
+        self.quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.client_user,
+            on_behalf_of=self.client_user,
+            customer=self.customer,
+            customer_name="Tracking Customer",
+            customer_email="tracking-client@test.com",
+            status=QuoteStatus.CLOSED,
+        )
+        self.shop_quote = ShopQuote.objects.create(
+            quote_request=self.quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.ACCEPTED,
+            total=Decimal("2000.00"),
+            estimated_ready_at=timezone.now(),
+        )
+        self.managed_job = ManagedJob.objects.create(
+            title="Managed tracked job",
+            source_quote_request=self.quote_request,
+            source_shop_quote=self.shop_quote,
+            client=self.client_user,
+            customer=self.customer,
+            broker=self.partner,
+            assigned_shop=self.shop,
+            created_by=self.client_user,
+            status="in_production",
+            client_total=Decimal("2600.00"),
+            production_total=Decimal("2000.00"),
+            platform_fee=Decimal("300.00"),
+            broker_commission=Decimal("300.00"),
+        )
+
+    def test_public_tracking_endpoint_hides_private_shop_and_pricing_fields(self):
+        response = self.client.get(f"/api/public/managed-jobs/track/{self.managed_job.tracking_token}/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("job_status", payload)
+        self.assertIn("partner_name", payload)
+        self.assertNotIn("shop_name", payload)
+        self.assertNotIn("base_price", payload)
+        self.assertNotIn("production_total", payload)
+        self.assertNotIn("broker_commission", payload)
 
 
 class ManagedJobUrgencyFoundationTestCase(TestCase):

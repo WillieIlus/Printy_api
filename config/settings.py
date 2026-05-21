@@ -6,6 +6,7 @@ import os
 import logging
 from pathlib import Path
 from datetime import timedelta
+from decimal import Decimal
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
@@ -43,6 +44,25 @@ def _log_env_presence(*names):
         f"{name}={'set' if os.environ.get(name) else 'missing'}" for name in names
     )
     logger.warning("Environment variable presence: %s", presence)
+
+
+LOCAL_HOST_TOKENS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]", "testserver"}
+
+
+def _is_placeholder_secret(value):
+    if not value:
+        return True
+    lowered = value.strip().lower()
+    return lowered.startswith("replace-with") or lowered in {
+        "changeme",
+        "change-me",
+        "secret",
+        "your-secret-key",
+    }
+
+
+def _contains_production_host(values):
+    return any(item.lower() not in LOCAL_HOST_TOKENS for item in values)
 
 
 SECRET_KEY = _get_env(
@@ -106,7 +126,7 @@ SITE_ID = 1
 # REST Framework
 # =============================================================================
 
-# JWT-only (no SessionAuth): cross-site SPA (Netlify/printy.ke) ↔ API. No CSRF for API.
+# JWT-only (no SessionAuth): cross-site SPA (printy.ke) to API. No CSRF for API.
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
@@ -164,11 +184,12 @@ ACCOUNT_USER_MODEL_USERNAME_FIELD = None
 ACCOUNT_EMAIL_VERIFICATION = os.environ.get("ACCOUNT_EMAIL_VERIFICATION", "mandatory")
 ACCOUNT_EMAIL_SUBJECT_PREFIX = ""
 ACCOUNT_CONFIRM_EMAIL_ON_GET = True
+ACCOUNT_EMAIL_UNKNOWN_ACCOUNTS = os.environ.get("ACCOUNT_EMAIL_UNKNOWN_ACCOUNTS", "false").lower() in ("1", "true", "yes")
 ACCOUNT_DEFAULT_HTTP_PROTOCOL = "http" if DEBUG else "https"
 ACCOUNT_ADAPTER = "accounts.adapters.AccountAdapter"
 
 SITE_DOMAIN = os.environ.get("SITE_DOMAIN", "localhost:8000" if DEBUG else "printy.ke")
-SITE_NAME = os.environ.get("SITE_NAME", "Printyke")
+SITE_NAME = os.environ.get("SITE_NAME", "Printy")
 
 # OAuth: set GOOGLE_* / GITHUB_* env vars, or use SocialApp in Django admin.
 SOCIALACCOUNT_PROVIDERS = {
@@ -211,17 +232,38 @@ DEFAULT_FROM_EMAIL = os.environ.get(
 SERVER_EMAIL = DEFAULT_FROM_EMAIL
 ADMIN_NOTIFY_EMAIL = os.environ.get("ADMIN_NOTIFY_EMAIL", "hello.printyke@gmail.com")
 
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 
-if not DEBUG and "localhost" in FRONTEND_URL:
-    import warnings
-    warnings.warn(
-        f"FRONTEND_URL is set to '{FRONTEND_URL}' but DEBUG=False. "
-        "Production emails will contain localhost links. "
-        "Set FRONTEND_URL=https://printy.ke in your environment.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
+if not DEBUG:
+    if _is_placeholder_secret(SECRET_KEY):
+        raise ImproperlyConfigured(
+            "SECRET_KEY must be replaced with a real secret when DEBUG=False."
+        )
+    if not ALLOWED_HOSTS or not _contains_production_host(ALLOWED_HOSTS):
+        raise ImproperlyConfigured(
+            "ALLOWED_HOSTS must include the real production hosts when DEBUG=False."
+        )
+    if not CSRF_TRUSTED_ORIGINS or not all(
+        origin.startswith("https://") for origin in CSRF_TRUSTED_ORIGINS
+    ):
+        raise ImproperlyConfigured(
+            "CSRF_TRUSTED_ORIGINS must contain HTTPS origins when DEBUG=False."
+        )
+    if not CORS_ALLOWED_ORIGINS or not all(
+        origin.startswith("https://") for origin in CORS_ALLOWED_ORIGINS
+    ):
+        raise ImproperlyConfigured(
+            "CORS_ALLOWED_ORIGINS must contain HTTPS origins when DEBUG=False."
+        )
+    parsed_frontend_url = FRONTEND_URL.lower()
+    if not parsed_frontend_url or "localhost" in parsed_frontend_url or "127.0.0.1" in parsed_frontend_url:
+        raise ImproperlyConfigured(
+            "FRONTEND_URL must point to the real frontend domain when DEBUG=False."
+        )
+    if not parsed_frontend_url.startswith("https://"):
+        raise ImproperlyConfigured(
+            "FRONTEND_URL must use HTTPS when DEBUG=False."
+        )
 
 EMAIL_CONFIRMATION_URL = f"{FRONTEND_URL}/auth/confirm-email"
 PASSWORD_RESET_URL = f"{FRONTEND_URL}/auth/reset-password"
@@ -267,6 +309,9 @@ if not DEBUG:
     SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "true").lower() in ("1", "true", "yes")
     CSRF_COOKIE_SECURE = os.environ.get("CSRF_COOKIE_SECURE", "true").lower() in ("1", "true", "yes")
     SECURE_SSL_REDIRECT = os.environ.get("SECURE_SSL_REDIRECT", "true").lower() in ("1", "true", "yes")
+    SECURE_HSTS_SECONDS = int(os.environ.get("SECURE_HSTS_SECONDS", "31536000"))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = os.environ.get("SECURE_HSTS_INCLUDE_SUBDOMAINS", "true").lower() in ("1", "true", "yes")
+    SECURE_HSTS_PRELOAD = os.environ.get("SECURE_HSTS_PRELOAD", "false").lower() in ("1", "true", "yes")
     # Trust X-Forwarded-Proto from nginx/reverse proxy
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
@@ -308,13 +353,22 @@ MPESA_TRANSACTION_DESC_DEFAULT = _get_env(
     fallback_names=("MPESA_TRANSACTION_DESC",),
     default="Printy payment",
 )
+PRINTY_PLATFORM_FEE_RATE = Decimal(str(_get_env("PRINTY_PLATFORM_FEE_RATE", default="0.30")))
 
-if MPESA_ENV == "production" and MPESA_CALLBACK_URL:
+if MPESA_ENV == "production":
     parsed_callback = MPESA_CALLBACK_URL.lower()
+    if not parsed_callback:
+        raise ImproperlyConfigured(
+            "MPESA_CALLBACK_URL must be set when MPESA_ENV='production'."
+        )
     if not parsed_callback.startswith("https://"):
-        logger.warning("MPESA_CALLBACK_URL should use HTTPS in production.")
+        raise ImproperlyConfigured(
+            "MPESA_CALLBACK_URL must use HTTPS when MPESA_ENV='production'."
+        )
     if "localhost" in parsed_callback or "127.0.0.1" in parsed_callback:
-        logger.warning("MPESA_CALLBACK_URL points to localhost; production callbacks will fail.")
+        raise ImproperlyConfigured(
+            "MPESA_CALLBACK_URL cannot point to localhost when MPESA_ENV='production'."
+        )
 
 # =============================================================================
 # Subscription (legacy)

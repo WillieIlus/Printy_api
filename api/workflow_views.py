@@ -10,7 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.services.capabilities import has_capability
-from accounts.services.roles import is_client
+from accounts.services.roles import CANONICAL_PARTNER_ROLE, is_client, resolve_user_roles
 from .visibility import CLIENT_ACTOR, TOPOLOGY_MANAGED, project_identity
 from notifications.models import Notification
 from notifications.services import notify_quote_event
@@ -86,6 +86,13 @@ from .workflow_serializers import (
 from .public_matching_serializers import PublicCalculatorResponseSerializer
 
 logger = logging.getLogger("api.workflow")
+
+
+def _partner_quote_client_error():
+    return Response(
+        {"detail": "client_id is required for partner quote requests."},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
 
 
 def _broadcast_group_requests(quote_request: QuoteRequest):
@@ -682,11 +689,14 @@ class QuoteDraftSendView(APIView):
         draft = get_object_or_404(QuoteDraft, pk=pk, user=request.user)
         serializer = QuoteDraftSendSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        request_details_snapshot = serializer.validated_data.get("request_details_snapshot") or {}
+        if CANONICAL_PARTNER_ROLE in resolve_user_roles(request.user) and not request_details_snapshot.get("client_id"):
+            return _partner_quote_client_error()
         try:
             quote_requests = send_quote_draft_to_shops(
                 draft=draft,
                 shops=list(serializer.validated_data["shops"]),
-                request_details_snapshot=serializer.validated_data.get("request_details_snapshot"),
+                request_details_snapshot=request_details_snapshot,
             )
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -720,10 +730,13 @@ class PartnerQuoteCreateView(APIView):
             return Response({"detail": "You cannot create partner quotes."}, status=status.HTTP_403_FORBIDDEN)
         serializer = PartnerQuoteCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if serializer.validated_data.get("client_user") is None:
+            return _partner_quote_client_error()
         try:
             payload = create_partner_quote(
                 partner_user=request.user,
                 shop=serializer.validated_data["shop"],
+                client_user=serializer.validated_data.get("client_user"),
                 client_name=serializer.validated_data.get("client_name", ""),
                 client_email=serializer.validated_data.get("client_email", ""),
                 client_phone=serializer.validated_data.get("client_phone", ""),
@@ -1103,7 +1116,7 @@ class ClientResponseListView(APIView):
 
     def get(self, request):
         responses = ShopQuote.objects.filter(
-            quote_request__created_by=request.user,
+            Q(quote_request__created_by=request.user) | Q(quote_request__on_behalf_of=request.user),
         ).exclude(
             status=ShopQuoteStatus.PENDING,
         ).select_related(
@@ -1119,9 +1132,10 @@ class ClientResponseAcceptView(APIView):
 
     def post(self, request, response_id):
         shop_quote = get_object_or_404(
-            ShopQuote.objects.select_related("quote_request", "shop", "shop__owner"),
+            ShopQuote.objects.select_related("quote_request", "shop", "shop__owner").filter(
+                Q(quote_request__created_by=request.user) | Q(quote_request__on_behalf_of=request.user)
+            ),
             pk=response_id,
-            quote_request__created_by=request.user,
         )
         if shop_quote.status not in (ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED, ShopQuoteStatus.MODIFIED):
             return Response({"detail": "Only sent or revised quotes can be accepted."}, status=status.HTTP_400_BAD_REQUEST)
@@ -1217,11 +1231,6 @@ class ClientResponseAcceptView(APIView):
                 shop_quote=shop_quote,
                 accepted_by=request.user,
             )
-            create_assignment_for_managed_job(
-                managed_job=managed_job,
-                shop_quote=shop_quote,
-            )
-
         if shop_quote.shop.owner_id and shop_quote.shop.owner_id != request.user.id:
             notify_quote_event(
                 recipient=shop_quote.shop.owner,
@@ -1248,9 +1257,10 @@ class ClientResponseRejectView(APIView):
 
     def post(self, request, response_id):
         shop_quote = get_object_or_404(
-            ShopQuote.objects.select_related("quote_request", "shop", "shop__owner"),
+            ShopQuote.objects.select_related("quote_request", "shop", "shop__owner").filter(
+                Q(quote_request__created_by=request.user) | Q(quote_request__on_behalf_of=request.user)
+            ),
             pk=response_id,
-            quote_request__created_by=request.user,
         )
         serializer = ClientResponseRejectSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1307,9 +1317,10 @@ class ClientResponseReplyView(APIView):
 
     def post(self, request, response_id):
         shop_quote = get_object_or_404(
-            ShopQuote.objects.select_related("quote_request", "shop", "shop__owner"),
+            ShopQuote.objects.select_related("quote_request", "shop", "shop__owner").filter(
+                Q(quote_request__created_by=request.user) | Q(quote_request__on_behalf_of=request.user)
+            ),
             pk=response_id,
-            quote_request__created_by=request.user,
         )
         serializer = ClientResponseReplySerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

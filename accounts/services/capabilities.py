@@ -5,6 +5,11 @@ from __future__ import annotations
 from typing import Iterable
 
 from accounts.models import User
+from accounts.services.roles import (
+    CANONICAL_PARTNER_ROLE,
+    CANONICAL_PRODUCTION_ROLE,
+    resolve_user_roles,
+)
 
 CAPABILITY_KEYS = (
     "can_manage_clients",
@@ -21,46 +26,21 @@ def _coerce_bool(value) -> bool | None:
     return None
 
 
-def _owned_shop_count(user: User) -> int:
-    if not user or not getattr(user, "is_authenticated", False):
-        return 0
-    owned_shops = getattr(user, "owned_shops", None)
-    if owned_shops is None:
-        return 0
-    try:
-        return owned_shops.count()
-    except Exception:
-        return 0
-
-
-def _has_active_shop_membership(user: User) -> bool:
-    if not user or not getattr(user, "is_authenticated", False):
-        return False
-    memberships = getattr(user, "shop_memberships", None)
-    if memberships is None:
-        return False
-    try:
-        return memberships.filter(is_active=True).exists()
-    except Exception:
-        return False
-
-
 def base_capabilities_for_user(user: User) -> dict[str, bool]:
     """Resolve additive capabilities from the current legacy role shape."""
     if not user or not getattr(user, "is_authenticated", False):
         return {key: False for key in CAPABILITY_KEYS}
 
-    owns_shop = _owned_shop_count(user) > 0
-    has_membership = _has_active_shop_membership(user)
-    is_broker = getattr(user, "role", None) == User.Role.BROKER
-    partner_enabled = bool(getattr(user, "partner_profile_enabled", False)) or is_broker
-    platform_staff = bool(getattr(user, "is_staff", False))
+    roles = set(resolve_user_roles(user))
+    is_partner = CANONICAL_PARTNER_ROLE in roles
+    is_production = CANONICAL_PRODUCTION_ROLE in roles
+    platform_staff = bool(getattr(user, "is_staff", False) or getattr(user, "is_superuser", False))
 
-    can_receive_assignments = owns_shop or has_membership or platform_staff
-    can_manage_production = owns_shop or has_membership or platform_staff
-    can_receive_payouts = owns_shop or partner_enabled or platform_staff
-    can_source_jobs = owns_shop or partner_enabled or platform_staff
-    can_manage_clients = owns_shop or partner_enabled or platform_staff
+    can_receive_assignments = is_production or platform_staff
+    can_manage_production = is_production or platform_staff
+    can_receive_payouts = is_partner or is_production or platform_staff
+    can_source_jobs = is_partner or is_production or platform_staff
+    can_manage_clients = is_partner or is_production or platform_staff
 
     return {
         "can_manage_clients": can_manage_clients,

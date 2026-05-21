@@ -2,6 +2,9 @@ import logging
 import os
 
 import requests as http_requests
+from django.contrib.auth import get_user_model
+from allauth.account.forms import ResetPasswordForm, ResetPasswordKeyForm, UserTokenForm
+from allauth.account.internal.flows.password_reset import finalize_password_reset
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -10,7 +13,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .models import User
-from .services.capabilities import get_account_capabilities
+from .services.roles import assign_role, get_public_assignable_roles, normalize_role_value
 from .serializers import CustomTokenObtainPairSerializer, UserCreateSerializer, UserSerializer
 
 
@@ -35,6 +38,30 @@ class RegisterView(generics.CreateAPIView):
 
     permission_classes = [AllowAny]
     serializer_class = UserCreateSerializer
+
+    default_role = User.Role.CLIENT
+    role_source = "signup"
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["default_role"] = self.default_role
+        context["role_source"] = self.role_source
+        return context
+
+
+class ClientRegisterView(RegisterView):
+    default_role = User.Role.CLIENT
+    role_source = "signup_client"
+
+
+class PartnerRegisterView(RegisterView):
+    default_role = User.Role.PARTNER
+    role_source = "signup_partner"
+
+
+class ProductionRegisterView(RegisterView):
+    default_role = User.Role.PRODUCTION
+    role_source = "signup_production"
 
 
 class CustomTokenObtainPairView(TokenObtainPairView):
@@ -135,6 +162,68 @@ class ResendEmailConfirmationView(APIView):
         )
 
 
+class PasswordResetRequestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        form = ResetPasswordForm(data={"email": request.data.get("email", "")})
+        if not form.is_valid():
+            return Response(form.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        form.save(request)
+        return Response(
+            {
+                "detail": "If that email exists, a password reset link has been sent.",
+            }
+        )
+
+
+class PasswordResetConfirmView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        opaque_key = str(request.data.get("key", "")).strip()
+        password = str(request.data.get("password", "")).strip()
+
+        if not opaque_key or not password:
+            return Response(
+                {"detail": "key and password are required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if "-" not in opaque_key:
+            return Response(
+                {"detail": "Invalid password reset key."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        uidb36, temp_key = opaque_key.split("-", 1)
+        token_form = UserTokenForm(data={"uidb36": uidb36, "key": temp_key})
+        if not token_form.is_valid():
+            return Response(
+                {"detail": "Invalid or expired password reset key."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reset_form = ResetPasswordKeyForm(
+            data={"password1": password, "password2": password},
+            user=token_form.reset_user,
+            temp_key=temp_key,
+        )
+        if not reset_form.is_valid():
+            errors = []
+            for field_errors in reset_form.errors.values():
+                errors.extend(field_errors)
+            return Response(
+                {"detail": " ".join(errors) or "Password reset failed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        reset_form.save()
+        finalize_password_reset(request, token_form.reset_user, email=getattr(token_form.reset_user, "email", None))
+        return Response({"detail": "Password reset successful."})
+
+
 class GoogleSocialLoginView(APIView):
     """
     Verify a Google ID token and return JWT tokens for the user.
@@ -177,9 +266,8 @@ class GoogleSocialLoginView(APIView):
         given_name = google_data.get("given_name", "")
         family_name = google_data.get("family_name", "")
         google_sub = google_data.get("sub", "")
-        role = (request.data.get("role") or "client").strip()
-        if role not in ("client", "shop_owner"):
-            role = "client"
+        requested_role = normalize_role_value((request.data.get("role") or "client").strip()) or User.Role.CLIENT
+        role = requested_role if requested_role in get_public_assignable_roles() else User.Role.CLIENT
         partner_profile_enabled = bool(request.data.get("partner_profile_enabled", False))
 
         user, created = User.objects.get_or_create(
@@ -197,6 +285,10 @@ class GoogleSocialLoginView(APIView):
         if not created and not user.name and name:
             user.name = name
             user.save(update_fields=["name", "updated_at"] if hasattr(user, "updated_at") else ["name"])
+        if role == User.Role.PARTNER and not user.partner_profile_enabled:
+            user.partner_profile_enabled = True
+            user.save(update_fields=["partner_profile_enabled", "updated_at"] if hasattr(user, "updated_at") else ["partner_profile_enabled"])
+        assign_role(user, role, source="google_social_login")
 
         from allauth.account.models import EmailAddress
         EmailAddress.objects.get_or_create(
@@ -221,14 +313,6 @@ class GoogleSocialLoginView(APIView):
             {
                 "access": str(refresh.access_token),
                 "refresh": str(refresh),
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "name": user.name or name,
-                    "role": user.role,
-                    "partner_profile_enabled": user.partner_profile_enabled,
-                    "capabilities": get_account_capabilities(user),
-                    "is_email_verified": True,
-                },
+                "user": UserSerializer(user).data,
             }
         )

@@ -1,10 +1,7 @@
 """Subscription and payment API views."""
 import logging
-from datetime import date, timedelta
 
 from django.shortcuts import get_object_or_404
-from django.utils.decorators import method_decorator
-from django.views.decorators.csrf import csrf_exempt
 from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -14,7 +11,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet
 from api.permissions import IsShopOwner
 from shops.models import Shop
 
-from .models import MpesaStkRequest, Payment, Subscription, SubscriptionPlan
+from .models import MpesaStkRequest, Subscription, SubscriptionPlan
 from .serializers import StkPushSerializer, SubscriptionPlanSerializer, SubscriptionSerializer
 from .services.mpesa import initiate_stk_push, normalize_phone
 
@@ -118,90 +115,3 @@ class MpesaStkPushView(APIView):
             "message": "Payment request sent. Complete on your phone.",
         })
 
-
-@method_decorator(csrf_exempt, name="dispatch")
-class MpesaCallbackView(APIView):
-    """POST /api/payments/mpesa/callback/ — Daraja STK callback (no auth)."""
-
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
-    def post(self, request):
-        payload = request.data
-        logger.info("M-Pesa callback received: %s", payload)
-
-        body = payload.get("Body", {})
-        stk_callback = body.get("stkCallback", {})
-        checkout_id = stk_callback.get("CheckoutRequestID")
-        result_code = stk_callback.get("ResultCode")
-        result_desc = stk_callback.get("ResultDesc", "")
-
-        if not checkout_id:
-            logger.warning("Callback missing CheckoutRequestID")
-            return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
-
-        try:
-            stk_req = MpesaStkRequest.objects.select_related("shop", "plan").get(
-                checkout_request_id=checkout_id
-            )
-        except MpesaStkRequest.DoesNotExist:
-            logger.warning("Unknown CheckoutRequestID: %s", checkout_id)
-            return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
-
-        # Idempotency: already processed
-        if stk_req.status == MpesaStkRequest.SUCCESS:
-            return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
-
-        stk_req.raw_callback_payload = payload
-        stk_req.save(update_fields=["raw_callback_payload"])
-
-        if result_code != 0:
-            stk_req.status = MpesaStkRequest.FAILED
-            stk_req.save(update_fields=["status"])
-            return Response({"ResultCode": 0, "ResultDesc": "Accepted"})
-
-        # Extract receipt
-        callback_metadata = stk_callback.get("CallbackMetadata", {})
-        metadata_list = callback_metadata.get("Item", [])
-        receipt = ""
-        for item in metadata_list:
-            if item.get("Name") == "MpesaReceiptNumber":
-                receipt = str(item.get("Value", ""))
-                break
-
-        stk_req.receipt_number = receipt
-        stk_req.status = MpesaStkRequest.SUCCESS
-        stk_req.save(update_fields=["receipt_number", "status"])
-
-        # Activate subscription
-        sub, _ = Subscription.objects.get_or_create(
-            shop=stk_req.shop,
-            defaults={"status": Subscription.TRIAL},
-        )
-        plan = stk_req.plan
-        today = date.today()
-        period_days = plan.days_in_period()
-        period_end = today + timedelta(days=period_days)
-
-        sub.plan = plan
-        sub.status = Subscription.ACTIVE
-        sub.period_start = today
-        sub.period_end = period_end
-        sub.next_billing_date = period_end
-        sub.last_payment_date = today
-        sub.save()
-
-        Payment.objects.create(
-            subscription=sub,
-            amount=stk_req.amount,
-            method=Payment.MPESA_C2B,
-            status=Payment.COMPLETED,
-            receipt_number=receipt,
-            phone=stk_req.phone,
-            request_id=checkout_id,
-            period_start=today,
-            period_end=period_end,
-            metadata={"stk_request_id": stk_req.id},
-        )
-
-        return Response({"ResultCode": 0, "ResultDesc": "Accepted"})

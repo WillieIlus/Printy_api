@@ -302,7 +302,7 @@ class InitiateStkPushServiceTest(TestCase):
 
         mock_config.return_value = {
             "base_url": "https://sandbox.safaricom.co.ke",
-            "callback_url": "https://example.com/api/billing/mpesa/callback/",
+            "callback_url": "https://example.com/api/payments/mpesa/callback/",
             "consumer_key": "key",
             "consumer_secret": "secret",
             "shortcode": "174379",

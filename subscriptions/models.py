@@ -5,6 +5,7 @@ from django.conf import settings
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
+from common.payment_constants import PaymentStatus
 from shops.models import Shop
 
 
@@ -109,14 +110,10 @@ class Subscription(models.Model):
 class MpesaStkRequest(models.Model):
     """M-Pesa STK push request — tracks init and callback."""
 
-    INITIATED = "INITIATED"
-    SUCCESS = "SUCCESS"
-    FAILED = "FAILED"
-    STATUS_CHOICES = [
-        (INITIATED, "Initiated"),
-        (SUCCESS, "Success"),
-        (FAILED, "Failed"),
-    ]
+    INITIATED = PaymentStatus.INITIATED
+    SUCCESS = PaymentStatus.PAID
+    FAILED = PaymentStatus.FAILED
+    STATUS_CHOICES = PaymentStatus.choices
 
     shop = models.ForeignKey(
         Shop,

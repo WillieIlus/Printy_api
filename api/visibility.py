@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from accounts.services.roles import (
+    CANONICAL_PARTNER_ROLE,
+    CANONICAL_PRODUCTION_ROLE,
+    CANONICAL_SUPER_ADMIN_ROLE,
+    resolve_user_roles,
+)
+
 
 PUBLIC_ACTOR = "public"
 CLIENT_ACTOR = "client"
@@ -26,12 +33,12 @@ def resolve_actor(user: Any) -> str:
     """Resolve actor string from user object."""
     if not user or not getattr(user, "is_authenticated", False):
         return PUBLIC_ACTOR
-    if getattr(user, "is_staff", False):
+    roles = set(resolve_user_roles(user))
+    if CANONICAL_SUPER_ADMIN_ROLE in roles or getattr(user, "is_staff", False):
         return OPS_ACTOR
-    role = getattr(user, "role", CLIENT_ACTOR)
-    if role == "shop_owner":
+    if CANONICAL_PRODUCTION_ROLE in roles:
         return SHOP_ACTOR
-    if role == "broker":
+    if CANONICAL_PARTNER_ROLE in roles:
         return PARTNER_ACTOR
     return CLIENT_ACTOR
 
@@ -191,6 +198,49 @@ def project_production_intelligence(preview: dict[str, Any] | None) -> dict[str,
     )
 
 
+def project_public_preview(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    preview = _as_dict(payload)
+    if not preview:
+        return None
+    projected = _copy_keys(
+        preview,
+        (
+            "quote_type",
+            "product_type",
+            "size_label",
+            "quantity",
+            "normalized_pages",
+            "blank_pages_added",
+            "blanks_added",
+            "input_pages",
+            "cover_pages",
+            "insert_pages",
+            "cover_sheets",
+            "insert_sheets",
+            "matched_stock",
+            "warnings",
+            "explanations",
+        ),
+    )
+    production_preview = project_production_intelligence(preview)
+    if production_preview:
+        projected["production_preview"] = production_preview
+    pricing_breakdown = _copy_keys(
+        _as_dict(preview.get("pricing")),
+        (
+            "method",
+            "charged_area_m2",
+            "charged_length_m",
+            "minimum_charge",
+            "minimum_charge_applied",
+            "rate",
+        ),
+    )
+    if pricing_breakdown:
+        projected["pricing_breakdown"] = pricing_breakdown
+    return projected or None
+
+
 def project_pricing_breakdown(payload: dict[str, Any] | None, *, actor: str) -> dict[str, Any] | None:
     breakdown = _as_dict(payload)
     if not breakdown:
@@ -215,6 +265,20 @@ def project_pricing_breakdown(payload: dict[str, Any] | None, *, actor: str) -> 
             if isinstance(line, dict)
         ]
         return projected
+
+    if actor == PUBLIC_ACTOR:
+        return _copy_keys(
+            breakdown,
+            (
+                "currency",
+                "method",
+                "charged_area_m2",
+                "charged_length_m",
+                "minimum_charge",
+                "minimum_charge_applied",
+                "lines",
+            ),
+        )
 
     return None
 
@@ -291,6 +355,14 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
     for match in raw_matches:
         if not isinstance(match, dict):
             continue
+        projected_preview = project_public_preview(match.get("preview")) or {}
+        selection = _as_dict(match.get("selection"))
+        if selection.get("paper_label"):
+            projected_preview["selected_paper_label"] = selection.get("paper_label")
+        if selection.get("cover_paper_label"):
+            projected_preview["selected_cover_paper_label"] = selection.get("cover_paper_label")
+        if selection.get("insert_paper_label"):
+            projected_preview["selected_insert_paper_label"] = selection.get("insert_paper_label")
         projected = project_match_summary(
             match,
             actor=PUBLIC_ACTOR,
@@ -304,6 +376,7 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
                 "shop_name": match.get("shop_name"),
                 "slug": match.get("slug"),
                 "shop_slug": match.get("shop_slug"),
+                "preview": projected_preview or None,
             }
         )
         projected_matches.append(projected)

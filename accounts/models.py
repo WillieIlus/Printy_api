@@ -2,10 +2,34 @@
 User model for Printy API.
 Email as USERNAME_FIELD for allauth compatibility.
 """
+from decimal import Decimal
+
+from django.conf import settings
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
 
 from common.models import TimeStampedModel
+
+
+def _canonical_role_for_storage(value: str | None) -> str | None:
+    mapping = {
+        "super_admin": "super_admin",
+        "admin": "super_admin",
+        "superuser": "super_admin",
+        "staff": "super_admin",
+        "client": "client",
+        "customer": "client",
+        "buyer": "client",
+        "partner": "partner",
+        "broker": "partner",
+        "production": "production",
+        "shop_owner": "production",
+        "printer": "production",
+        "production_shop": "production",
+    }
+    if not value:
+        return None
+    return mapping.get(str(value).strip().lower())
 
 
 class UserManager(BaseUserManager):
@@ -18,11 +42,19 @@ class UserManager(BaseUserManager):
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
         user.save(using=self._db)
+        canonical_role = _canonical_role_for_storage(getattr(user, "role", None))
+        if canonical_role and hasattr(user, "user_roles"):
+            UserRole.objects.get_or_create(
+                user=user,
+                role=canonical_role,
+                defaults={"is_active": True, "source": "manager_create_user"},
+            )
         return user
 
     def create_superuser(self, email, password=None, **extra_fields):
         extra_fields.setdefault("is_staff", True)
         extra_fields.setdefault("is_superuser", True)
+        extra_fields.setdefault("role", "super_admin")
         if extra_fields.get("is_staff") is not True:
             raise ValueError("Superuser must have is_staff=True.")
         if extra_fields.get("is_superuser") is not True:
@@ -37,9 +69,14 @@ class User(AbstractUser, TimeStampedModel):
     """
 
     class Role(models.TextChoices):
+        SUPER_ADMIN = "super_admin", "Super Admin"
+        ADMIN = "admin", "Admin"
         CLIENT = "client", "Client"
+        PARTNER = "partner", "Partner"
+        PRODUCTION = "production", "Production"
         BROKER = "broker", "Broker"
         SHOP_OWNER = "shop_owner", "Shop Owner"
+        PRINTER = "printer", "Printer"
         STAFF = "staff", "Staff"
 
     username = models.CharField(max_length=150, blank=True, null=True)
@@ -88,11 +125,11 @@ class User(AbstractUser, TimeStampedModel):
 
     @property
     def is_broker_role(self) -> bool:
-        return self.role == self.Role.BROKER
+        return self.role in {self.Role.BROKER, self.Role.PARTNER}
 
     @property
     def is_shop_owner_role(self) -> bool:
-        return self.role == self.Role.SHOP_OWNER
+        return self.role in {self.Role.SHOP_OWNER, self.Role.PRODUCTION, self.Role.PRINTER}
 
     @property
     def is_staff_role(self) -> bool:
@@ -100,7 +137,44 @@ class User(AbstractUser, TimeStampedModel):
 
     @property
     def is_hybrid_partner_account(self) -> bool:
-        return bool(self.partner_profile_enabled and self.role in {self.Role.SHOP_OWNER, self.Role.STAFF, self.Role.BROKER})
+        return bool(self.partner_profile_enabled and self.role in {self.Role.SHOP_OWNER, self.Role.PRODUCTION, self.Role.PRINTER, self.Role.STAFF, self.Role.BROKER, self.Role.PARTNER})
+
+
+class UserRole(TimeStampedModel):
+    """Persisted additive role assignments for hybrid dashboard access."""
+
+    class Role(models.TextChoices):
+        CLIENT = "client", "Client"
+        PARTNER = "partner", "Partner"
+        PRODUCTION = "production", "Production"
+        SUPER_ADMIN = "super_admin", "Super Admin"
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="user_roles",
+    )
+    role = models.CharField(max_length=20, choices=Role.choices)
+    is_active = models.BooleanField(default=True)
+    source = models.CharField(max_length=64, blank=True, default="")
+    assigned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_user_roles",
+    )
+
+    class Meta:
+        verbose_name = "User role"
+        verbose_name_plural = "User roles"
+        ordering = ["user_id", "role", "id"]
+        constraints = [
+            models.UniqueConstraint(fields=["user", "role"], name="accounts_userrole_unique_user_role"),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id}:{self.role}"
 
 
 class UserProfile(TimeStampedModel):
@@ -119,6 +193,7 @@ class UserProfile(TimeStampedModel):
     state = models.CharField(max_length=100, blank=True, default="")
     country = models.CharField(max_length=100, blank=True, default="")
     postal_code = models.CharField(max_length=20, blank=True, default="")
+    default_markup_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.30"))
 
     class Meta:
         verbose_name = "User profile"

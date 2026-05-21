@@ -29,6 +29,7 @@ from jobs.choices import (
     JobPaymentChannel,
     JobPaymentMethod,
     JobPaymentReconciliationStatus,
+    LEGACY_JOB_PAYMENT_STATUS_ALIASES,
     JobPaymentStatus,
     JobSettlementStatus,
     ManagedJobPaymentStatus,
@@ -36,6 +37,9 @@ from jobs.choices import (
 )
 from jobs.models import JobPayment, JobSettlementSplit, ManagedJob
 import requests
+
+DEFAULT_PARTNER_MARKUP_RATE = Decimal("0.30")
+DEFAULT_PLATFORM_FEE_RATE = Decimal("0.30")
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -55,6 +59,42 @@ def _string(value: Any, default: str = "") -> str:
     if value in (None, ""):
         return default
     return str(value)
+
+
+def _quantized_percent(value: Any, default: Decimal) -> Decimal:
+    return _money(value if value not in (None, "") else default).quantize(Decimal("0.01"))
+
+
+def _rate_to_percent(rate: Decimal) -> Decimal:
+    return (rate * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def get_default_platform_fee_rate() -> Decimal:
+    configured = getattr(settings, "PRINTY_PLATFORM_FEE_RATE", DEFAULT_PLATFORM_FEE_RATE)
+    return _money(configured, default=str(DEFAULT_PLATFORM_FEE_RATE)).quantize(Decimal("0.01"))
+
+
+def get_default_platform_service_percent() -> Decimal:
+    return _rate_to_percent(get_default_platform_fee_rate())
+
+
+def get_default_partner_markup_rate(*, partner_user=None, partner_profile=None) -> Decimal:
+    profile = partner_profile or getattr(partner_user, "profile", None)
+    configured = getattr(profile, "default_markup_rate", DEFAULT_PARTNER_MARKUP_RATE)
+    return _money(configured, default=str(DEFAULT_PARTNER_MARKUP_RATE)).quantize(Decimal("0.01"))
+
+
+def get_default_partner_markup_percent(*, partner_user=None, partner_profile=None) -> Decimal:
+    return _rate_to_percent(
+        get_default_partner_markup_rate(partner_user=partner_user, partner_profile=partner_profile)
+    )
+
+
+def _canonical_job_payment_status(value: str | None) -> str:
+    normalized = _string(value).strip().lower()
+    if not normalized:
+        return JobPaymentStatus.PENDING
+    return LEGACY_JOB_PAYMENT_STATUS_ALIASES.get(normalized, normalized)
 
 
 def generate_job_account_reference(*, managed_job: ManagedJob) -> str:
@@ -80,10 +120,10 @@ def _infer_channel(payment_method: str) -> str:
 
 def _map_job_result_code_to_status(result_code: str) -> str:
     if result_code == "0":
-        return JobPaymentStatus.CONFIRMED
-    if result_code in {"1037", "1019", "1025"}:
-        return JobPaymentStatus.FAILED
+        return JobPaymentStatus.PAID
     if result_code in {"1032"}:
+        return JobPaymentStatus.CANCELLED
+    if result_code in {"1037", "1019", "1025"}:
         return JobPaymentStatus.FAILED
     return JobPaymentStatus.FAILED
 
@@ -207,6 +247,52 @@ def _allocate_urgency_premium(*, managed_job: ManagedJob, urgency_total: Decimal
     }
 
 
+def calculate_partner_job_split(
+    base_price: Decimal | int | float | str,
+    broker_margin_percent: Decimal | int | float | str | None = None,
+    platform_service_percent: Decimal | int | float | str | None = None,
+    broker_assigned: bool = True,
+    absorb_unused_broker_slot: bool = True,
+    shop_owns_client_directly: bool = False,
+    partner_user=None,
+    partner_profile=None,
+) -> dict[str, Decimal]:
+    production_amount = _money(base_price)
+    default_broker_percent = get_default_partner_markup_percent(
+        partner_user=partner_user,
+        partner_profile=partner_profile,
+    )
+    default_platform_percent = get_default_platform_service_percent()
+    broker_override_supplied = broker_margin_percent not in (None, "")
+    broker_requested_percent = _quantized_percent(broker_margin_percent, default_broker_percent)
+    broker_percent = broker_requested_percent
+    platform_percent = _quantized_percent(platform_service_percent, default_platform_percent)
+
+    if shop_owns_client_directly:
+        broker_percent = Decimal("0.00")
+    elif not broker_assigned:
+        unused_broker_percent = (
+            broker_requested_percent
+            if broker_override_supplied and broker_requested_percent > 0
+            else default_broker_percent
+        )
+        broker_percent = Decimal("0.00")
+        if absorb_unused_broker_slot:
+            platform_percent = (platform_percent + unused_broker_percent).quantize(Decimal("0.01"))
+
+    broker_amount = (production_amount * broker_percent / Decimal("100")).quantize(Decimal("0.01"))
+    platform_amount = (production_amount * platform_percent / Decimal("100")).quantize(Decimal("0.01"))
+    client_total = production_amount + broker_amount + platform_amount
+    return {
+        "production_amount": production_amount,
+        "broker_margin_percent": broker_percent,
+        "broker_margin_amount": broker_amount,
+        "platform_service_percent": platform_percent,
+        "platform_service_amount": platform_amount,
+        "client_total": client_total.quantize(Decimal("0.01")),
+    }
+
+
 def calculate_settlement_split(*, managed_job: ManagedJob, payment_method: str | None = None) -> dict[str, Any]:
     client_total = _money(managed_job.client_total)
     production_amount = _extract_production_amount(managed_job)
@@ -310,7 +396,7 @@ def create_job_payment(
     raw_gateway_payload: dict[str, Any] | None = None,
 ) -> JobPayment:
     payment_channel = payment_channel or _infer_channel(payment_method)
-    payment_status = JobPaymentStatus.MANUAL_PAYMENT_PENDING if payment_method == JobPaymentMethod.CASH else JobPaymentStatus.PENDING
+    payment_status = JobPaymentStatus.PENDING
     final_amount = amount if amount is not None else _money(managed_job.client_total)
     payment = JobPayment.objects.create(
         managed_job=managed_job,
@@ -336,8 +422,8 @@ def mark_payment_confirmed(
     job_payment: JobPayment,
     raw_gateway_payload: dict[str, Any] | None = None,
 ) -> JobPayment:
-    if job_payment.payment_status != JobPaymentStatus.CONFIRMED:
-        job_payment.payment_status = JobPaymentStatus.CONFIRMED
+    if _canonical_job_payment_status(job_payment.payment_status) != JobPaymentStatus.PAID:
+        job_payment.payment_status = JobPaymentStatus.PAID
         job_payment.reconciliation_status = JobPaymentReconciliationStatus.CONFIRMED
         job_payment.confirmed_at = timezone.now()
         if raw_gateway_payload is not None:
@@ -414,9 +500,9 @@ def initiate_job_stk_push(
     amount: Decimal | None = None,
 ) -> JobPayment:
     phone_normalized = normalize_phone_number(phone_number)
-    amount_decimal = _money(amount if amount is not None else managed_job.client_total)
+    amount_decimal = _money(managed_job.client_total)
     if amount_decimal <= 0:
-        raise ValueError("STK push amount must be greater than zero.")
+        raise ValueError("Job pricing is not finalised. Cannot initiate payment.")
 
     existing = JobPayment.objects.select_for_update().filter(
         managed_job=managed_job,
@@ -426,9 +512,8 @@ def initiate_job_stk_push(
         expected_amount=amount_decimal,
         payer_phone=phone_normalized,
         payment_status__in=[
+            JobPaymentStatus.INITIATED,
             JobPaymentStatus.PENDING,
-            JobPaymentStatus.STK_PUSH_SENT,
-            JobPaymentStatus.CONFIRMATION_PENDING,
         ],
     ).order_by("-created_at").first()
     if existing and existing.checkout_request_id:
@@ -466,7 +551,7 @@ def initiate_job_stk_push(
     payment.account_reference = account_reference
     payment.external_reference = account_reference
     payment.raw_gateway_payload = payload
-    payment.payment_status = JobPaymentStatus.PENDING
+    payment.payment_status = JobPaymentStatus.INITIATED
     payment.reconciliation_status = JobPaymentReconciliationStatus.PENDING
     payment.save(update_fields=[
         "account_reference",
@@ -490,12 +575,12 @@ def initiate_job_stk_push(
         "response": response_payload,
     }
     payment.payment_status = (
-        JobPaymentStatus.STK_PUSH_SENT if _string(response_payload.get("ResponseCode")) == "0"
+        JobPaymentStatus.PENDING if _string(response_payload.get("ResponseCode")) == "0"
         else JobPaymentStatus.FAILED
     )
     payment.reconciliation_status = (
         JobPaymentReconciliationStatus.PENDING
-        if payment.payment_status == JobPaymentStatus.STK_PUSH_SENT
+        if payment.payment_status == JobPaymentStatus.PENDING
         else JobPaymentReconciliationStatus.FAILED
     )
     payment.save(update_fields=[
@@ -537,119 +622,8 @@ def reconcile_job_payment_status(*, job_payment: JobPayment) -> dict[str, Any]:
     return response_payload
 
 
-@transaction.atomic
-def handle_job_mpesa_callback(*, payload: dict[str, Any]) -> dict[str, str]:
-    if verify_callback_minimally(payload):
-        parsed = parse_callback(payload)
-        payment = None
-        if parsed.get("checkout_request_id"):
-            payment = JobPayment.objects.select_for_update().filter(
-                checkout_request_id=parsed["checkout_request_id"]
-            ).first()
-        if payment is None and parsed.get("merchant_request_id"):
-            payment = JobPayment.objects.select_for_update().filter(
-                merchant_request_id=parsed["merchant_request_id"]
-            ).first()
-        if payment is None:
-            return {"status": "ok", "message": "Payment not found but acknowledged"}
+def handle_job_mpesa_callback(payload: dict[str, Any]) -> dict[str, str]:
+    """Compatibility wrapper for the shared M-Pesa callback entry point."""
+    from billing.services.callbacks import handle_mpesa_callback
 
-        if payment.payment_status == JobPaymentStatus.CONFIRMED:
-            payment.reconciliation_status = JobPaymentReconciliationStatus.DUPLICATE_CALLBACK
-            payment.save(update_fields=["reconciliation_status", "updated_at"])
-            return {"status": "ok", "message": "Already processed"}
-
-        duplicate = _find_duplicate_receipt(payment=payment, receipt=_string(parsed.get("mpesa_receipt_number")))
-        if duplicate is not None:
-            payment.reconciliation_status = JobPaymentReconciliationStatus.DUPLICATE_RECEIPT
-            payment.payment_status = JobPaymentStatus.FAILED
-            payment.callback_payload = payload
-            payment.save(update_fields=["reconciliation_status", "payment_status", "callback_payload", "updated_at"])
-            return {"status": "ok", "message": "Duplicate receipt acknowledged"}
-
-        payment.callback_payload = payload
-        payment.reconciliation_status = JobPaymentReconciliationStatus.CALLBACK_RECEIVED
-        payment.checkout_request_id = parsed.get("checkout_request_id", "") or payment.checkout_request_id
-        payment.merchant_request_id = parsed.get("merchant_request_id", "") or payment.merchant_request_id
-        payment.payer_phone = _string(parsed.get("phone_number"), payment.payer_phone)[:20]
-        payment.mpesa_receipt_number = _string(parsed.get("mpesa_receipt_number"))[:50]
-        payment.received_amount = parsed.get("amount")
-        payment.payment_status = (
-            JobPaymentStatus.CONFIRMATION_PENDING if parsed.get("success") else JobPaymentStatus.FAILED
-        )
-        payment.save(update_fields=[
-            "callback_payload",
-            "reconciliation_status",
-            "checkout_request_id",
-            "merchant_request_id",
-            "payer_phone",
-            "mpesa_receipt_number",
-            "received_amount",
-            "payment_status",
-            "updated_at",
-        ])
-
-        expected_amount = payment.expected_amount or payment.amount
-        received_amount = payment.received_amount
-        if parsed.get("success") and received_amount == expected_amount:
-            mark_payment_confirmed(job_payment=payment, raw_gateway_payload={"stk_callback": payload})
-            return {"status": "ok", "message": "Processed"}
-        if parsed.get("success"):
-            payment.reconciliation_status = JobPaymentReconciliationStatus.AMOUNT_MISMATCH
-            payment.payment_status = JobPaymentStatus.CONFIRMATION_PENDING
-            payment.save(update_fields=["reconciliation_status", "payment_status", "updated_at"])
-            return {"status": "ok", "message": "Amount mismatch acknowledged"}
-        payment.reconciliation_status = JobPaymentReconciliationStatus.FAILED
-        payment.save(update_fields=["reconciliation_status", "updated_at"])
-        return {"status": "ok", "message": "Failed callback acknowledged"}
-
-    parsed_c2b = _parse_c2b_callback(payload)
-    if not parsed_c2b:
-        return {"status": "error", "message": "Invalid callback structure"}
-
-    payment = JobPayment.objects.select_for_update().filter(
-        account_reference=parsed_c2b["account_reference"]
-    ).order_by("-created_at").first()
-    if payment is None:
-        return {"status": "ok", "message": "Unknown account reference acknowledged"}
-
-    if payment.payment_status == JobPaymentStatus.CONFIRMED and payment.mpesa_receipt_number == parsed_c2b["mpesa_receipt_number"]:
-        payment.reconciliation_status = JobPaymentReconciliationStatus.DUPLICATE_CALLBACK
-        payment.save(update_fields=["reconciliation_status", "updated_at"])
-        return {"status": "ok", "message": "Already processed"}
-
-    duplicate = _find_duplicate_receipt(payment=payment, receipt=parsed_c2b["mpesa_receipt_number"])
-    if duplicate is not None:
-        payment.reconciliation_status = JobPaymentReconciliationStatus.DUPLICATE_RECEIPT
-        payment.payment_status = JobPaymentStatus.FAILED
-        payment.callback_payload = parsed_c2b["raw_payload"]
-        payment.save(update_fields=["reconciliation_status", "payment_status", "callback_payload", "updated_at"])
-        return {"status": "ok", "message": "Duplicate receipt acknowledged"}
-
-    payment.payment_channel = JobPaymentChannel.PAYBILL_MANUAL
-    payment.payment_method = JobPaymentMethod.MPESA
-    payment.payment_status = JobPaymentStatus.CONFIRMATION_PENDING
-    payment.reconciliation_status = JobPaymentReconciliationStatus.CALLBACK_RECEIVED
-    payment.callback_payload = parsed_c2b["raw_payload"]
-    payment.mpesa_receipt_number = parsed_c2b["mpesa_receipt_number"][:50]
-    payment.payer_phone = parsed_c2b["payer_phone"][:20]
-    payment.received_amount = parsed_c2b["received_amount"]
-    payment.save(update_fields=[
-        "payment_channel",
-        "payment_method",
-        "payment_status",
-        "reconciliation_status",
-        "callback_payload",
-        "mpesa_receipt_number",
-        "payer_phone",
-        "received_amount",
-        "updated_at",
-    ])
-
-    expected_amount = payment.expected_amount or payment.amount
-    if payment.received_amount == expected_amount:
-        mark_payment_confirmed(job_payment=payment, raw_gateway_payload={"paybill_callback": parsed_c2b["raw_payload"]})
-        return {"status": "ok", "message": "Processed"}
-
-    payment.reconciliation_status = JobPaymentReconciliationStatus.AMOUNT_MISMATCH
-    payment.save(update_fields=["reconciliation_status", "updated_at"])
-    return {"status": "ok", "message": "Amount mismatch acknowledged"}
+    return handle_mpesa_callback(payload)

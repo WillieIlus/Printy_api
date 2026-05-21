@@ -15,7 +15,7 @@ def _safe_email_error(exc: Exception) -> str:
 
 
 def _frontend_base_url() -> str:
-    return getattr(settings, "FRONTEND_URL", "http://localhost:3000").rstrip("/")
+    return getattr(settings, "FRONTEND_URL", "").rstrip("/")
 
 
 def _default_action_url(*, quote_request, shop_quote=None, recipient_role: str) -> str:

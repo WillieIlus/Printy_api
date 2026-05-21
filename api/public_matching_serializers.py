@@ -242,6 +242,12 @@ class PricingBreakdownLineSerializer(serializers.Serializer):
 
 class PricingBreakdownSerializer(serializers.Serializer):
     currency = serializers.CharField(default="KES")
+    base_price = serializers.FloatField(required=False, allow_null=True)
+    broker_margin_percent = serializers.FloatField(required=False, allow_null=True)
+    broker_margin_amount = serializers.FloatField(required=False, allow_null=True)
+    service_margin_percent = serializers.FloatField(required=False, allow_null=True)
+    service_margin_amount = serializers.FloatField(required=False, allow_null=True)
+    client_price = serializers.FloatField(required=False, allow_null=True)
     paper_price = serializers.FloatField(required=False, allow_null=True)
     print_price_front = serializers.FloatField(required=False, allow_null=True)
     print_price_back = serializers.FloatField(required=False, allow_null=True)

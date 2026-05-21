@@ -12,11 +12,18 @@ from pricing.models import FinishingRate, Material, PrintingRate
 from api.visibility import project_public_marketplace_response
 from services.pricing.engine import calculate_sheet_pricing
 from services.pricing.large_format import calculate_large_format_preview
+from services.pricing.marketplace_pricing import apply_marketplace_pricing_to_preview
 from quotes.turnaround import derive_product_turnaround_hours, estimate_turnaround, humanize_working_hours
 from shops.models import Shop
 
 
 MAX_MARKETPLACE_MATCHES = 3
+
+
+def _apply_marketplace_pricing(shop: Shop, preview: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(preview, dict):
+        return preview
+    return apply_marketplace_pricing_to_preview(preview, shop=shop)
 
 
 def recompute_shop_match_readiness(shop: Shop) -> bool:
@@ -326,7 +333,7 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
                 payload=payload,
             )
 
-        result = calculate_large_format_preview(
+        result = _apply_marketplace_pricing(shop, calculate_large_format_preview(
             shop=shop,
             product_subtype=payload.get("product_subtype") or "banner",
             quantity=payload["quantity"],
@@ -335,7 +342,7 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
             material=material,
             finishing_selections=finishing_selections,
             turnaround_hours=payload.get("turnaround_hours"),
-        )
+        ))
         return _attach_turnaround(shop, _build_shop_row(
             shop,
             can_calculate=True,
@@ -376,7 +383,7 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
             payload=payload,
         )
 
-    result = calculate_sheet_pricing(
+    result = _apply_marketplace_pricing(shop, calculate_sheet_pricing(
         shop=shop,
         product=product,
         quantity=payload["quantity"],
@@ -388,7 +395,7 @@ def _preview_catalog_for_shop(shop: Shop, product: Product, payload: dict[str, A
         finishing_selections=finishing_selections,
         width_mm=int(payload.get("width_mm") or product.default_finished_width_mm or 0),
         height_mm=int(payload.get("height_mm") or product.default_finished_height_mm or 0),
-    ).to_dict()
+    ).to_dict())
 
     return _attach_turnaround(shop, _build_shop_row(
         shop,
@@ -439,7 +446,7 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any], product_match:
                 payload=payload,
             )
 
-        result = calculate_large_format_preview(
+        result = _apply_marketplace_pricing(shop, calculate_large_format_preview(
             shop=shop,
             product_subtype=payload.get("product_subtype") or "banner",
             quantity=payload["quantity"],
@@ -448,7 +455,7 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any], product_match:
             material=material,
             finishing_selections=finishing_selections,
             turnaround_hours=payload.get("turnaround_hours"),
-        )
+        ))
         return _attach_turnaround(shop, _build_shop_row(
             shop,
             can_calculate=True,
@@ -498,7 +505,7 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any], product_match:
                 payload=payload,
             )
 
-    result = calculate_sheet_pricing(
+    result = _apply_marketplace_pricing(shop, calculate_sheet_pricing(
         shop=shop,
         product=None,
         quantity=payload["quantity"],
@@ -510,7 +517,7 @@ def _preview_custom_for_shop(shop: Shop, payload: dict[str, Any], product_match:
         finishing_selections=finishing_selections,
         width_mm=width_mm,
         height_mm=height_mm,
-    ).to_dict()
+    ).to_dict())
 
     return _attach_turnaround(shop, _build_shop_row(
         shop,
@@ -897,9 +904,28 @@ def _extract_pricing_breakdown(preview: dict[str, Any]) -> dict[str, Any]:
     per_sheet = breakdown.get("per_sheet_pricing") or {}
     pricing = breakdown.get("pricing") or preview.get("pricing") or {}
     material = breakdown.get("material") or {}
+    marketplace = breakdown.get("marketplace_pricing") or preview.get("marketplace_pricing") or {}
+    line_items = [
+        {"label": item.get("label"), "amount": item.get("amount"), "formula": item.get("formula")}
+        for item in (preview.get("calculation_result", {}).get("line_items") or [])
+    ]
+    line_items.extend(
+        {
+            "label": line.get("label"),
+            "amount": line.get("amount"),
+            "formula": None,
+        }
+        for line in marketplace.get("lines") or []
+    )
 
     return {
         "currency": preview.get("currency") or "KES",
+        "base_price": _as_float(marketplace.get("base_price") or totals.get("shop_total")),
+        "broker_margin_percent": _as_float(marketplace.get("broker_margin_percent")),
+        "broker_margin_amount": _as_float(marketplace.get("broker_margin_amount")),
+        "service_margin_percent": _as_float(marketplace.get("service_margin_percent")),
+        "service_margin_amount": _as_float(marketplace.get("service_margin_amount")),
+        "client_price": _as_float(marketplace.get("client_price") or totals.get("grand_total")),
         "paper_price": _as_float(per_sheet.get("paper_price")),
         "print_price_front": _as_float(per_sheet.get("print_price_front")),
         "print_price_back": _as_float(per_sheet.get("print_price_back")),
@@ -913,10 +939,7 @@ def _extract_pricing_breakdown(preview: dict[str, Any]) -> dict[str, Any]:
         "charged_length_m": _as_float(pricing.get("charged_length_m")),
         "minimum_charge": _as_float(pricing.get("minimum_charge")),
         "minimum_charge_applied": pricing.get("minimum_charge_applied"),
-        "lines": [
-            {"label": item.get("label"), "amount": item.get("amount"), "formula": item.get("formula")}
-            for item in (preview.get("calculation_result", {}).get("line_items") or [])
-        ]
+        "lines": line_items,
     }
 
 
@@ -1044,7 +1067,7 @@ def _preview_booklet_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, 
         effective_lamination_mode = "none"
 
     try:
-        result = calculate_booklet_pricing(
+        result = _apply_marketplace_pricing(shop, calculate_booklet_pricing(
             shop=shop,
             quantity=payload.get("quantity") or 1,
             width_mm=width_mm,
@@ -1062,7 +1085,7 @@ def _preview_booklet_for_shop(shop: Shop, payload: dict[str, Any]) -> dict[str, 
             finishing_selections=[],
             binding_finishing_rate=binding_rate,
             turnaround_hours=payload.get("turnaround_hours"),
-        )
+        ))
     except Exception:
         return _build_shop_row(
             shop,

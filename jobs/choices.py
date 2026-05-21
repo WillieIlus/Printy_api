@@ -2,6 +2,8 @@
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 
+from common.payment_constants import PaymentStatus
+
 
 class JobMachineType(models.TextChoices):
     DIGITAL = "DIGITAL", _("Digital")
@@ -134,13 +136,21 @@ class JobPaymentMethod(models.TextChoices):
 
 
 class JobPaymentStatus(models.TextChoices):
-    PENDING = "pending", _("Pending")
-    MANUAL_PAYMENT_PENDING = "manual_payment_pending", _("Manual payment pending")
-    STK_PUSH_SENT = "stk_push_sent", _("STK push sent")
-    CONFIRMATION_PENDING = "confirmation_pending", _("Confirmation pending")
-    CONFIRMED = "confirmed", _("Confirmed")
-    FAILED = "failed", _("Failed")
-    REFUNDED = "refunded", _("Refunded")
+    INITIATED = PaymentStatus.INITIATED
+    PENDING = PaymentStatus.PENDING
+    PAID = PaymentStatus.PAID
+    FAILED = PaymentStatus.FAILED
+    CANCELLED = PaymentStatus.CANCELLED
+    NEEDS_REVIEW = PaymentStatus.NEEDS_REVIEW
+
+
+LEGACY_JOB_PAYMENT_STATUS_ALIASES = {
+    "stk_push_sent": JobPaymentStatus.INITIATED,
+    "manual_payment_pending": JobPaymentStatus.PENDING,
+    "confirmation_pending": JobPaymentStatus.PENDING,
+    "confirmed": JobPaymentStatus.PAID,
+    "refunded": JobPaymentStatus.CANCELLED,
+}
 
 
 class JobPaymentChannel(models.TextChoices):

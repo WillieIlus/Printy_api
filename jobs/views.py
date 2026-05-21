@@ -3,8 +3,6 @@ from django.conf import settings
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext as _
-from django.utils.decorators import method_decorator
-from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -33,7 +31,6 @@ from jobs.file_services import (
 from jobs.formatter import format_job_for_whatsapp_share
 from jobs.models import JobAssignment, JobClaim, JobFile, JobNotification, JobPayment, JobRequest, ManagedJob
 from jobs.payment_services import (
-    handle_job_mpesa_callback,
     initialize_settlement_for_managed_job,
     initiate_job_stk_push,
     reconcile_job_payment_status,
@@ -47,6 +44,7 @@ from jobs.serializers import (
     JobFileSerializer,
     ManagedJobStkInitiateSerializer,
     ManagedJobEventSerializer,
+    ManagedJobPublicTrackingSerializer,
     ManagedJobSerializer,
     JobPaymentSerializer,
     JobRequestCreateSerializer,
@@ -102,7 +100,7 @@ class JobRequestViewSet(viewsets.ModelViewSet):
         job.ensure_public_token()
         message = format_job_for_whatsapp_share(job)
         frontend_url = getattr(settings, "FRONTEND_URL", "https://printy.ke")
-        public_view_url = f"{frontend_url.rstrip('/')}/public/job/{job.public_token}"
+        public_view_url = f"{frontend_url.rstrip('/')}/track-job/{job.public_token}"
         return Response({
             "message": message,
             "public_view_url": public_view_url,
@@ -224,6 +222,18 @@ class PublicJobView(APIView):
         data["claim_cta"] = _("Claim job")
         data["requires_login"] = True
         return Response(data)
+
+
+class PublicManagedJobTrackingView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, token):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("broker", "broker__profile", "source_shop_quote"),
+            tracking_token=token,
+        )
+        serializer = ManagedJobPublicTrackingSerializer(managed_job, context={"request": request})
+        return Response(serializer.data)
 
 
 def _can_access_managed_job(*, user, managed_job: ManagedJob, actor: str) -> bool:
@@ -372,16 +382,6 @@ class ManagedJobSettlementDetailView(APIView):
         if settlement is None:
             settlement = initialize_settlement_for_managed_job(managed_job=managed_job)
         return Response(JobSettlementSplitSerializer(settlement, context={"request": request}).data)
-
-
-@method_decorator(csrf_exempt, name="dispatch")
-class ManagedJobMpesaCallbackView(APIView):
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
-    def post(self, request):
-        result = handle_job_mpesa_callback(payload=request.data if isinstance(request.data, dict) else {})
-        return Response({"ResultCode": 0, "ResultDesc": "Accepted", **result})
 
 
 class ManagedJobEventListView(APIView):

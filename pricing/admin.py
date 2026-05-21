@@ -1,6 +1,15 @@
 from django.contrib import admin
 
-from .models import FinishingCategory, FinishingRate, Material, PrintingRate, ServiceRate, ServiceRateTier, VolumeDiscount
+from .models import (
+    FinishingCategory,
+    FinishingRate,
+    Material,
+    PrintingRate,
+    ServiceRate,
+    ServiceRateTier,
+    ShopPricingSettings,
+    VolumeDiscount,
+)
 
 
 @admin.register(FinishingCategory)
@@ -8,6 +17,20 @@ class FinishingCategoryAdmin(admin.ModelAdmin):
     list_display = ["name", "slug", "description"]
     search_fields = ["name"]
     prepopulated_fields = {"slug": ("name",)}
+
+
+@admin.register(ShopPricingSettings)
+class ShopPricingSettingsAdmin(admin.ModelAdmin):
+    list_display = [
+        "shop",
+        "broker_margin_percent",
+        "service_margin_percent",
+        "broker_margin_locked",
+        "service_margin_locked",
+        "is_active",
+    ]
+    list_filter = ["is_active", "broker_margin_locked", "service_margin_locked"]
+    search_fields = ["shop__name", "shop__slug"]
 
 
 @admin.register(PrintingRate)

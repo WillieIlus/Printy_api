@@ -57,6 +57,55 @@ class FinishingCategory(TimeStampedModel):
         super().save(*args, **kwargs)
 
 
+class ShopPricingSettings(TimeStampedModel):
+    """Marketplace margin settings for a shop's client-facing pricing."""
+
+    shop = models.OneToOneField(
+        Shop,
+        on_delete=models.CASCADE,
+        related_name="pricing_settings",
+        verbose_name=_("shop"),
+        help_text=_("Shop that owns these marketplace pricing settings."),
+    )
+    broker_margin_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("30.00"),
+        verbose_name=_("broker margin percent"),
+        help_text=_("Marketplace broker margin percentage added to the shop base price."),
+    )
+    service_margin_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("30.00"),
+        verbose_name=_("service margin percent"),
+        help_text=_("Printy service margin percentage added to the shop base price."),
+    )
+    broker_margin_locked = models.BooleanField(
+        default=True,
+        verbose_name=_("broker margin locked"),
+        help_text=_("Whether the broker margin is locked for standard shop users."),
+    )
+    service_margin_locked = models.BooleanField(
+        default=True,
+        verbose_name=_("service margin locked"),
+        help_text=_("Whether the Printy service margin is locked for standard shop users."),
+    )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name=_("is active"),
+        help_text=_("Whether these pricing settings are active."),
+    )
+
+    class Meta:
+        ordering = ["shop__name"]
+        verbose_name = _("shop pricing settings")
+        verbose_name_plural = _("shop pricing settings")
+
+    def __str__(self):
+        return f"Pricing settings for {self.shop.name}"
+
+
 class PrintingRate(TimeStampedModel):
     """
     Printing rate per machine, sheet size, color mode.
