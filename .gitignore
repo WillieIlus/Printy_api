@@ -6,7 +6,9 @@ env/
 # Environment
 .env
 .env.local
+.env.production
 .env.*.local
+.env.production.local
 .envrc
 *.pem
 *.key

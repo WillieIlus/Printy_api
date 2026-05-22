@@ -69,6 +69,8 @@ def validate_partner_markup(*, pricing_snapshot: dict[str, Any], shop: Shop, par
     production_estimate = _money(preview.get("production_estimate"))
     if partner_markup < 0:
         raise ValueError("Partner markup cannot be negative.")
+    if production_estimate <= 0:
+        raise ValueError("Production price is not available yet for the selected shop.")
     if production_estimate > 0 and partner_markup > (production_estimate * Decimal("1.50")):
         raise ValueError("Partner markup exceeds the current guardrail.")
 

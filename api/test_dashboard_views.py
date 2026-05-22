@@ -328,6 +328,44 @@ class PartnerClientCreateTestCase(TestCase):
             role=User.Role.CLIENT,
             name="Regular Client",
         )
+        self.production_user = User.objects.create_user(
+            email="production-client-create@test.com",
+            password="pass12345",
+            role=User.Role.PRODUCTION,
+            name="Production User",
+        )
+
+    def test_partner_get_with_no_clients_returns_empty_results(self):
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.get("/api/dashboard/partner/clients/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"role": "partner", "results": []})
+
+    def test_partner_post_creates_client_and_get_returns_it(self):
+        self.client.force_authenticate(user=self.partner)
+
+        create_response = self.client.post(
+            "/api/dashboard/partner/clients/",
+            {
+                "name": "Jane Client",
+                "phone": "+254712345678",
+                "email": "jane@example.com",
+                "company": "Jane Ltd",
+            },
+            format="json",
+        )
+
+        self.assertIn(create_response.status_code, (200, 201))
+        self.assertIsNotNone(create_response.json()["client_id"])
+
+        list_response = self.client.get("/api/dashboard/partner/clients/")
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(len(list_response.json()["results"]), 1)
+        self.assertEqual(list_response.json()["results"][0]["name"], "Jane Client")
+        self.assertEqual(list_response.json()["results"][0]["phone"], "+254712345678")
 
     def test_partner_create_by_phone_is_idempotent(self):
         self.client.force_authenticate(user=self.partner)
@@ -362,6 +400,23 @@ class PartnerClientCreateTestCase(TestCase):
         self.assertFalse(second_payload["is_new"])
         self.assertEqual(PartnerClient.objects.filter(partner=self.partner).count(), 1)
 
+    def test_partner_get_handles_null_client_user(self):
+        PartnerClient.objects.create(
+            partner=self.partner,
+            client_user=None,
+            name="Loose Record",
+            phone="",
+            email="",
+            company="",
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.get("/api/dashboard/partner/clients/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["results"][0]["name"], "Loose Record")
+        self.assertIsNone(response.json()["results"][0]["client_id"])
+
     def test_non_partner_cannot_create_partner_client(self):
         self.client.force_authenticate(user=self.non_partner)
 
@@ -372,3 +427,23 @@ class PartnerClientCreateTestCase(TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+    def test_non_partner_cannot_get_partner_clients(self):
+        self.client.force_authenticate(user=self.non_partner)
+
+        response = self.client.get("/api/dashboard/partner/clients/")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_production_cannot_access_partner_clients(self):
+        self.client.force_authenticate(user=self.production_user)
+
+        get_response = self.client.get("/api/dashboard/partner/clients/")
+        post_response = self.client.post(
+            "/api/dashboard/partner/clients/",
+            {"name": "Blocked Client", "phone": "+254700000000"},
+            format="json",
+        )
+
+        self.assertEqual(get_response.status_code, 403)
+        self.assertEqual(post_response.status_code, 403)
