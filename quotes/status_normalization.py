@@ -24,7 +24,7 @@ def quote_draft_status_label(status: str) -> str:
 
 def normalize_quote_request_status(raw_status: str | None) -> str:
     return {
-        QuoteStatus.DRAFT: "pending",
+        QuoteStatus.DRAFT: "draft",
         QuoteStatus.SUBMITTED: "sent",
         QuoteStatus.AWAITING_SHOP_ACTION: "pending",
         QuoteStatus.ACCEPTED: "pending",
@@ -40,6 +40,7 @@ def normalize_quote_request_status(raw_status: str | None) -> str:
 
 def quote_request_status_label(status: str) -> str:
     return {
+        "draft": "Draft",
         "pending": "Pending",
         "sent": "Sent",
         "viewed": "Viewed",

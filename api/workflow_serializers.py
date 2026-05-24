@@ -37,6 +37,16 @@ from services.pricing.mvp_rate_card import FINISHING_DEFINITION_BY_KEY, PAPER_DE
 
 def _as_dict(value):
     return value if isinstance(value, dict) else {}
+
+
+def _client_visible_quote_total(raw_total, raw_snapshot, *, client_total=None):
+    customer_pricing = _as_dict(_as_dict(raw_snapshot).get("customer_pricing"))
+    return (
+        client_total
+        or customer_pricing.get("final_client_price")
+        or customer_pricing.get("estimated_total")
+        or raw_total
+    )
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours
 from shops.models import Shop
 from .serializers import QuoteItemReadSerializer
@@ -109,6 +119,45 @@ class CalculatorConfigPreviewSerializer(serializers.Serializer):
         if attrs.get("product_type") == "large_format":
             attrs = validate_size_selection(attrs)
         return attrs
+
+
+class PartnerProductionMatchResultSerializer(serializers.Serializer):
+    shop_id = serializers.IntegerField()
+    shop_display_name = serializers.CharField()
+    shop_slug = serializers.CharField(required=False, allow_blank=True)
+    can_produce = serializers.BooleanField()
+    production_cost = serializers.CharField(required=False, allow_null=True)
+    currency = serializers.CharField(required=False, allow_blank=True)
+    price_available = serializers.BooleanField()
+    price_status = serializers.CharField()
+    missing_requirements = serializers.ListField(child=serializers.CharField(), default=list)
+    available_reasons = serializers.ListField(child=serializers.CharField(), default=list)
+    estimated_turnaround = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    turnaround_hours = serializers.IntegerField(required=False, allow_null=True)
+    turnaround_label = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    location_summary = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    location_area = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    match_type = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    match_score = serializers.FloatField(required=False, allow_null=True)
+    recommendation_rank = serializers.IntegerField(required=False, allow_null=True)
+    recommendation_label = serializers.CharField(required=False, allow_blank=True)
+    explanation = serializers.CharField(required=False, allow_blank=True)
+    reason = serializers.CharField(required=False, allow_blank=True)
+    product_type = serializers.CharField()
+    preview_snapshot = serializers.JSONField(required=False, allow_null=True)
+    selection = serializers.JSONField(required=False, allow_null=True)
+
+
+class PartnerProductionMatchResponseSerializer(serializers.Serializer):
+    product_type = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    summary = serializers.CharField()
+    missing_fields = serializers.ListField(child=serializers.CharField(), default=list)
+    results = PartnerProductionMatchResultSerializer(many=True, default=list)
+    matched_count = serializers.IntegerField(default=0)
+    results_count = serializers.IntegerField(default=0)
+    pricing_snapshot = serializers.JSONField(required=False, allow_null=True)
+    spec_snapshot = serializers.JSONField(required=False, allow_null=True)
+    visibility = serializers.JSONField(required=False, allow_null=True)
 
 
 class CalculatorPreviewSerializer(serializers.Serializer):
@@ -384,6 +433,35 @@ class PartnerQuotePreviewSerializer(serializers.Serializer):
     partner_markup = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.00"))
 
 
+class PartnerAssignedRequestShopOptionsSerializer(serializers.Serializer):
+    finished_size = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    quantity = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    paper_stock = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    print_sides = serializers.ChoiceField(choices=["SIMPLEX", "DUPLEX"], required=False, allow_null=True)
+    color_mode = serializers.ChoiceField(choices=["BW", "COLOR"], required=False, allow_null=True)
+    lamination = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    urgency_type = serializers.ChoiceField(
+        choices=["standard", "same_day", "express", "after_hours", "emergency"],
+        required=False,
+        allow_null=True,
+    )
+    requested_paper_category = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    requested_gsm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    total_pages = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    cover_stock = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    insert_stock = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    requested_cover_paper_category = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    requested_cover_gsm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    requested_insert_paper_category = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    requested_insert_gsm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    cover_lamination = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    binding_type = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    material_type = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    product_subtype = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    width_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    height_mm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+
+
 class PartnerQuoteCreateSerializer(serializers.Serializer):
     shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all())
     title = serializers.CharField(required=False, allow_blank=True, max_length=255)
@@ -396,14 +474,38 @@ class PartnerQuoteCreateSerializer(serializers.Serializer):
     client_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
     client_email = serializers.EmailField(required=False, allow_blank=True)
     client_phone = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    client_company = serializers.CharField(required=False, allow_blank=True, max_length=255)
     note = serializers.CharField(required=False, allow_blank=True, max_length=1000)
     calculator_inputs_snapshot = serializers.JSONField()
     pricing_snapshot = serializers.JSONField()
     partner_markup = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.00"))
+    save_as_draft = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
-        if not (attrs.get("client_name") or attrs.get("client_email") or attrs.get("client_phone")):
-            raise serializers.ValidationError("Client name, email, or phone is required.")
+        if attrs.get("save_as_draft"):
+            return attrs
+        if not (attrs.get("client_user") or attrs.get("client_email") or attrs.get("client_phone") or attrs.get("client_name")):
+            raise serializers.ValidationError("Client email or an existing client is required.")
+        return attrs
+
+
+class PartnerQuoteAttachClientSerializer(serializers.Serializer):
+    client_id = serializers.PrimaryKeyRelatedField(
+        queryset=get_user_model().objects.all(),
+        required=False,
+        allow_null=True,
+        source="client_user",
+    )
+    client_name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    client_email = serializers.EmailField(required=False, allow_blank=True)
+    client_phone = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    client_company = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+    def validate(self, attrs):
+        if attrs.get("client_user") is not None:
+            return attrs
+        if not attrs.get("client_email"):
+            raise serializers.ValidationError("Client email is required when no existing client is selected.")
         return attrs
 
 
@@ -465,14 +567,83 @@ class QuoteDraftReadSerializer(serializers.ModelSerializer):
 
 
 class QuoteDraftSendSerializer(serializers.Serializer):
-    shops = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all(), many=True)
+    shops = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all(), many=True, required=False)
+    selected_manager_id = serializers.IntegerField(required=False, allow_null=True)
     request_details_snapshot = serializers.JSONField(required=False)
+
+    def validate_selected_manager_id(self, value):
+        from quotes.services_workflow import resolve_assigned_manager
+
+        if value in (None, ""):
+            return None
+        try:
+            manager = resolve_assigned_manager(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+        return manager.id if manager is not None else None
+
+    def validate(self, attrs):
+        shops = attrs.get("shops") or []
+        if shops:
+            return attrs
+        return attrs
+
+
+class RecommendedPrintManagerSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    display_name = serializers.CharField()
+    brand_name = serializers.CharField(allow_blank=True)
+    specializations = serializers.ListField(child=serializers.CharField(), required=False)
+    avg_response_hours = serializers.FloatField(required=False, allow_null=True)
+    completed_jobs = serializers.IntegerField()
+    satisfaction_rating = serializers.FloatField(required=False, allow_null=True)
+    distance_km = serializers.FloatField(required=False, allow_null=True)
+    is_previous_manager = serializers.BooleanField(default=False)
+    badge = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    recommendation_reason = serializers.CharField()
+
+
+class IntakeRecommendedManagerQuerySerializer(serializers.Serializer):
+    product_type = serializers.CharField()
+    quantity = serializers.IntegerField(min_value=1)
+    paper_gsm = serializers.IntegerField(required=False, allow_null=True)
+    size = serializers.CharField(required=False, allow_blank=True)
+    client_id = serializers.IntegerField(required=False, allow_null=True)
+
+
+class IntakeSubmitSerializer(serializers.Serializer):
+    draft_id = serializers.IntegerField(required=False, allow_null=True)
+    selected_manager_id = serializers.IntegerField(required=False, allow_null=True)
+    artwork_reference = serializers.CharField(required=False, allow_blank=True)
+    title = serializers.CharField(required=False, allow_blank=True)
+    calculator_inputs_snapshot = serializers.JSONField(required=False)
+    pricing_snapshot = serializers.JSONField(required=False)
+    request_details_snapshot = serializers.JSONField(required=False)
+
+    def validate_selected_manager_id(self, value):
+        from quotes.services_workflow import resolve_assigned_manager
+
+        if value in (None, ""):
+            return None
+        try:
+            manager = resolve_assigned_manager(value)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+        return manager.id if manager is not None else None
+
+    def validate(self, attrs):
+        if attrs.get("draft_id"):
+            return attrs
+        if attrs.get("calculator_inputs_snapshot"):
+            return attrs
+        raise serializers.ValidationError("draft_id or calculator_inputs_snapshot is required.")
 
 
 class QuoteRequestReadSerializer(serializers.ModelSerializer):
     source_draft_reference = serializers.CharField(source="source_draft.draft_reference", read_only=True)
     latest_response = serializers.SerializerMethodField()
     responses_count = serializers.SerializerMethodField()
+    assigned_manager = serializers.SerializerMethodField()
     raw_status = serializers.CharField(source="status", read_only=True)
     status = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
@@ -484,6 +655,7 @@ class QuoteRequestReadSerializer(serializers.ModelSerializer):
             "request_reference",
             "shop",
             "created_by",
+            "assigned_manager",
             "status",
             "raw_status",
             "status_label",
@@ -514,7 +686,7 @@ class QuoteRequestReadSerializer(serializers.ModelSerializer):
             "status": normalized_status,
             "raw_status": latest.status,
             "status_label": quote_response_status_label(normalized_status),
-            "total": latest.total,
+            "total": _client_visible_quote_total(latest.total, latest.response_snapshot, client_total=latest.client_total),
             "turnaround_days": latest.turnaround_days,
             "turnaround_hours": latest.turnaround_hours,
             "estimated_ready_at": latest.estimated_ready_at,
@@ -538,6 +710,16 @@ class QuoteRequestReadSerializer(serializers.ModelSerializer):
 
     def get_responses_count(self, obj):
         return obj.shop_quotes.count()
+
+    def get_assigned_manager(self, obj):
+        manager = getattr(obj, "assigned_manager", None)
+        if manager is None:
+            return None
+        return {
+            "id": manager.id,
+            "display_name": getattr(manager, "name", "") or getattr(manager, "email", "") or "Print Manager",
+            "short_title": "Print Manager",
+        }
 
     def get_status(self, obj):
         return normalize_quote_request_status(obj.status)
@@ -592,7 +774,7 @@ class DashboardQuoteRequestSummarySerializer(serializers.ModelSerializer):
             "status": normalized_status,
             "raw_status": raw_status,
             "status_label": quote_response_status_label(normalized_status),
-            "total": getattr(obj, "latest_response_total", None),
+            "total": _client_visible_quote_total(getattr(obj, "latest_response_total", None), raw_snapshot),
             "created_at": getattr(obj, "latest_response_created_at", None),
             "sent_at": getattr(obj, "latest_response_sent_at", None),
         }
@@ -998,14 +1180,23 @@ class ClientQuoteItemDetailSerializer(serializers.ModelSerializer):
         return obj.title or ""
 
     def get_finishings(self, obj):
-        return [
-            {
-                "id": f.id,
-                "finishing_rate_name": f.finishing_rate.get_code_display() if f.finishing_rate else "",
-                "selected_side": f.selected_side,
-            }
-            for f in obj.finishings.all().select_related("finishing_rate")
-        ]
+        finishings = []
+        for finishing in obj.finishings.all().select_related("finishing_rate"):
+            rate = getattr(finishing, "finishing_rate", None)
+            label = getattr(rate, "name", "") or ""
+            if rate is not None and hasattr(rate, "get_code_display"):
+                try:
+                    label = rate.get_code_display() or label
+                except Exception:
+                    label = label or ""
+            finishings.append(
+                {
+                    "id": finishing.id,
+                    "finishing_rate_name": label,
+                    "selected_side": finishing.selected_side,
+                }
+            )
+        return finishings
 
     def get_sheets_needed(self, obj):
         return (obj.pricing_snapshot or {}).get("sheets_needed")
@@ -1014,7 +1205,17 @@ class ClientQuoteItemDetailSerializer(serializers.ModelSerializer):
         return (obj.pricing_snapshot or {}).get("imposition_count")
 
     def get_finishing_summary(self, obj):
-        names = [f.finishing_rate.get_code_display() for f in obj.finishings.all() if f.finishing_rate]
+        names = []
+        for finishing in obj.finishings.all().select_related("finishing_rate"):
+            rate = getattr(finishing, "finishing_rate", None)
+            if rate is None:
+                continue
+            try:
+                label = rate.get_code_display() if hasattr(rate, "get_code_display") else getattr(rate, "name", "")
+            except Exception:
+                label = getattr(rate, "name", "")
+            if label:
+                names.append(label)
         return ", ".join(names) if names else "None"
 
     def get_production_description(self, obj):
@@ -1037,6 +1238,7 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
     managed_job = serializers.SerializerMethodField()
     tracking_token = serializers.SerializerMethodField()
     public_token = serializers.SerializerMethodField()
+    assigned_manager = serializers.SerializerMethodField()
     raw_status = serializers.CharField(source="status", read_only=True)
     status = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
@@ -1056,6 +1258,7 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
             "customer_name",
             "customer_email",
             "customer_phone",
+            "assigned_manager",
             "notes",
             "delivery_preference",
             "delivery_address",
@@ -1074,6 +1277,16 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
 
     def get_status(self, obj):
         return normalize_quote_request_status(obj.status)
+
+    def get_assigned_manager(self, obj):
+        manager = getattr(obj, "assigned_manager", None)
+        if manager is None:
+            return None
+        return {
+            "id": manager.id,
+            "display_name": getattr(manager, "name", "") or getattr(manager, "email", "") or "Print Manager",
+            "short_title": "Print Manager",
+        }
 
     def get_shop_name(self, obj):
         topology_mode = resolve_topology_mode_for_quote_request(obj)
@@ -1167,6 +1380,11 @@ class MvpRateCardPaperRowSerializer(serializers.Serializer):
     paper_type = serializers.CharField(required=False, allow_blank=True)
     category = serializers.CharField(required=False, allow_blank=True)
     size = serializers.CharField(required=False, allow_blank=True)
+    paper_base_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    single_print_base = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    double_print_base = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    heavy_paper_surcharge = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    surcharge_threshold_gsm = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     single_side_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     double_side_price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     active = serializers.BooleanField(required=False, default=False)
@@ -1180,6 +1398,7 @@ class MvpRateCardFinishingRowSerializer(serializers.Serializer):
     pricing_mode = serializers.CharField(required=False, allow_blank=True, default="flat_per_job")
     unit = serializers.CharField(required=False, allow_blank=True)
     price = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
+    minimum_charge = serializers.DecimalField(max_digits=12, decimal_places=2, required=False, allow_null=True)
     active = serializers.BooleanField(required=False, default=False)
 
 

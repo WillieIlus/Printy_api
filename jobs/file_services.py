@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from django.conf import settings
+from django.core.mail import send_mail
 from django.db import transaction
 
 from api.visibility import CLIENT_ACTOR, OPS_ACTOR, PARTNER_ACTOR, SHOP_ACTOR
@@ -19,6 +21,8 @@ from jobs.audit_services import (
 )
 from jobs.choices import JobFileStatus, JobFileType, JobFileVisibility
 from jobs.models import JobAssignment, JobFile, ManagedJob
+from notifications.models import Notification
+from notifications.services import notify
 from quotes.models import QuoteRequest, QuoteRequestAttachment, ShopQuote, ShopQuoteAttachment
 
 
@@ -42,6 +46,82 @@ def _stored_name(file_field: Any) -> str | None:
         return None
     name = getattr(file_field, "name", "") or None
     return name or None
+
+
+def managed_job_has_artwork(*, managed_job: ManagedJob) -> bool:
+    return managed_job.job_files.filter(
+        file_type__in=[JobFileType.ARTWORK, JobFileType.CUSTOMER_UPLOAD],
+    ).exists()
+
+
+def sync_managed_job_artwork_requirement(*, managed_job: ManagedJob) -> bool:
+    has_artwork = managed_job_has_artwork(managed_job=managed_job)
+    required = not has_artwork
+    if managed_job.artwork_required != required:
+        managed_job.artwork_required = required
+        managed_job.save(update_fields=["artwork_required", "updated_at"])
+    return has_artwork
+
+
+def _job_dashboard_url(managed_job: ManagedJob, role: str) -> str:
+    frontend_url = str(getattr(settings, "FRONTEND_URL", "https://printy.ke") or "https://printy.ke").rstrip("/")
+    if role == "partner":
+        return f"{frontend_url}/dashboard/partner/jobs/{managed_job.id}"
+    return f"{frontend_url}/dashboard/client/jobs/{managed_job.id}"
+
+
+def notify_missing_artwork(*, managed_job: ManagedJob, actor=None, source: str = "payment_confirmed") -> None:
+    client_recipient = managed_job.client or managed_job.created_by
+    partner_recipient = managed_job.broker
+    client_message = "Your payment was received. Please upload your artwork to allow production to begin."
+    partner_message = "Client has paid but artwork is missing. Job cannot be dispatched until artwork is uploaded."
+    if source == "quote_request_submitted":
+        client_message = "Your quote request was sent. Don't forget to upload your artwork so production can begin as soon as you accept a quote."
+        partner_message = "Client has not uploaded artwork yet."
+    elif source == "dispatch_attempt":
+        client_message = "Production is waiting for your artwork upload before the job can be dispatched."
+
+    if client_recipient:
+        notify(
+            recipient=client_recipient,
+            notification_type=Notification.JOB_STATUS_UPDATED,
+            message=client_message,
+            object_type="managed_job",
+            object_id=managed_job.id,
+            actor=actor,
+        )
+        if getattr(client_recipient, "email", ""):
+            try:
+                send_mail(
+                    subject="Upload your artwork for Printy",
+                    message=f"{client_message}\n\nOpen your job: {_job_dashboard_url(managed_job, 'client')}",
+                    from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                    recipient_list=[client_recipient.email],
+                    fail_silently=True,
+                )
+            except Exception:
+                pass
+
+    if partner_recipient:
+        notify(
+            recipient=partner_recipient,
+            notification_type=Notification.JOB_STATUS_UPDATED,
+            message=partner_message,
+            object_type="managed_job",
+            object_id=managed_job.id,
+            actor=actor,
+        )
+        if getattr(partner_recipient, "email", ""):
+            try:
+                send_mail(
+                    subject="Artwork still missing for a managed job",
+                    message=f"{partner_message}\n\nOpen the job: {_job_dashboard_url(managed_job, 'partner')}",
+                    from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                    recipient_list=[partner_recipient.email],
+                    fail_silently=True,
+                )
+            except Exception:
+                pass
 
 
 @transaction.atomic
@@ -287,7 +367,7 @@ def create_print_ready_file(
     original_filename: str = "",
     notes: str = "Print-ready production file.",
     replaces: JobFile | None = None,
-) -> JobFile:
+    ) -> JobFile:
     version = (replaces.version + 1) if replaces else 1
     return create_job_file(
         managed_job=managed_job,
@@ -302,6 +382,31 @@ def create_print_ready_file(
         notes=notes,
         replaces=replaces,
     )
+
+
+@transaction.atomic
+def upload_artwork_for_managed_job(
+    *,
+    managed_job: ManagedJob,
+    assignment: JobAssignment | None = None,
+    uploaded_by=None,
+    file=None,
+    original_filename: str = "",
+    notes: str = "Artwork uploaded for production.",
+) -> JobFile:
+    job_file = create_job_file(
+        managed_job=managed_job,
+        assignment=assignment,
+        uploaded_by=uploaded_by,
+        file=file,
+        original_filename=original_filename,
+        file_type=JobFileType.ARTWORK,
+        visibility=JobFileVisibility.CLIENT,
+        status=JobFileStatus.UPLOADED,
+        notes=notes,
+    )
+    sync_managed_job_artwork_requirement(managed_job=managed_job)
+    return job_file
 
 
 @transaction.atomic

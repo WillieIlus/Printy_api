@@ -137,8 +137,10 @@ class QuoteRequest(TimeStampedModel):
         Shop,
         on_delete=models.CASCADE,
         related_name="quote_requests",
+        null=True,
+        blank=True,
         verbose_name=_("shop"),
-        help_text=_("Shop this quote request is for."),
+        help_text=_("Shop this quote request is for when the request is already shop-bound."),
     )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -148,6 +150,15 @@ class QuoteRequest(TimeStampedModel):
         related_name="quote_requests",
         verbose_name=_("created by"),
         help_text=_("User who created this quote request."),
+    )
+    assigned_manager = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_quote_requests",
+        verbose_name=_("assigned manager"),
+        help_text=_("Print Manager / Partner assigned to coordinate this request before production shop selection."),
     )
     on_behalf_of = models.ForeignKey(
         settings.AUTH_USER_MODEL,

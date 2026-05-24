@@ -93,6 +93,7 @@ class JobAssignmentStatus(models.TextChoices):
     ACCEPTED = "accepted", _("Accepted")
     REJECTED = "rejected", _("Rejected")
     IN_PRODUCTION = "in_production", _("In production")
+    FINISHING = "finishing", _("Finishing")
     READY = "ready", _("Ready")
     COMPLETED = "completed", _("Completed")
     CANCELLED = "cancelled", _("Cancelled")
@@ -100,6 +101,7 @@ class JobAssignmentStatus(models.TextChoices):
 
 
 class JobFileType(models.TextChoices):
+    ARTWORK = "artwork", _("Artwork")
     CUSTOMER_UPLOAD = "customer_upload", _("Customer upload")
     BROKER_REVISION = "broker_revision", _("Broker revision")
     PROOF = "proof", _("Proof")

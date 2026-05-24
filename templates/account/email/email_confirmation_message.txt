@@ -1,4 +1,4 @@
-{% load i18n %}{% autoescape off %}Hello from Printyke!
+{% load i18n %}{% autoescape off %}Hello from Printy!
 
 {% blocktranslate with user_display=user_display %}Hi {{ user_display }},{% endblocktranslate %}
 
@@ -6,8 +6,8 @@
 
 {{ activate_url }}
 
-{% blocktranslate %}This link expires in a few days. If you did not sign up for Printyke, you can safely ignore this email.{% endblocktranslate %}
+{% blocktranslate %}This link expires in a few days. If you did not sign up for Printy, you can safely ignore this email.{% endblocktranslate %}
 
-– The Printyke Team
+- The Printy Team
 hello.printyke@gmail.com
 {% endautoescape %}

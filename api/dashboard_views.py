@@ -21,6 +21,7 @@ from accounts.services.roles import (
     is_super_admin,
     resolve_user_roles,
 )
+from accounts.models import UserProfile
 from api.services.admin_dashboard import build_admin_dashboard_payload
 from api.visibility import project_shop_identity
 from jobs.managed_services import create_assignment_for_managed_job
@@ -30,18 +31,38 @@ from jobs.serializers import JobSettlementSplitSerializer
 from inventory.models import Paper
 from notifications.models import Notification
 from notifications.services import notify_quote_event
+from jobs.file_services import managed_job_has_artwork, notify_missing_artwork
 from pricing.models import FinishingRate, PrintingRate
 from quotes.models import QuoteRequest, ShopQuote
+from quotes.partner_services import respond_to_assigned_quote_request
+from quotes.services_workflow import update_quote_response
+from services.production_matching import build_partner_production_matches
+from services.pricing.partner_market_rates import build_partner_market_rate_payload
 from shops.models import Shop
 from .models import PartnerClient
-from .workflow_serializers import ClientQuoteRequestDetailSerializer, QuoteResponseReadSerializer
+from .workflow_serializers import (
+    ClientQuoteRequestDetailSerializer,
+    PartnerAssignedRequestShopOptionsSerializer,
+    PartnerQuoteAttachClientSerializer,
+    PartnerProductionMatchResponseSerializer,
+    PartnerQuotePreviewSerializer,
+    QuoteRequestReadSerializer,
+    QuoteResponseReadSerializer,
+)
 
 
 class PartnerClientCreateSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=255)
-    phone = serializers.CharField(max_length=50)
+    name = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    phone = serializers.CharField(required=False, allow_blank=True, max_length=50)
     email = serializers.EmailField(required=False, allow_blank=True)
     company = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+    def validate(self, attrs):
+        if not attrs.get("email") and not attrs.get("phone") and not attrs.get("name"):
+            raise serializers.ValidationError("Email, phone, or name is required.")
+        if not attrs.get("email") and not attrs.get("phone"):
+            raise serializers.ValidationError("Email or phone is required to create a partner client.")
+        return attrs
 
 
 def _normalize_phone(value: str) -> str:
@@ -51,6 +72,88 @@ def _normalize_phone(value: str) -> str:
 def _fallback_partner_client_email(*, partner_id: int, phone: str) -> str:
     digits = "".join(character for character in phone if character.isdigit()) or f"partner{partner_id}"
     return f"partner-client-{partner_id}-{digits}@printy.local"
+
+
+def _partner_client_username(*, phone: str, email: str, partner_id: int) -> str:
+    return phone or email or f"partner-client-{partner_id}"
+
+
+def _resolve_or_create_partner_client(
+    *,
+    partner_user,
+    client_user=None,
+    client_name: str = "",
+    client_email: str = "",
+    client_phone: str = "",
+    client_company: str = "",
+):
+    User = get_user_model()
+    name = str(client_name or "").strip()
+    phone = _normalize_phone(client_phone)
+    email = str(client_email or "").strip().lower()
+    company = str(client_company or "").strip()
+
+    resolved_user = client_user
+    if resolved_user is None and phone:
+        resolved_user = User.objects.filter(username=phone).first()
+    if resolved_user is None and email:
+        resolved_user = User.objects.filter(email__iexact=email).first()
+
+    if resolved_user is not None and getattr(resolved_user, "role", "") != User.Role.CLIENT:
+        raise ValueError("Existing account cannot be linked as a partner client.")
+
+    created_user = False
+    if resolved_user is None:
+        if not email:
+            raise ValueError("Client email is required when no existing client is selected.")
+        fallback_email = email or _fallback_partner_client_email(partner_id=partner_user.id, phone=phone)
+        resolved_user = User.objects.create_user(
+            email=fallback_email,
+            password=None,
+            username=_partner_client_username(phone=phone, email=fallback_email, partner_id=partner_user.id),
+            name=name or fallback_email or phone or "Client",
+            role=User.Role.CLIENT,
+            is_active=True,
+        )
+        created_user = True
+
+    record, created_record = PartnerClient.objects.get_or_create(
+        partner=partner_user,
+        client_user=resolved_user,
+        defaults={
+            "name": name or getattr(resolved_user, "name", "") or getattr(resolved_user, "email", "") or "Client",
+            "phone": phone,
+            "email": email or getattr(resolved_user, "email", "") or "",
+            "company": company,
+        },
+    )
+    update_fields: list[str] = []
+    desired_name = name or record.name or getattr(resolved_user, "name", "") or getattr(resolved_user, "email", "") or "Client"
+    if desired_name and record.name != desired_name:
+        record.name = desired_name
+        update_fields.append("name")
+    if phone and record.phone != phone:
+        record.phone = phone
+        update_fields.append("phone")
+    if email and record.email != email:
+        record.email = email
+        update_fields.append("email")
+    if company != record.company:
+        record.company = company
+        update_fields.append("company")
+    if update_fields:
+        update_fields.append("updated_at")
+        record.save(update_fields=update_fields)
+
+    return {
+        "client_user": resolved_user,
+        "client_id": resolved_user.id,
+        "name": record.name,
+        "phone": record.phone,
+        "email": record.email,
+        "company": record.company,
+        "is_new": created_user and created_record,
+    }
 
 
 def _partner_client_row(record: PartnerClient) -> dict[str, object]:
@@ -84,6 +187,10 @@ class BaseDashboardHomeView(APIView):
                     "expected_dashboard_role": self.dashboard_role,
                 }
             )
+
+
+class PartnerDashboardProfileSerializer(serializers.Serializer):
+    default_markup_rate = serializers.DecimalField(max_digits=5, decimal_places=2, min_value=Decimal("0.00"), max_value=Decimal("5.00"))
 
 
 class ClientDashboardHomeView(BaseDashboardHomeView):
@@ -152,8 +259,8 @@ class PartnerDashboardHomeView(BaseDashboardHomeView):
             "assigned_shop",
         ).order_by("-updated_at", "-created_at")
         quote_requests = QuoteRequest.objects.filter(
-            Q(created_by=request.user) | Q(managed_jobs__broker=request.user)
-        ).select_related("shop").order_by("-updated_at", "-created_at").distinct()
+            Q(created_by=request.user) | Q(assigned_manager=request.user) | Q(managed_jobs__broker=request.user)
+        ).select_related("shop", "assigned_manager").order_by("-updated_at", "-created_at").distinct()
         recent_jobs = [
             {
                 "id": job.id,
@@ -174,7 +281,7 @@ class PartnerDashboardHomeView(BaseDashboardHomeView):
                 "reference": quote_request.request_reference or f"QR-{quote_request.id}",
                 "status": quote_request.status,
                 "customer_name": quote_request.customer_name or "Client",
-                "shop_name": getattr(quote_request.shop, "name", "") or "Shop",
+                "shop_name": getattr(quote_request.shop, "name", "") or "Awaiting production match",
             }
             for quote_request in quote_requests[:8]
         ]
@@ -194,6 +301,35 @@ class PartnerDashboardHomeView(BaseDashboardHomeView):
                 },
             }
         )
+
+
+class PartnerMarketRateListView(BaseDashboardHomeView):
+    dashboard_role = "partner"
+    allowed_roles = (CANONICAL_PARTNER_ROLE,)
+
+    def get(self, request):
+        return Response(build_partner_market_rate_payload(user=request.user))
+
+
+class PartnerDashboardProfileView(BaseDashboardHomeView):
+    dashboard_role = "partner"
+    allowed_roles = (CANONICAL_PARTNER_ROLE,)
+
+    def _get_profile(self, user):
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        return profile
+
+    def get(self, request):
+        profile = self._get_profile(request.user)
+        return Response({"default_markup_rate": str(profile.default_markup_rate)})
+
+    def patch(self, request):
+        serializer = PartnerDashboardProfileSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        profile = self._get_profile(request.user)
+        profile.default_markup_rate = serializer.validated_data["default_markup_rate"]
+        profile.save(update_fields=["default_markup_rate", "updated_at"])
+        return Response({"default_markup_rate": str(profile.default_markup_rate)})
 
 
 class ProductionDashboardHomeView(BaseDashboardHomeView):
@@ -296,6 +432,116 @@ def _job_pricing_snapshot(job: ManagedJob, role: str) -> dict[str, str | None]:
 
 
 class BaseRoleDetailView(BaseDashboardHomeView):
+    def _has_artwork(self, job: ManagedJob) -> bool:
+        return job.job_files.filter(file_type__in=["artwork", "customer_upload"]).exists()
+
+    def _request_snapshot_root(self, quote_request: QuoteRequest | None) -> dict[str, object]:
+        return quote_request.request_snapshot if quote_request and isinstance(quote_request.request_snapshot, dict) else {}
+
+    def _request_snapshot(self, quote_request: QuoteRequest | None) -> dict[str, object]:
+        if not quote_request:
+            return {}
+        snapshot = self._request_snapshot_root(quote_request)
+        nested = snapshot.get("request_snapshot")
+        if isinstance(nested, dict):
+            return nested
+        return snapshot
+
+    def _assigned_request_match_payload(self, quote_request: QuoteRequest, overrides: dict[str, object] | None = None) -> dict[str, object]:
+        snapshot = self._request_snapshot_root(quote_request)
+        nested = self._request_snapshot(quote_request)
+        calculator_inputs = snapshot.get("calculator_inputs") if isinstance(snapshot.get("calculator_inputs"), dict) else {}
+        overrides = overrides or {}
+
+        def _pick(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        payload = {
+            "product_type": _pick(overrides.get("product_type"), nested.get("product_type"), calculator_inputs.get("product_type")),
+            "quantity": _pick(overrides.get("quantity"), nested.get("quantity"), calculator_inputs.get("quantity")),
+            "finished_size": _pick(overrides.get("finished_size"), nested.get("finished_size"), nested.get("size_label"), calculator_inputs.get("finished_size")),
+            "paper_stock": _pick(overrides.get("paper_stock"), nested.get("paper_stock"), calculator_inputs.get("paper_stock")),
+            "print_sides": _pick(overrides.get("print_sides"), nested.get("print_sides"), calculator_inputs.get("print_sides")),
+            "color_mode": _pick(overrides.get("color_mode"), nested.get("color_mode"), calculator_inputs.get("color_mode")),
+            "lamination": _pick(overrides.get("lamination"), nested.get("lamination"), calculator_inputs.get("lamination")),
+            "urgency_type": _pick(overrides.get("urgency_type"), nested.get("urgency_type"), calculator_inputs.get("urgency_type")),
+            "requested_paper_category": _pick(overrides.get("requested_paper_category"), nested.get("requested_paper_category"), calculator_inputs.get("requested_paper_category")),
+            "requested_gsm": _pick(overrides.get("requested_gsm"), nested.get("requested_gsm"), calculator_inputs.get("requested_gsm")),
+            "total_pages": _pick(overrides.get("total_pages"), nested.get("total_pages"), calculator_inputs.get("total_pages")),
+            "cover_stock": _pick(overrides.get("cover_stock"), nested.get("cover_stock"), calculator_inputs.get("cover_stock")),
+            "insert_stock": _pick(overrides.get("insert_stock"), nested.get("insert_stock"), calculator_inputs.get("insert_stock")),
+            "requested_cover_paper_category": _pick(overrides.get("requested_cover_paper_category"), nested.get("requested_cover_paper_category"), calculator_inputs.get("requested_cover_paper_category")),
+            "requested_cover_gsm": _pick(overrides.get("requested_cover_gsm"), nested.get("requested_cover_gsm"), calculator_inputs.get("requested_cover_gsm")),
+            "requested_insert_paper_category": _pick(overrides.get("requested_insert_paper_category"), nested.get("requested_insert_paper_category"), calculator_inputs.get("requested_insert_paper_category")),
+            "requested_insert_gsm": _pick(overrides.get("requested_insert_gsm"), nested.get("requested_insert_gsm"), calculator_inputs.get("requested_insert_gsm")),
+            "cover_lamination": _pick(overrides.get("cover_lamination"), nested.get("cover_lamination"), calculator_inputs.get("cover_lamination")),
+            "binding_type": _pick(overrides.get("binding_type"), nested.get("binding_type"), calculator_inputs.get("binding_type")),
+            "material_type": _pick(overrides.get("material_type"), nested.get("material_type"), calculator_inputs.get("material_type")),
+            "product_subtype": _pick(overrides.get("product_subtype"), nested.get("product_subtype"), calculator_inputs.get("product_subtype")),
+            "width_mm": _pick(overrides.get("width_mm"), nested.get("width_mm"), calculator_inputs.get("width_mm"), nested.get("custom_width_mm"), calculator_inputs.get("custom_width_mm")),
+            "height_mm": _pick(overrides.get("height_mm"), nested.get("height_mm"), calculator_inputs.get("height_mm"), nested.get("custom_height_mm"), calculator_inputs.get("custom_height_mm")),
+        }
+        return {key: value for key, value in payload.items() if value not in (None, "", [])}
+
+    def _production_specs_snapshot(self, job: ManagedJob) -> dict[str, object]:
+        request_snapshot = self._request_snapshot(getattr(job, "source_quote_request", None))
+        operational_snapshot = job.operational_snapshot if isinstance(job.operational_snapshot, dict) else {}
+
+        def _first_value(*values):
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return value
+            return None
+
+        def _label(raw):
+            if raw is None:
+                return None
+            return str(raw).replace("_", " ").replace("-", " ").strip().title()
+
+        paper_name = _first_value(request_snapshot.get("paper_label"), request_snapshot.get("paper_stock"))
+        paper_gsm = request_snapshot.get("requested_gsm")
+        paper_label = None
+        if paper_name and paper_gsm:
+            paper_label = f"{paper_name} ({paper_gsm}gsm)"
+        elif paper_name:
+            paper_label = str(paper_name)
+        elif paper_gsm:
+            paper_label = f"{paper_gsm}gsm stock"
+
+        finishing = _first_value(request_snapshot.get("lamination_label"), _label(request_snapshot.get("lamination")))
+        notes = _first_value(
+            operational_snapshot.get("needs_confirmation"),
+            request_snapshot.get("custom_brief"),
+            getattr(getattr(job, "source_quote_request", None), "notes", ""),
+        )
+        if isinstance(notes, list):
+            notes = ", ".join(str(item).strip() for item in notes if str(item).strip())
+
+        return {
+            "product": _first_value(
+                request_snapshot.get("product_label"),
+                _label(request_snapshot.get("product_type")),
+                job.title,
+            ),
+            "quantity": request_snapshot.get("quantity"),
+            "size": _first_value(request_snapshot.get("finished_size"), request_snapshot.get("size_label")),
+            "paper": paper_label,
+            "print_sides": _first_value(request_snapshot.get("print_sides_label"), _label(request_snapshot.get("print_sides"))),
+            "color_mode": _first_value(request_snapshot.get("color_mode_label"), _label(request_snapshot.get("color_mode"))),
+            "finishing": finishing,
+            "notes": notes,
+            "matched_specs": operational_snapshot.get("matched_specs") or [],
+        }
+
     def _client_tracking_payload(self, job: ManagedJob | None) -> dict[str, object | None]:
         if not job:
             return {
@@ -307,13 +553,19 @@ class BaseRoleDetailView(BaseDashboardHomeView):
             "public_token": None,
         }
 
-    def _quote_row(self, quote_request: QuoteRequest) -> dict[str, object]:
+    def _quote_row(self, quote_request: QuoteRequest, *, request=None) -> dict[str, object]:
+        serialized = QuoteRequestReadSerializer(quote_request, context={"request": request}).data
         row = {
             "id": quote_request.id,
             "reference": quote_request.request_reference or f"QR-{quote_request.id}",
-            "status": quote_request.status,
+            "status": serialized.get("status") or quote_request.status,
+            "status_label": serialized.get("status_label") or quote_request.status,
             "customer_name": quote_request.customer_name or "Client",
-            "shop_name": getattr(quote_request.shop, "name", "") or "Shop",
+            "shop_name": getattr(quote_request.shop, "name", "") or "Awaiting production match",
+            "assigned_manager": serialized.get("assigned_manager"),
+            "assigned_manager_name": (serialized.get("assigned_manager") or {}).get("display_name") or "",
+            "request_snapshot": serialized.get("request_snapshot") or {},
+            "latest_response": serialized.get("latest_response"),
             "created_at": quote_request.created_at,
             "updated_at": quote_request.updated_at,
         }
@@ -334,6 +586,9 @@ class BaseRoleDetailView(BaseDashboardHomeView):
             "assignment_status": job.assignment_status,
             "requested_deadline": job.requested_deadline,
             "updated_at": job.updated_at,
+            "artwork_required": job.artwork_required,
+            "artwork_uploaded": self._has_artwork(job),
+            "payment_confirmed": str(job.payment_status or "").lower() in {"confirmed", "release_ready", "released"},
             "pricing": _job_pricing_snapshot(job, role),
         }
         if role == CANONICAL_CLIENT_ROLE:
@@ -343,6 +598,7 @@ class BaseRoleDetailView(BaseDashboardHomeView):
             row["assigned_shop_name"] = getattr(job.assigned_shop, "name", "") or "Awaiting assignment"
         if role == CANONICAL_PRODUCTION_ROLE:
             row["assigned_shop_name"] = getattr(job.assigned_shop, "name", "") or "Production Shop"
+            row["specs"] = self._production_specs_snapshot(job)
         return row
 
 
@@ -351,8 +607,13 @@ class ClientQuoteListView(BaseRoleDetailView):
     allowed_roles = (CANONICAL_CLIENT_ROLE,)
 
     def get(self, request):
-        rows = QuoteRequest.objects.filter(created_by=request.user).select_related("shop").order_by("-updated_at", "-created_at")
-        return Response({"role": "client", "results": [self._quote_row(item) for item in rows]})
+        rows = (
+            QuoteRequest.objects.filter(Q(created_by=request.user) | Q(on_behalf_of=request.user))
+            .select_related("shop", "assigned_manager")
+            .distinct()
+            .order_by("-updated_at", "-created_at")
+        )
+        return Response({"role": "client", "results": [self._quote_row(item, request=request) for item in rows]})
 
 
 class ClientQuoteDetailView(BaseRoleDetailView):
@@ -361,7 +622,7 @@ class ClientQuoteDetailView(BaseRoleDetailView):
 
     def get(self, request, pk):
         quote_request = get_object_or_404(
-            QuoteRequest.objects.select_related("shop", "on_behalf_of"),
+            QuoteRequest.objects.select_related("shop", "on_behalf_of", "assigned_manager"),
             Q(created_by=request.user) | Q(on_behalf_of=request.user),
             pk=pk,
         )
@@ -426,13 +687,15 @@ class PartnerQuoteListDetailView(BaseRoleDetailView):
     allowed_roles = (CANONICAL_PARTNER_ROLE,)
 
     def get_queryset(self, request):
-        return QuoteRequest.objects.filter(Q(created_by=request.user) | Q(managed_jobs__broker=request.user)).select_related("shop").distinct().order_by("-updated_at", "-created_at")
+        return QuoteRequest.objects.filter(
+            Q(created_by=request.user) | Q(assigned_manager=request.user) | Q(managed_jobs__broker=request.user)
+        ).select_related("shop", "on_behalf_of", "assigned_manager").distinct().order_by("-updated_at", "-created_at")
 
     def get(self, request, pk=None):
         if pk is not None:
-            quote_request = self.get_queryset(request).get(pk=pk)
+            quote_request = get_object_or_404(self.get_queryset(request), pk=pk)
             latest_response = quote_request.shop_quotes.exclude(status=ShopQuote.PENDING).select_related("shop").order_by("-created_at", "-id").first()
-            payload = self._quote_row(quote_request)
+            payload = self._quote_row(quote_request, request=request)
             payload["client_name"] = quote_request.customer_name or getattr(quote_request.on_behalf_of, "name", "") or "Client"
             payload["client_email"] = quote_request.customer_email or getattr(quote_request.on_behalf_of, "email", "")
             payload["client_phone"] = quote_request.customer_phone
@@ -442,7 +705,7 @@ class PartnerQuoteListDetailView(BaseRoleDetailView):
             if managed_job:
                 payload["managed_job"] = self._job_row(managed_job, role=CANONICAL_PARTNER_ROLE)
             return Response({"role": "partner", "quote": payload})
-        return Response({"role": "partner", "results": [self._quote_row(item) for item in self.get_queryset(request)]})
+        return Response({"role": "partner", "results": [self._quote_row(item, request=request) for item in self.get_queryset(request)]})
 
 
 class PartnerQuoteSendToClientView(BaseRoleDetailView):
@@ -451,14 +714,25 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
 
     def get_queryset(self, request):
         return QuoteRequest.objects.filter(
-            Q(created_by=request.user) | Q(managed_jobs__broker=request.user)
-        ).select_related("shop", "on_behalf_of").distinct()
+            Q(created_by=request.user) | Q(assigned_manager=request.user) | Q(managed_jobs__broker=request.user)
+        ).select_related("shop", "on_behalf_of", "assigned_manager").distinct()
 
     def post(self, request, pk):
         quote_request = get_object_or_404(self.get_queryset(request), pk=pk)
+        request_snapshot = dict(quote_request.request_snapshot or {})
+        pending_client = dict(request_snapshot.get("pending_client") or {})
+        if quote_request.on_behalf_of_id is None and pending_client.get("client_user_id"):
+            quote_request.on_behalf_of_id = pending_client["client_user_id"]
+            quote_request.customer_name = pending_client.get("name") or quote_request.customer_name
+            quote_request.customer_email = pending_client.get("email") or quote_request.customer_email
+            quote_request.customer_phone = pending_client.get("phone") or quote_request.customer_phone
+            quote_request.request_snapshot = request_snapshot
+            quote_request.save(
+                update_fields=["on_behalf_of", "customer_name", "customer_email", "customer_phone", "request_snapshot", "updated_at"]
+            )
         if quote_request.on_behalf_of_id is None:
             return Response({"detail": "client_id is required for partner quote requests."}, status=400)
-        latest_response = quote_request.shop_quotes.exclude(status=ShopQuote.PENDING).order_by("-created_at", "-id").first()
+        latest_response = quote_request.shop_quotes.order_by("-created_at", "-id").first()
         if latest_response is None or latest_response.total is None:
             return Response({"detail": "A production base quote is required before sending to the client."}, status=400)
 
@@ -503,8 +777,17 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
         }
         response_snapshot["pricing"] = {**dict(response_snapshot.get("pricing") or {}), "grand_total": str(split["client_total"])}
         response_snapshot["totals"] = {**dict(response_snapshot.get("totals") or {}), "grand_total": str(split["client_total"])}
-        latest_response.response_snapshot = response_snapshot
-        latest_response.sent_at = latest_response.sent_at or timezone.now()
+        if latest_response.status == ShopQuote.PENDING:
+            latest_response = update_quote_response(
+                response=latest_response,
+                status=ShopQuote.SENT,
+                response_snapshot=response_snapshot,
+                total=base_price,
+                note=str(request.data.get("note") or latest_response.note or "Partner quote prepared in Printy."),
+            )
+        else:
+            latest_response.response_snapshot = response_snapshot
+            latest_response.sent_at = latest_response.sent_at or timezone.now()
         latest_response.production_base_price = split["production_amount"]
         latest_response.broker_margin_type = broker_margin_type
         latest_response.broker_margin_value = broker_margin_value.quantize(Decimal("0.01"))
@@ -533,7 +816,6 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
             ]
         )
 
-        request_snapshot = dict(quote_request.request_snapshot or {})
         request_snapshot["customer_pricing"] = response_snapshot["customer_pricing"]
         quote_request.request_snapshot = request_snapshot
         quote_request.save(update_fields=["request_snapshot", "updated_at"])
@@ -545,6 +827,127 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
                 "pricing": response_snapshot["customer_pricing"],
             }
         )
+
+
+class PartnerQuoteAttachClientView(BaseRoleDetailView):
+    dashboard_role = "partner"
+    allowed_roles = (CANONICAL_PARTNER_ROLE,)
+
+    def get_queryset(self, request):
+        return QuoteRequest.objects.filter(
+            Q(created_by=request.user) | Q(assigned_manager=request.user) | Q(managed_jobs__broker=request.user)
+        ).select_related("shop", "on_behalf_of", "assigned_manager").distinct()
+
+    @transaction.atomic
+    def patch(self, request, pk):
+        quote_request = get_object_or_404(self.get_queryset(request), pk=pk)
+        if quote_request.status != "draft":
+            return Response({"detail": "Only draft partner quotes can attach a client."}, status=400)
+        serializer = PartnerQuoteAttachClientSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payload = _resolve_or_create_partner_client(
+                partner_user=request.user,
+                client_user=serializer.validated_data.get("client_user"),
+                client_name=serializer.validated_data.get("client_name", ""),
+                client_email=serializer.validated_data.get("client_email", ""),
+                client_phone=serializer.validated_data.get("client_phone", ""),
+                client_company=serializer.validated_data.get("client_company", ""),
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+
+        request_snapshot = dict(quote_request.request_snapshot or {})
+        request_snapshot["pending_client"] = {
+            "client_user_id": payload["client_id"],
+            "name": payload["name"],
+            "email": payload["email"],
+            "phone": payload["phone"],
+            "company": payload["company"],
+        }
+        request_details = dict(request_snapshot.get("request_details") or {})
+        request_details.update(
+            {
+                "customer_name": payload["name"],
+                "customer_email": payload["email"],
+                "customer_phone": payload["phone"],
+                "client_company": payload["company"],
+            }
+        )
+        request_snapshot["request_details"] = request_details
+        quote_request.customer_name = payload["name"] or quote_request.customer_name
+        quote_request.customer_email = payload["email"] or quote_request.customer_email
+        quote_request.customer_phone = payload["phone"] or quote_request.customer_phone
+        quote_request.request_snapshot = request_snapshot
+        quote_request.save(update_fields=["customer_name", "customer_email", "customer_phone", "request_snapshot", "updated_at"])
+        return Response(
+            {
+                "quote_request_id": quote_request.id,
+                "client_id": payload["client_id"],
+                "client_name": payload["name"],
+                "client_email": payload["email"],
+                "client_phone": payload["phone"],
+                "client_company": payload["company"],
+            }
+        )
+
+
+class PartnerAssignedRequestQuoteCreateView(BaseRoleDetailView):
+    dashboard_role = "partner"
+    allowed_roles = (CANONICAL_PARTNER_ROLE,)
+
+    def get_queryset(self, request):
+        return QuoteRequest.objects.filter(
+            Q(created_by=request.user) | Q(assigned_manager=request.user) | Q(managed_jobs__broker=request.user)
+        ).select_related("shop", "on_behalf_of", "assigned_manager").distinct()
+
+    def post(self, request, pk):
+        quote_request = get_object_or_404(self.get_queryset(request), pk=pk)
+        if quote_request.assigned_manager_id != request.user.id:
+            raise PermissionDenied("You cannot respond to this quote request.")
+        serializer = PartnerQuotePreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payload = respond_to_assigned_quote_request(
+                partner_user=request.user,
+                quote_request=quote_request,
+                shop=serializer.validated_data["shop"],
+                pricing_snapshot=serializer.validated_data["pricing_snapshot"],
+                partner_markup=serializer.validated_data["partner_markup"],
+                note=str(request.data.get("note") or "").strip(),
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError({"detail": str(exc)}) from exc
+        return Response(
+            {
+                "role": "partner",
+                "quote_request_id": payload["quote_request"].id,
+                "shop_quote": QuoteResponseReadSerializer(payload["shop_quote"], context={"request": request}).data,
+                "partner_preview": payload["preview"],
+            },
+            status=201,
+        )
+
+
+class PartnerAssignedRequestShopOptionsView(BaseRoleDetailView):
+    dashboard_role = "partner"
+    allowed_roles = (CANONICAL_PARTNER_ROLE,)
+
+    def get_queryset(self, request):
+        return QuoteRequest.objects.filter(
+            Q(created_by=request.user) | Q(assigned_manager=request.user) | Q(managed_jobs__broker=request.user)
+        ).select_related("shop", "on_behalf_of", "assigned_manager").distinct()
+
+    def post(self, request, pk):
+        quote_request = get_object_or_404(self.get_queryset(request), pk=pk)
+        if quote_request.assigned_manager_id != request.user.id:
+            raise PermissionDenied("You cannot access production options for this quote request.")
+        serializer = PartnerAssignedRequestShopOptionsSerializer(data=request.data or {})
+        serializer.is_valid(raise_exception=True)
+        payload = build_partner_production_matches(
+            self._assigned_request_match_payload(quote_request, serializer.validated_data)
+        )
+        return Response(PartnerProductionMatchResponseSerializer(payload).data)
 
 
 class PartnerJobListDetailView(BaseRoleDetailView):
@@ -587,6 +990,11 @@ class PartnerJobDispatchView(BaseRoleDetailView):
             return Response({"detail": "Client payment must be confirmed before dispatch."}, status=400)
         if job.dispatched_at is not None:
             return Response({"detail": "This job has already been dispatched."}, status=400)
+        if not managed_job_has_artwork(managed_job=job):
+            job.artwork_required = True
+            job.save(update_fields=["artwork_required", "updated_at"])
+            notify_missing_artwork(managed_job=job, actor=request.user, source="dispatch_attempt")
+            return Response({"detail": "Artwork required before dispatch. Client has been notified."}, status=400)
 
         source_shop_quote = job.source_shop_quote
         if source_shop_quote is None:
@@ -655,101 +1063,27 @@ class PartnerClientListView(BaseRoleDetailView):
     def post(self, request):
         serializer = PartnerClientCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
-        User = get_user_model()
-        name = serializer.validated_data["name"].strip()
-        phone = _normalize_phone(serializer.validated_data["phone"])
-        email = serializer.validated_data.get("email", "").strip().lower()
-        company = serializer.validated_data.get("company", "").strip()
-
-        existing_record = PartnerClient.objects.filter(partner=request.user).select_related("client_user").filter(
-            Q(phone=phone) | (Q(email=email) if email else Q(pk__in=[]))
-        ).order_by("id").first()
-        if existing_record:
-            update_fields: list[str] = []
-            if name and existing_record.name != name:
-                existing_record.name = name
-                update_fields.append("name")
-            if email and existing_record.email != email:
-                existing_record.email = email
-                update_fields.append("email")
-            if company != existing_record.company:
-                existing_record.company = company
-                update_fields.append("company")
-            if update_fields:
-                update_fields.append("updated_at")
-                existing_record.save(update_fields=update_fields)
-            return Response(
-                {
-                    "client_id": existing_record.client_user_id,
-                    "name": existing_record.name,
-                    "phone": existing_record.phone,
-                    "email": existing_record.email,
-                    "company": existing_record.company,
-                    "is_new": False,
-                },
-                status=200,
+        try:
+            payload = _resolve_or_create_partner_client(
+                partner_user=request.user,
+                client_name=serializer.validated_data.get("name", ""),
+                client_email=serializer.validated_data.get("email", ""),
+                client_phone=serializer.validated_data.get("phone", ""),
+                client_company=serializer.validated_data.get("company", ""),
             )
-
-        resolved_user = None
-        if phone:
-            resolved_user = User.objects.filter(username=phone).first()
-        if resolved_user is None and email:
-            resolved_user = User.objects.filter(email__iexact=email).first()
-
-        if resolved_user is not None:
-            if getattr(resolved_user, "role", "") != User.Role.CLIENT:
-                return Response({"detail": "Existing account cannot be linked as a partner client."}, status=400)
-            is_new = False
-        else:
-            fallback_email = email or _fallback_partner_client_email(partner_id=request.user.id, phone=phone)
-            resolved_user = User.objects.create_user(
-                email=fallback_email,
-                password=None,
-                username=phone,
-                name=name,
-                role=User.Role.CLIENT,
-                is_active=True,
-            )
-            is_new = True
-
-        record, created = PartnerClient.objects.get_or_create(
-            partner=request.user,
-            client_user=resolved_user,
-            defaults={
-                "name": name or getattr(resolved_user, "name", "") or getattr(resolved_user, "email", "") or "Client",
-                "phone": phone,
-                "email": email or getattr(resolved_user, "email", "") or "",
-                "company": company,
-            },
-        )
-        update_fields: list[str] = []
-        if name and record.name != name:
-            record.name = name
-            update_fields.append("name")
-        if phone and record.phone != phone:
-            record.phone = phone
-            update_fields.append("phone")
-        if email and record.email != email:
-            record.email = email
-            update_fields.append("email")
-        if company != record.company:
-            record.company = company
-            update_fields.append("company")
-        if update_fields:
-            update_fields.append("updated_at")
-            record.save(update_fields=update_fields)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
 
         return Response(
             {
-                "client_id": resolved_user.id,
-                "name": record.name,
-                "phone": record.phone,
-                "email": record.email,
-                "company": record.company,
-                "is_new": is_new and created,
+                "client_id": payload["client_id"],
+                "name": payload["name"],
+                "phone": payload["phone"],
+                "email": payload["email"],
+                "company": payload["company"],
+                "is_new": payload["is_new"],
             },
-            status=201 if is_new and created else 200,
+            status=201 if payload["is_new"] else 200,
         )
 
 
@@ -792,7 +1126,12 @@ class ProductionJobListDetailView(BaseRoleDetailView):
     allowed_roles = (CANONICAL_PRODUCTION_ROLE,)
 
     def get_queryset(self, request):
-        return ManagedJob.objects.filter(_production_shop_filter(request.user)).select_related("assigned_shop").distinct().order_by("-operational_priority_level", "-updated_at")
+        return (
+            ManagedJob.objects.filter(_production_shop_filter(request.user))
+            .select_related("assigned_shop", "source_quote_request")
+            .distinct()
+            .order_by("-operational_priority_level", "-updated_at")
+        )
 
     def get(self, request, pk=None):
         if pk is not None:

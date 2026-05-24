@@ -115,11 +115,11 @@ class QuoteRequestAttachmentInline(admin.TabularInline):
 
 @admin.register(QuoteRequest)
 class QuoteRequestAdmin(admin.ModelAdmin):
-    list_display = ["id", "shop", "created_by", "customer_name", "status", "delivery_preference", "created_at"]
-    list_filter = ["shop", "status", "delivery_preference"]
+    list_display = ["id", "shop", "assigned_manager", "created_by", "customer_name", "status", "delivery_preference", "created_at"]
+    list_filter = ["shop", "assigned_manager", "status", "delivery_preference"]
     inlines = [QuoteRequestServiceInline, QuoteItemInline, QuoteRequestAttachmentInline]
     fieldsets = (
-        (None, {"fields": ("shop", "created_by", "customer_name", "customer_email", "customer_phone", "customer", "customer_inquiry", "status", "notes")}),
+        (None, {"fields": ("shop", "assigned_manager", "created_by", "customer_name", "customer_email", "customer_phone", "customer", "customer_inquiry", "status", "notes")}),
         ("Delivery", {"fields": ("delivery_preference", "delivery_address", "delivery_location")}),
     )
 

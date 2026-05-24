@@ -25,6 +25,7 @@ from jobs.audit_services import (
     EVENT_SETTLEMENT_RELEASE_READY,
     record_managed_job_event,
 )
+from jobs.file_services import notify_missing_artwork, sync_managed_job_artwork_requirement
 from jobs.choices import (
     JobPaymentChannel,
     JobPaymentMethod,
@@ -448,6 +449,7 @@ def mark_payment_confirmed(
         managed_job.status = ManagedJobStatus.PAYMENT_CONFIRMED
         update_fields.append("status")
     managed_job.save(update_fields=update_fields)
+    has_artwork = sync_managed_job_artwork_requirement(managed_job=managed_job)
 
     initialize_settlement_for_managed_job(
         managed_job=managed_job,
@@ -467,6 +469,8 @@ def mark_payment_confirmed(
             "reconciliation_status": job_payment.reconciliation_status,
         },
     )
+    if not has_artwork:
+        notify_missing_artwork(managed_job=managed_job, source="payment_confirmed")
     return job_payment
 
 

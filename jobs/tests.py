@@ -19,11 +19,13 @@ from jobs.file_services import (
     import_legacy_files_to_managed_job,
     mark_file_print_ready,
     request_revision,
+    upload_artwork_for_managed_job,
     upload_proof_for_managed_job,
 )
 from jobs.assignment_services import (
     accept_assignment,
     mark_assignment_completed,
+    mark_assignment_finishing,
     mark_assignment_in_production,
     mark_assignment_ready,
     reject_assignment,
@@ -762,6 +764,13 @@ class JobPaymentSettlementFoundationTestCase(TestCase):
         self.assertEqual(client_payment["amount"], "1600.00")
         self.assertEqual(client_payment["external_reference"], "")
 
+        shop_payment = JobPaymentSerializer(payment, context={"request": shop_request}).data
+        self.assertIsNone(shop_payment["amount"])
+        self.assertIsNone(shop_payment["expected_amount"])
+        self.assertIsNone(shop_payment["received_amount"])
+        self.assertEqual(shop_payment["payment_status"], "paid")
+        self.assertEqual(shop_payment["status_code"], "paid")
+
         client_settlement = JobSettlementSplitSerializer(settlement, context={"request": client_request}).data
         self.assertEqual(client_settlement["client_total"], "1600.00")
         self.assertIsNone(client_settlement["production_amount"])
@@ -817,6 +826,13 @@ class JobPaymentSettlementFoundationTestCase(TestCase):
         self.assertIsNone(client_settlement.json()["partner_commission"])
 
         self.client.force_authenticate(user=self.owner)
+        shop_payments = self.client.get(f"/api/managed-jobs/{self.managed_job.id}/payments/")
+        self.assertEqual(shop_payments.status_code, 200)
+        self.assertIsNone(shop_payments.json()[0]["amount"])
+        self.assertIsNone(shop_payments.json()[0]["expected_amount"])
+        self.assertIsNone(shop_payments.json()[0]["received_amount"])
+        self.assertEqual(shop_payments.json()[0]["payment_status"], "paid")
+
         shop_settlement = self.client.get(f"/api/managed-jobs/{self.managed_job.id}/settlement/")
         self.assertEqual(shop_settlement.status_code, 200)
         self.assertEqual(shop_settlement.json()["production_amount"], "1000.00")
@@ -1284,6 +1300,7 @@ class JobAssignmentActionsTestCase(TestCase):
         self.assertEqual(self.production_order.status, "pending")
 
         mark_assignment_in_production(assignment=self.assignment, actor=self.owner)
+        mark_assignment_finishing(assignment=self.assignment, actor=self.owner)
         mark_assignment_ready(assignment=self.assignment, actor=self.owner)
         mark_assignment_completed(assignment=self.assignment, actor=self.owner)
         self.assignment.refresh_from_db()
@@ -1293,6 +1310,7 @@ class JobAssignmentActionsTestCase(TestCase):
         self.assertEqual(self.managed_job.status, "completed")
         self.assertEqual(self.production_order.status, "completed")
         self.assertIsNotNone(self.production_order.completed_at)
+        self.assertIn("finishing_started_at", self.assignment.operational_snapshot)
 
     def test_assignment_action_endpoints_and_issue_reporting(self):
         self.client.force_authenticate(user=self.owner)
@@ -1307,6 +1325,8 @@ class JobAssignmentActionsTestCase(TestCase):
         self.assertTrue(self.managed_job.ops_review_required)
 
         self.client.force_authenticate(user=self.ops)
+        in_production_response = self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-in-production/", {"note": "Printing"}, format="json")
+        self.assertEqual(in_production_response.status_code, 200)
         ready_response = self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-ready/", {"note": "Ready"}, format="json")
         self.assertEqual(ready_response.status_code, 200)
         self.assertEqual(ready_response.json()["status"], "ready")
@@ -1319,6 +1339,14 @@ class JobAssignmentActionsTestCase(TestCase):
         payload = response.json()[0]
         self.assertEqual(payload["managed_reference"], self.managed_job.managed_reference)
         self.assertIn("workflow_projection", payload)
+        self.assertEqual(payload["payout_status_label"], "Waiting for job completion")
+        self.assertFalse("client_total" in payload)
+
+    def test_invalid_assignment_transition_returns_400(self):
+        self.client.force_authenticate(user=self.owner)
+        response = self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-ready/", {}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Cannot mark assignment ready", response.json()["detail"])
 
 
 class ManagedJobAuditEventTestCase(TestCase):
@@ -1425,6 +1453,8 @@ class ManagedJobVisibilityEndpointsTestCase(TestCase):
             shop_quote=self.shop_quote,
             accepted_by=self.client_user,
         )
+        self.managed_job.assigned_shop = self.shop
+        self.managed_job.save(update_fields=["assigned_shop", "updated_at"])
         self.assignment = create_assignment_for_managed_job(
             managed_job=self.managed_job,
             shop_quote=self.shop_quote,
@@ -1475,6 +1505,20 @@ class ManagedJobVisibilityEndpointsTestCase(TestCase):
         self.client.force_authenticate(user=self.other_client)
         other_response = self.client.get(f"/api/managed-jobs/{self.managed_job.id}/events/")
         self.assertEqual(other_response.status_code, 403)
+
+    def test_client_can_upload_artwork_and_clear_artwork_required_flag(self):
+        self.managed_job.artwork_required = True
+        self.managed_job.save(update_fields=["artwork_required", "updated_at"])
+        self.client.force_authenticate(user=self.client_user)
+        response = self.client.post(
+            f"/api/managed-jobs/{self.managed_job.id}/files/artwork/",
+            {"file": SimpleUploadedFile("client-artwork.pdf", b"artwork", content_type="application/pdf")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.managed_job.refresh_from_db()
+        self.assertFalse(self.managed_job.artwork_required)
+        self.assertTrue(JobFile.objects.filter(managed_job=self.managed_job, file_type="artwork").exists())
 
 
 class ManagedJobPublicTrackingTestCase(TestCase):

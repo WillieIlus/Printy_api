@@ -54,7 +54,30 @@ class DashboardHomeViewRoleTestCase(TestCase):
             payment_status="pending",
             assignment_status="assigned",
             status="accepted",
+            operational_snapshot={
+                "matched_specs": ["A4", "300gsm", "Gloss lamination"],
+            },
         )
+        cls.quote_request = QuoteRequest.objects.create(
+            shop=cls.shop,
+            created_by=cls.client_user,
+            customer_name="Client Dashboard",
+            status="submitted",
+            request_snapshot={
+                "product_type": "flyer",
+                "product_label": "A4 Flyer",
+                "quantity": 500,
+                "finished_size": "A4",
+                "paper_label": "Art Card",
+                "requested_gsm": 300,
+                "print_sides": "DOUBLE_SIDED",
+                "color_mode": "FULL_COLOR",
+                "lamination": "gloss_lamination",
+                "custom_brief": "Deliver clean trimmed edges.",
+            },
+        )
+        cls.managed_job.source_quote_request = cls.quote_request
+        cls.managed_job.save(update_fields=["source_quote_request", "updated_at"])
         JobAssignment.objects.create(
             managed_job=cls.managed_job,
             assigned_shop=cls.shop,
@@ -76,6 +99,98 @@ class DashboardHomeViewRoleTestCase(TestCase):
         self.assertEqual(payload["recent_jobs"][0]["assigned_shop_name"], "Verified Print Partner")
         self.assertEqual(payload["recent_jobs"][0]["client_total"], "9088.00")
 
+    def test_client_quote_list_includes_partner_managed_requests(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.partner_user,
+            on_behalf_of=self.client_user,
+            customer_name="Client Dashboard",
+            customer_email=self.client_user.email,
+            status="submitted",
+        )
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get("/api/dashboard/client/quotes/")
+
+        self.assertEqual(response.status_code, 200)
+        references = [item["reference"] for item in response.json()["results"]]
+        self.assertIn(quote_request.request_reference or f"QR-{quote_request.id}", references)
+
+    def test_client_quote_list_exposes_safe_assigned_manager_info(self):
+        manager_led_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.client_user,
+            assigned_manager=self.partner_user,
+            customer_name="Managed Client",
+            customer_email=self.client_user.email,
+            status="submitted",
+            request_snapshot={
+                "product_type": "letterheads",
+                "quantity": 500,
+            },
+        )
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get("/api/dashboard/client/quotes/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = next(item for item in response.json()["results"] if item["id"] == manager_led_request.id)
+        self.assertEqual(payload["assigned_manager"]["id"], self.partner_user.id)
+        self.assertEqual(payload["assigned_manager"]["display_name"], self.partner_user.name)
+        self.assertEqual(payload["assigned_manager"]["short_title"], "Print Manager")
+        self.assertEqual(payload["request_snapshot"]["product_type"], "letterheads")
+        self.assertNotIn("email", payload["assigned_manager"])
+        self.assertNotIn("phone", payload["assigned_manager"])
+        self.assertNotIn("broker_commission", payload)
+        self.assertNotIn("production_total", payload)
+
+    def test_client_quote_list_handles_unassigned_manager_led_request(self):
+        manager_led_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.client_user,
+            customer_name="Managed Client",
+            customer_email=self.client_user.email,
+            status="submitted",
+            request_snapshot={
+                "product_type": "flyers",
+                "quantity": 1000,
+            },
+        )
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get("/api/dashboard/client/quotes/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = next(item for item in response.json()["results"] if item["id"] == manager_led_request.id)
+        self.assertIsNone(payload["assigned_manager"])
+        self.assertEqual(payload["request_snapshot"]["product_type"], "flyers")
+
+    def test_client_quote_detail_opens_for_manager_led_request_without_leaking_internal_fields(self):
+        manager_led_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.client_user,
+            assigned_manager=self.partner_user,
+            customer_name="Managed Client",
+            customer_email=self.client_user.email,
+            status="submitted",
+            request_snapshot={
+                "source": "manager_led_intake",
+                "calculator_inputs": {
+                    "product_type": "letterhead",
+                    "quantity": 500,
+                },
+            },
+        )
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get(f"/api/dashboard/client/quotes/{manager_led_request.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["quote"]
+        self.assertEqual(payload["assigned_manager"]["display_name"], self.partner_user.name)
+        self.assertEqual(payload["request_snapshot"]["calculator_inputs"]["product_type"], "letterhead")
+        self.assertEqual(payload["responses"], [])
+
     def test_partner_dashboard_exposes_client_price_but_production_does_not(self):
         self.client.force_authenticate(user=self.partner_user)
 
@@ -90,6 +205,22 @@ class DashboardHomeViewRoleTestCase(TestCase):
         self.assertEqual(production_response.status_code, 200)
         queue_row = production_response.json()["queue"][0]
         self.assertNotIn("client_total", queue_row)
+
+    def test_partner_quote_list_includes_requests_assigned_to_manager(self):
+        assigned_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.client_user,
+            assigned_manager=self.partner_user,
+            customer_name="Assigned Client",
+            status="submitted",
+        )
+        self.client.force_authenticate(user=self.partner_user)
+
+        response = self.client.get("/api/dashboard/partner/quotes/")
+
+        self.assertEqual(response.status_code, 200)
+        ids = [item["id"] for item in response.json()["results"]]
+        self.assertIn(assigned_request.id, ids)
 
     def test_dashboard_role_guards_block_cross_workspace_access(self):
         self.client.force_authenticate(user=self.partner_user)
@@ -111,6 +242,44 @@ class DashboardHomeViewRoleTestCase(TestCase):
         response = self.client.get("/api/dashboard/partner-home/")
 
         self.assertEqual(response.status_code, 200)
+
+    def test_partner_dashboard_returns_200_with_no_jobs_or_requests(self):
+        empty_partner = User.objects.create_user(
+            email="empty-partner-dashboard@test.com",
+            password="pass12345",
+            role=User.Role.PARTNER,
+            partner_profile_enabled=True,
+        )
+        self.client.force_authenticate(user=empty_partner)
+
+        response = self.client.get("/api/dashboard/partner-home/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["recent_jobs"], [])
+        self.assertEqual(payload["quote_requests"], [])
+
+    def test_partner_dashboard_handles_manager_led_request_without_shop(self):
+        manager_led_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.client_user,
+            assigned_manager=self.partner_user,
+            customer_name="Manager Led Client",
+            customer_email="manager-led-client@test.com",
+            status="submitted",
+            request_snapshot={"source": "manager_led_intake"},
+        )
+        self.client.force_authenticate(user=self.partner_user)
+
+        response = self.client.get("/api/dashboard/partner-home/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        request_row = next(item for item in payload["quote_requests"] if item["id"] == manager_led_request.id)
+        self.assertEqual(request_row["shop_name"], "Awaiting production match")
+        self.assertEqual(request_row["customer_name"], "Manager Led Client")
+        self.assertNotIn("customer_email", request_row)
+        self.assertNotIn("request_snapshot", request_row)
 
     def test_production_can_access_production_dashboard(self):
         self.client.force_authenticate(user=self.production_user)
@@ -140,6 +309,9 @@ class DashboardHomeViewRoleTestCase(TestCase):
         self.assertEqual(production_response.status_code, 200)
         self.assertEqual(production_response.json()["job"]["pricing"]["production_total"], str(self.managed_job.production_total))
         self.assertIsNone(production_response.json()["job"]["pricing"]["client_total"])
+        self.assertEqual(production_response.json()["job"]["specs"]["quantity"], 500)
+        self.assertEqual(production_response.json()["job"]["specs"]["paper"], "Art Card (300gsm)")
+        self.assertEqual(production_response.json()["job"]["specs"]["finishing"], "Gloss Lamination")
 
     def test_legacy_shop_route_target_has_new_production_jobs_api(self):
         self.client.force_authenticate(user=self.production_user)

@@ -25,9 +25,12 @@ from pricing.choices import ChargeUnit, ColorMode, FinishingBillingBasis, Finish
 from pricing.models import FinishingRate, Material, PrintingRate, VolumeDiscount
 from production.models import Customer
 from quotes.choices import QuoteStatus, ShopQuoteStatus
-from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteRequest, QuoteRequestMessage, ShopQuote
-from jobs.models import JobAssignment, JobFile, ManagedJob
+from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteItemFinishing, QuoteRequest, QuoteRequestMessage, QuoteShareLink, ShopQuote
+from jobs.managed_services import create_managed_job_from_accepted_quote
+from jobs.models import JobAssignment, JobFile, JobPayment, ManagedJob
+from jobs.serializers import JobPaymentSerializer
 from services.public_matching import recompute_shop_match_readiness
+from services.pricing.mvp_rate_card import build_shop_rate_card_setup
 from shops.models import Shop
 
 
@@ -255,6 +258,8 @@ class AnalyticsDashboardSummaryAPITestCase(TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
+        self.assertEqual(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["sample_count"], 0)
+        self.assertFalse(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["has_enough_data"])
         self.assertEqual(data["total_visits_today"], 3)
         self.assertEqual(data["total_visits_this_week"], 3)
         self.assertEqual(data["total_visits_this_month"], 4)
@@ -2699,119 +2704,605 @@ class QuoteWorkflowAPITestCase(TestCase):
 
         list_requests = self.client.get("/api/workflow/quote-requests/")
         self.assertEqual(list_requests.status_code, 200)
-        self.assertEqual(list_requests.json()[0]["latest_response"]["status"], "modified")
 
-        patch_quote_response = self.client.patch(
-            f"/api/workflow/quote-responses/{response_id}/",
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class ManagerLedQuoteIntakeAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.end_client = User.objects.create_user(
+            email="manager-led-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Managed Client",
+        )
+        self.partner_manager = User.objects.create_user(
+            email="manager-led-partner@test.com",
+            password="pass12345",
+            role="partner",
+            partner_profile_enabled=True,
+            name="Partner Manager",
+        )
+        self.random_partner = User.objects.create_user(
+            email="manager-led-random@test.com",
+            password="pass12345",
+            role="partner",
+            partner_profile_enabled=True,
+            name="Random Partner",
+        )
+        self.shop_owner_manager = User.objects.create_user(
+            email="manager-led-shop-owner@test.com",
+            password="pass12345",
+            role="shop_owner",
+            name="Hybrid Shop Owner",
+        )
+        self.inactive_partner = User.objects.create_user(
+            email="inactive-manager@test.com",
+            password="pass12345",
+            role="partner",
+            partner_profile_enabled=True,
+            name="Inactive Manager",
+            is_active=False,
+        )
+        self.normal_client = User.objects.create_user(
+            email="normal-client-manager@test.com",
+            password="pass12345",
+            role="client",
+            name="Normal Client",
+        )
+        self.production_shop_owner = User.objects.create_user(
+            email="manager-led-production-owner@test.com",
+            password="pass12345",
+            role="shop_owner",
+        )
+        self.production_shop = Shop.objects.create(
+            owner=self.production_shop_owner,
+            name="Manager Intake Shop",
+            slug="manager-intake-shop",
+            is_active=True,
+        )
+
+    def _create_draft(self):
+        self.client.force_authenticate(user=self.end_client)
+        response = self.client.post(
+            "/api/calculator/drafts/",
             {
-                "status": "accepted",
-                "note": "Accepted internally",
+                "title": "Manager-led intake",
+                "calculator_inputs_snapshot": {
+                    "quantity": 250,
+                    "print_sides": "DUPLEX",
+                    "color_mode": "COLOR",
+                    "custom_title": "Business Cards",
+                },
+                "pricing_snapshot": {
+                    "currency": "KES",
+                    "min_price": "1200.00",
+                    "max_price": "1800.00",
+                    "pricing_preview": {"totals": {"grand_total": "1500.00"}},
+                },
+                "request_details_snapshot": {"customer_name": "Managed Client", "notes": "Please check artwork."},
             },
             format="json",
         )
-        self.assertEqual(patch_quote_response.status_code, 200)
-        self.assertEqual(patch_quote_response.json()["status"], "accepted")
-        self.assertTrue(Notification.objects.filter(
-            user=self.customer,
-            notification_type=Notification.SHOP_QUOTE_REVISED,
-            object_id=response_id,
-        ).exists())
+        self.assertEqual(response.status_code, 201)
+        return response.json()["id"]
 
-        request_record = QuoteRequest.objects.get(pk=request_id)
-        response_record = ShopQuote.objects.get(pk=response_id)
-        self.assertEqual(request_record.status, "quoted")
-        self.assertEqual(response_record.response_snapshot["pricing"]["grand_total"], "2550.00")
+    def test_manager_led_quote_request_can_be_created_with_shop_null_and_assigned_manager(self):
+        draft_id = self._create_draft()
 
-        self.client.force_authenticate(user=self.customer)
-        response_list = self.client.get(f"/api/quote-requests/{request_id}/responses/")
-        self.assertEqual(response_list.status_code, 200)
-        self.assertEqual(response_list.json()[0]["status"], "accepted")
-        self.assertIn("whatsapp_available", response_list.json()[0])
-        self.assertIn("whatsapp_label", response_list.json()[0])
-
-    def test_workflow_accept_creates_managed_job_idempotently(self):
-        quote_request = QuoteRequest.objects.create(
-            shop=self.shop,
-            created_by=self.customer,
-            customer_name="Workflow Client",
-            customer_email="workflow-client@test.com",
-            status=QuoteStatus.QUOTED,
-            request_snapshot={
-                "source": "calculator_draft_send",
-                "visibility": {
-                    "actor": "client",
-                    "topology_mode": "managed",
-                    "exposes_internal_economics": False,
-                },
+        response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {
+                "selected_manager_id": self.partner_manager.id,
+                "request_details_snapshot": {"customer_name": "Managed Client", "notes": "Please check artwork."},
             },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.json()[0]
+        quote_request = QuoteRequest.objects.get(pk=payload["id"])
+        self.assertIsNone(quote_request.shop_id)
+        self.assertEqual(quote_request.assigned_manager_id, self.partner_manager.id)
+        self.assertEqual(payload["assigned_manager"]["id"], self.partner_manager.id)
+        self.assertEqual(payload["request_snapshot"]["source"], "manager_led_intake")
+        self.assertTrue(QuoteItem.objects.filter(quote_request=quote_request).exists())
+
+    def test_invalid_manager_id_is_rejected(self):
+        draft_id = self._create_draft()
+
+        response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"selected_manager_id": 999999},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("selected_manager_id", response.json()["field_errors"])
+
+    def test_inactive_manager_id_is_rejected(self):
+        draft_id = self._create_draft()
+
+        response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"selected_manager_id": self.inactive_partner.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("selected_manager_id", response.json()["field_errors"])
+
+    def test_normal_client_user_cannot_be_assigned_as_manager(self):
+        draft_id = self._create_draft()
+
+        response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"selected_manager_id": self.normal_client.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("selected_manager_id", response.json()["field_errors"])
+
+    def test_shop_owner_with_manager_capability_can_be_assigned(self):
+        draft_id = self._create_draft()
+
+        response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"selected_manager_id": self.shop_owner_manager.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=response.json()[0]["id"])
+        self.assertEqual(quote_request.assigned_manager_id, self.shop_owner_manager.id)
+
+    def test_auto_assign_creates_unassigned_manager_led_request(self):
+        draft_id = self._create_draft()
+
+        response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"request_details_snapshot": {"customer_name": "Managed Client"}},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.json()[0]
+        quote_request = QuoteRequest.objects.get(pk=payload["id"])
+        self.assertIsNone(quote_request.shop_id)
+        self.assertIsNone(quote_request.assigned_manager_id)
+        self.assertEqual(payload["request_snapshot"]["source"], "manager_led_intake")
+
+    def test_assigned_manager_can_see_request_but_random_partner_cannot(self):
+        draft_id = self._create_draft()
+        create_response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"selected_manager_id": self.partner_manager.id},
+            format="json",
+        )
+        request_id = create_response.json()[0]["id"]
+
+        self.client.force_authenticate(user=self.partner_manager)
+        partner_response = self.client.get(f"/api/dashboard/partner/quotes/{request_id}/")
+        self.assertEqual(partner_response.status_code, 200)
+        self.assertEqual(partner_response.json()["quote"]["id"], request_id)
+
+        self.client.force_authenticate(user=self.random_partner)
+        hidden_response = self.client.get(f"/api/dashboard/partner/quotes/{request_id}/")
+        self.assertEqual(hidden_response.status_code, 404)
+
+    def test_shop_cannot_see_manager_led_request_before_dispatch(self):
+        draft_id = self._create_draft()
+        create_response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"selected_manager_id": self.partner_manager.id},
+            format="json",
+        )
+        request_id = create_response.json()[0]["id"]
+
+        self.client.force_authenticate(user=self.production_shop_owner)
+        response = self.client.get(f"/api/shops/{self.production_shop.slug}/incoming-requests/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        rows = payload if isinstance(payload, list) else payload["results"]
+        self.assertNotIn(request_id, [row["id"] for row in rows])
+
+    def test_client_request_detail_exposes_manager_safe_payload_only(self):
+        draft_id = self._create_draft()
+        create_response = self.client.post(
+            f"/api/calculator/drafts/{draft_id}/send/",
+            {"selected_manager_id": self.partner_manager.id},
+            format="json",
+        )
+        request_id = create_response.json()[0]["id"]
+
+        response = self.client.get(f"/api/client/requests/{request_id}/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["assigned_manager"]["id"], self.partner_manager.id)
+        self.assertNotIn("email", payload["assigned_manager"])
+        self.assertIsNone(payload["shop"])
+        self.assertEqual(payload["responses"], [])
+
+    def test_managed_job_acceptance_uses_assigned_manager_as_broker(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=self.production_shop,
+            created_by=self.end_client,
+            assigned_manager=self.partner_manager,
+            customer_name="Managed Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={"source": "manager_led_intake"},
         )
         shop_quote = ShopQuote.objects.create(
             quote_request=quote_request,
-            shop=self.shop,
-            created_by=self.owner,
-            status=ShopQuoteStatus.SENT,
-            total=Decimal("2550.00"),
-            response_snapshot={"pricing": {"grand_total": "2550.00"}},
-        )
-        quote_request.attachments.create(
-            file=SimpleUploadedFile("workflow-brief.pdf", b"workflow brief", content_type="application/pdf"),
-            name="Workflow brief",
-        )
-        shop_quote.attachments.create(
-            file=SimpleUploadedFile("workflow-proof.pdf", b"workflow proof", content_type="application/pdf"),
-            name="Workflow proof",
+            shop=self.production_shop,
+            created_by=self.production_shop_owner,
+            status=ShopQuoteStatus.ACCEPTED,
+            total=Decimal("1800.00"),
+            accepted_at=timezone.now(),
+            response_snapshot={"pricing": {"grand_total": "1800.00"}},
         )
 
-        self.client.force_authenticate(user=self.customer)
-        accept_response = self.client.post(
-            f"/api/client/responses/{shop_quote.id}/accept/",
-            {},
-            format="json",
-        )
-        self.assertEqual(accept_response.status_code, 200)
-        self.assertEqual(ManagedJob.objects.filter(source_shop_quote=shop_quote).count(), 1)
-        self.assertEqual(JobAssignment.objects.filter(source_shop_quote=shop_quote).count(), 1)
-        self.assertEqual(JobFile.objects.filter(managed_job__source_shop_quote=shop_quote).count(), 2)
-
-        managed_job = ManagedJob.objects.get(source_shop_quote=shop_quote)
-        assignment = JobAssignment.objects.get(source_shop_quote=shop_quote)
-        self.assertEqual(managed_job.source_quote_request_id, quote_request.id)
-        self.assertEqual(managed_job.client_id, self.customer.id)
-        self.assertEqual(managed_job.assigned_shop_id, self.shop.id)
-        self.assertEqual(managed_job.status, "awaiting_payment")
-        self.assertEqual(managed_job.topology_type, "client_printy_support")
-        self.assertEqual(
-            managed_job.commercial_snapshot["visibility"]["exposes_internal_economics"],
-            False,
-        )
-        self.assertEqual(assignment.managed_job_id, managed_job.id)
-        self.assertEqual(assignment.assigned_shop_id, self.shop.id)
-        self.assertEqual(assignment.status, "pending")
-        self.assertEqual(
-            set(JobFile.objects.filter(managed_job=managed_job).values_list("original_filename", flat=True)),
-            {"Workflow brief", "Workflow proof"},
+        managed_job = create_managed_job_from_accepted_quote(
+            quote_request=quote_request,
+            shop_quote=shop_quote,
+            accepted_by=self.end_client,
         )
 
-        self.client.force_authenticate(user=self.owner)
-        create_job_response = self.client.post(
-            f"/api/sent-quotes/{shop_quote.id}/create-job/",
+        self.assertEqual(managed_job.broker_id, self.partner_manager.id)
+        self.assertEqual(managed_job.relationship_snapshot["owner_type"], "user")
+        self.assertEqual(managed_job.relationship_snapshot["owner_user_id"], self.partner_manager.id)
+
+
+class RecommendedPrintManagerAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.returning_client = User.objects.create_user(
+            email="manager-recommend-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Returning Client",
+        )
+        self.partner_manager = User.objects.create_user(
+            email="recommended-partner@test.com",
+            password="pass12345",
+            role="partner",
+            name="Nairobi Print Desk",
+            partner_profile_enabled=True,
+        )
+        self.previous_manager = User.objects.create_user(
+            email="previous-manager@test.com",
+            password="pass12345",
+            role="broker",
+            name="Trusted Manager",
+            partner_profile_enabled=True,
+        )
+        self.shop_owner_manager = User.objects.create_user(
+            email="shop-owner-manager@test.com",
+            password="pass12345",
+            role="shop_owner",
+            name="Factory Floor Manager",
+        )
+        self.inactive_partner = User.objects.create_user(
+            email="inactive-recommended-partner@test.com",
+            password="pass12345",
+            role="partner",
+            name="Inactive Manager",
+            partner_profile_enabled=True,
+            is_active=False,
+        )
+        self.normal_client = User.objects.create_user(
+            email="ineligible-manager@test.com",
+            password="pass12345",
+            role="client",
+            name="Normal Client",
+        )
+        UserProfile.objects.create(
+            user=self.partner_manager,
+            bio="Helps with flyers and brochures.",
+            phone="+254700000001",
+            city="Nairobi",
+            state="Westlands",
+            avatar="/media/avatars/partner-manager.png",
+        )
+        UserProfile.objects.create(
+            user=self.previous_manager,
+            bio="Knows your repeat print jobs.",
+            phone="+254700000002",
+            city="Nairobi",
+        )
+
+        ManagedJob.objects.create(
+            title="Previous client job",
+            client=self.returning_client,
+            created_by=self.returning_client,
+            broker=self.previous_manager,
+            status="completed",
+            completed_at=timezone.now(),
+        )
+        ManagedJob.objects.create(
+            title="Partner completed job one",
+            client=self.returning_client,
+            created_by=self.returning_client,
+            broker=self.partner_manager,
+            status="completed",
+            completed_at=timezone.now() - timedelta(days=3),
+        )
+        ManagedJob.objects.create(
+            title="Partner completed job two",
+            client=self.returning_client,
+            created_by=self.returning_client,
+            broker=self.partner_manager,
+            status="completed",
+            completed_at=timezone.now() - timedelta(days=4),
+        )
+        ManagedJob.objects.create(
+            title="Shop owner completed job",
+            client=self.returning_client,
+            created_by=self.returning_client,
+            broker=self.shop_owner_manager,
+            status="completed",
+            completed_at=timezone.now() - timedelta(days=5),
+        )
+
+    def test_recommended_endpoint_prioritizes_previous_manager_and_keeps_payload_safe(self):
+        self.client.force_authenticate(user=self.returning_client)
+
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
             {
-                "title": "Workflow production job",
-                "quantity": 100,
-                "status": "pending",
-                "delivery_status": "pending",
+                "product_type": "business_card",
+                "quantity": 250,
+                "paper_gsm": 300,
+                "size": "85x55mm",
+                "client_id": self.returning_client.id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["results"][0]["id"], self.previous_manager.id)
+        self.assertTrue(payload["results"][0]["is_previous_manager"])
+        self.assertEqual(payload["results"][0]["recommendation_reason"], "You have worked with this Print Manager before.")
+        self.assertNotIn("email", payload["results"][0])
+        self.assertNotIn("phone", payload["results"][0])
+        self.assertNotIn("broker_commission", payload["results"][0])
+        self.assertNotIn("client_total", payload["results"][0])
+        self.assertEqual(payload["meta"]["product_type"], "business_card")
+        self.assertEqual(payload["meta"]["quantity"], 250)
+        self.assertTrue(payload["meta"]["previous_manager_active"])
+
+    def test_endpoint_includes_only_eligible_active_managers(self):
+        self.client.force_authenticate(user=self.returning_client)
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
+            {"product_type": "business_card", "quantity": 250},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        ids = [row["id"] for row in response.json()["results"]]
+        self.assertIn(self.partner_manager.id, ids)
+        self.assertIn(self.shop_owner_manager.id, ids)
+        self.assertNotIn(self.inactive_partner.id, ids)
+        self.assertNotIn(self.normal_client.id, ids)
+
+    def test_endpoint_returns_safe_empty_list_when_no_managers_are_eligible(self):
+        self.client.force_authenticate(user=self.returning_client)
+        self.partner_manager.is_active = False
+        self.partner_manager.save(update_fields=["is_active", "updated_at"])
+        self.previous_manager.is_active = False
+        self.previous_manager.save(update_fields=["is_active", "updated_at"])
+        self.shop_owner_manager.is_active = False
+        self.shop_owner_manager.save(update_fields=["is_active", "updated_at"])
+
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
+            {"product_type": "business_card", "quantity": 250},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["results"], [])
+        self.assertIn("Printy will handle your job directly", payload["message"])
+        self.assertFalse(payload["meta"]["previous_manager_active"])
+
+    def test_endpoint_handles_client_without_previous_manager(self):
+        new_client = User.objects.create_user(
+            email="first-time-manager-recommend-client@test.com",
+            password="pass12345",
+            role="client",
+            name="First Time Client",
+        )
+        self.client.force_authenticate(user=new_client)
+
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
+            {"product_type": "business_card", "quantity": 250},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertGreaterEqual(len(payload["results"]), 1)
+        self.assertFalse(payload["meta"]["previous_manager_active"])
+        self.assertFalse(any(row["is_previous_manager"] for row in payload["results"]))
+
+    def test_endpoint_handles_eligible_manager_without_profile(self):
+        self.client.force_authenticate(user=self.returning_client)
+
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
+            {"product_type": "business_card", "quantity": 250},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        manager_row = next(row for row in payload["results"] if row["id"] == self.shop_owner_manager.id)
+        self.assertEqual(manager_row["display_name"], "Factory Floor Manager")
+        self.assertEqual(manager_row["brand_name"], "Factory Floor Manager")
+        self.assertEqual(manager_row["specializations"], [])
+
+    def test_endpoint_rejects_invalid_client_id_safely(self):
+        self.client.force_authenticate(user=self.returning_client)
+
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
+            {
+                "product_type": "business_card",
+                "quantity": 250,
+                "client_id": "not-a-number",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertIn("client_id", payload["field_errors"])
+
+
+class RecommendedManagerAPITestCase(RecommendedPrintManagerAPITestCase):
+    pass
+
+
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class IntakeSubmitArtworkReminderTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client_user = User.objects.create_user(
+            email="intake-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Intake Client",
+        )
+        self.manager = User.objects.create_user(
+            email="intake-manager@test.com",
+            password="pass12345",
+            role="partner",
+            name="Intake Manager",
+            partner_profile_enabled=True,
+        )
+        self.client.force_authenticate(user=self.client_user)
+
+    def test_missing_artwork_triggers_client_reminder_notification_and_email(self):
+        response = self.client.post(
+            "/api/intake/submit/",
+            {
+                "selected_manager_id": self.manager.id,
+                "calculator_inputs_snapshot": {
+                    "product_type": "business_card",
+                    "quantity": 250,
+                    "finished_size": "85x55mm",
+                },
+                "request_details_snapshot": {
+                    "customer_name": "Intake Client",
+                    "notes": "Please quote this.",
+                },
             },
             format="json",
         )
-        self.assertEqual(create_job_response.status_code, 201)
-        self.assertEqual(ManagedJob.objects.filter(source_shop_quote=shop_quote).count(), 1)
-        self.assertEqual(JobAssignment.objects.filter(source_shop_quote=shop_quote).count(), 1)
-        managed_job.refresh_from_db()
-        assignment.refresh_from_db()
-        self.assertIsNotNone(managed_job.source_production_order_id)
-        self.assertEqual(managed_job.operational_snapshot["production_order_id"], managed_job.source_production_order_id)
-        self.assertEqual(assignment.production_order_id, managed_job.source_production_order_id)
-        self.assertEqual(assignment.status, "accepted")
+
+        self.assertEqual(response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=response.json()["intake_id"])
+        reminders = Notification.objects.filter(
+            user=self.client_user,
+            object_type="quote_request",
+            object_id=quote_request.id,
+            message__icontains="Don't forget to upload your artwork",
+        )
+        self.assertTrue(reminders.exists())
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("upload your artwork", mail.outbox[0].body.lower())
+
+    def test_artwork_reference_skips_client_reminder(self):
+        response = self.client.post(
+            "/api/intake/submit/",
+            {
+                "selected_manager_id": self.manager.id,
+                "artwork_reference": "cards-final.pdf",
+                "calculator_inputs_snapshot": {
+                    "product_type": "business_card",
+                    "quantity": 250,
+                    "finished_size": "85x55mm",
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(
+            Notification.objects.filter(
+                user=self.client_user,
+                message__icontains="Don't forget to upload your artwork",
+            ).exists()
+        )
+        self.assertEqual(len(mail.outbox), 0)
+
+
+class ShopPaymentVisibilityTestCase(TestCase):
+    def setUp(self):
+        self.client_user = User.objects.create_user(email="api-payment-client@test.com", password="pass12345", role="client")
+        self.partner = User.objects.create_user(email="api-payment-partner@test.com", password="pass12345", role="broker")
+        self.owner = User.objects.create_user(email="api-payment-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="API Payment Shop", slug="api-payment-shop", is_active=True)
+        self.quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.client_user,
+            customer_name="API Payment Client",
+            customer_email=self.client_user.email,
+            status=QuoteStatus.CLOSED,
+            request_snapshot={"source": "manager_led_intake"},
+        )
+        self.shop_quote = ShopQuote.objects.create(
+            quote_request=self.quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.ACCEPTED,
+            total=Decimal("1600.00"),
+        )
+        self.managed_job = ManagedJob.objects.create(
+            title="API Payment Job",
+            source_quote_request=self.quote_request,
+            source_shop_quote=self.shop_quote,
+            client=self.client_user,
+            broker=self.partner,
+            assigned_shop=self.shop,
+            created_by=self.client_user,
+            status="awaiting_payment",
+            payment_status="pending",
+            client_total=Decimal("1600.00"),
+            production_total=Decimal("1000.00"),
+            platform_fee=Decimal("300.00"),
+            broker_commission=Decimal("300.00"),
+            relationship_snapshot={
+                "owner_type": "user",
+                "owner_reference": f"user:{self.partner.id}",
+                "owner_user_id": self.partner.id,
+                "owner_shop_id": None,
+                "acquisition_source": "partner",
+            },
+        )
+
+    def test_shop_actor_cannot_see_client_payment_amount_fields(self):
+        payment = JobPayment.objects.create(
+            managed_job=self.managed_job,
+            payer=self.client_user,
+            amount=Decimal("1600.00"),
+            expected_amount=Decimal("1600.00"),
+            received_amount=Decimal("1600.00"),
+            payment_method="mpesa",
+            payment_status="paid",
+            external_reference="PAY-456",
+        )
+        shop_request = type("Request", (), {"user": self.owner})()
+
+        payload = JobPaymentSerializer(payment, context={"request": shop_request}).data
+
+        self.assertIsNone(payload["amount"])
+        self.assertIsNone(payload["expected_amount"])
+        self.assertIsNone(payload["received_amount"])
+        self.assertEqual(payload["payment_status"], "paid")
+        self.assertEqual(payload["status_code"], "paid")
 
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
@@ -3704,6 +4195,206 @@ class PublicMatchShopsAPITestCase(TestCase):
         self.assertNotIn("selection", payload["matches"][0])
 
 
+class PartnerProductionMatchAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.partner = User.objects.create_user(email="partner-match@test.com", password="pass12345", role="partner")
+        self.admin_user = User.objects.create_user(email="admin-match@test.com", password="pass12345", role="admin", is_staff=True)
+        self.client_user = User.objects.create_user(email="client-match@test.com", password="pass12345", role="client")
+
+        self.complete_shop = Shop.objects.create(
+            owner=User.objects.create_user(email="complete-owner@test.com", password="pass12345", role="shop_owner"),
+            name="Complete Shop",
+            slug="complete-shop",
+            is_active=True,
+            is_public=True,
+            city="Nairobi",
+            service_area="Westlands",
+        )
+        self.missing_paper_shop = Shop.objects.create(
+            owner=User.objects.create_user(email="no-paper-owner@test.com", password="pass12345", role="shop_owner"),
+            name="No Paper Shop",
+            slug="no-paper-shop",
+            is_active=True,
+            is_public=False,
+            city="Nairobi",
+        )
+        self.missing_finishing_shop = Shop.objects.create(
+            owner=User.objects.create_user(email="no-finishing-owner@test.com", password="pass12345", role="shop_owner"),
+            name="No Finishing Shop",
+            slug="no-finishing-shop",
+            is_active=True,
+            is_public=False,
+            city="Nairobi",
+        )
+        self.missing_price_shop = Shop.objects.create(
+            owner=User.objects.create_user(email="no-price-owner@test.com", password="pass12345", role="shop_owner"),
+            name="No Price Shop",
+            slug="no-price-shop",
+            is_active=True,
+            is_public=False,
+            city="Nairobi",
+        )
+
+        self._configure_complete_shop(self.complete_shop, include_cutting=True, with_rate=True)
+        self._configure_complete_shop(self.missing_paper_shop, include_cutting=True, with_rate=True, include_paper=False)
+        self._configure_complete_shop(self.missing_finishing_shop, include_cutting=False, with_rate=True)
+        self._configure_complete_shop(self.missing_price_shop, include_cutting=True, with_rate=False)
+        recompute_shop_match_readiness(self.complete_shop)
+        recompute_shop_match_readiness(self.missing_paper_shop)
+        recompute_shop_match_readiness(self.missing_finishing_shop)
+        recompute_shop_match_readiness(self.missing_price_shop)
+
+    def _configure_complete_shop(self, shop, *, include_cutting: bool, with_rate: bool, include_paper: bool = True):
+        machine = Machine.objects.create(
+            shop=shop,
+            name=f"{shop.name} Press",
+            max_width_mm=320,
+            max_height_mm=450,
+            is_active=True,
+        )
+        paper = None
+        if include_paper:
+            paper = Paper.objects.create(
+                shop=shop,
+                name="300gsm Art Card",
+                sheet_size="SRA3",
+                gsm=300,
+                paper_type="GLOSS",
+                buying_price=Decimal("10.00"),
+                selling_price=Decimal("24.00"),
+                width_mm=320,
+                height_mm=450,
+                is_active=True,
+            )
+        if with_rate:
+            PrintingRate.objects.create(
+                machine=machine,
+                sheet_size="SRA3",
+                color_mode="COLOR",
+                single_price=Decimal("45.00"),
+                double_price=Decimal("75.00"),
+                is_active=True,
+            )
+        if include_cutting:
+            FinishingRate.objects.create(
+                shop=shop,
+                name="Cutting",
+                slug=f"cutting-{shop.id}",
+                charge_unit=ChargeUnit.FLAT,
+                billing_basis=FinishingBillingBasis.FLAT_PER_JOB,
+                side_mode=FinishingSideMode.IGNORE_SIDES,
+                price=Decimal("50.00"),
+                is_active=True,
+            )
+        return machine, paper
+
+    def test_partner_match_endpoint_returns_complete_and_rejected_rows(self):
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(
+            "/api/partner/production-matches/",
+            {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "85x55mm",
+                "paper_stock": "300gsm",
+                "print_sides": "SIMPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["visibility"]["exposes_internal_economics"])
+        rows = {row["shop_display_name"]: row for row in payload["results"]}
+
+        complete = rows["Complete Shop"]
+        self.assertTrue(complete["can_produce"])
+        self.assertTrue(complete["price_available"])
+        self.assertEqual(complete["price_status"], "priced")
+        self.assertIsNotNone(complete["production_cost"])
+        self.assertIn("Pricing path available", " ".join(complete["available_reasons"]))
+
+        missing_paper = rows["No Paper Shop"]
+        self.assertFalse(missing_paper["can_produce"])
+        self.assertIn("paper", missing_paper["missing_requirements"])
+
+        missing_finishing = rows["No Finishing Shop"]
+        self.assertFalse(missing_finishing["can_produce"])
+        self.assertIn("finishing", missing_finishing["missing_requirements"])
+        self.assertIn("cutting", missing_finishing["missing_requirements"])
+
+        missing_price = rows["No Price Shop"]
+        self.assertFalse(missing_price["can_produce"])
+        self.assertEqual(missing_price["price_status"], "missing_pricing")
+        self.assertIn("pricing", missing_price["missing_requirements"])
+
+    def test_partner_match_endpoint_rejects_client_accounts(self):
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.post(
+            "/api/partner/production-matches/",
+            {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "85x55mm",
+                "paper_stock": "300gsm",
+                "print_sides": "SIMPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_admin_can_access_partner_match_endpoint(self):
+        self.client.force_authenticate(user=self.admin_user)
+
+        response = self.client.post(
+            "/api/partner/production-matches/",
+            {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "85x55mm",
+                "paper_stock": "300gsm",
+                "print_sides": "SIMPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        complete = next(row for row in payload["results"] if row["shop_display_name"] == "Complete Shop")
+        self.assertTrue(complete["price_available"])
+        self.assertIsNotNone(complete["production_cost"])
+
+    def test_public_match_endpoint_does_not_expose_partner_production_fields(self):
+        response = self.client.post(
+            "/api/public/match-shops/",
+            {
+                "pricing_mode": "custom",
+                "product_family": "flat",
+                "quantity": 100,
+                "width_mm": 85,
+                "height_mm": 55,
+                "paper_gsm": 300,
+                "paper_type": "GLOSS",
+                "print_sides": "SIMPLEX",
+                "colour_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["matches"])
+        self.assertNotIn("production_cost", payload["matches"][0])
+        self.assertFalse(payload["visibility"]["exposes_internal_economics"])
+
+
 class ClientVisibilitySerializerTestCase(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -3818,6 +4509,23 @@ class ClientVisibilitySerializerTestCase(TestCase):
         response = self.client.get(f"/api/client/requests/{self.quote_request.id}/")
 
         self.assertEqual(response.status_code, 404)
+
+    def test_on_behalf_of_client_can_access_request_detail(self):
+        partner = User.objects.create_user(
+            email="visibility-partner@test.com",
+            password="pass12345",
+            role="broker",
+            partner_profile_enabled=True,
+        )
+        self.quote_request.created_by = partner
+        self.quote_request.on_behalf_of = self.customer
+        self.quote_request.save(update_fields=["created_by", "on_behalf_of", "updated_at"])
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.get(f"/api/client/requests/{self.quote_request.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], self.quote_request.id)
 
 
 class CalculatorPreviewSerializerTestCase(TestCase):
@@ -4056,13 +4764,12 @@ class MvpRateCardPublicPreviewAPITestCase(TestCase):
                 "paper_prices": [
                     {
                         "key": "300gsm_matte_art_card",
-                        "single_side_price": "62.00",
-                        "double_side_price": "102.00",
+                        "paper_base_price": "35.00",
                         "active": True,
                     }
                 ],
                 "finishings": [
-                    {"key": "matte_lamination", "price": "38.00", "active": True},
+                    {"key": "matte_lamination_double", "price": "20.00", "minimum_charge": "60.00", "active": True},
                     {"key": "cutting", "price": "480.00", "active": True},
                 ],
             },
@@ -4072,15 +4779,42 @@ class MvpRateCardPublicPreviewAPITestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         data = response.json()
         paper_row = next(row for row in data["paper_rows"] if row["key"] == "300gsm_matte_art_card")
-        finishing_row = next(row for row in data["finishing_rows"] if row["key"] == "matte_lamination")
+        finishing_row = next(row for row in data["finishing_rows"] if row["key"] == "matte_lamination_double")
         self.assertEqual(paper_row["label"], "300gsm Matte/Art Card")
-        self.assertEqual(paper_row["size"], "SRA3/A3")
-        self.assertEqual(finishing_row["label"], "Matte Lamination")
+        self.assertEqual(paper_row["size"], "SRA3")
+        self.assertEqual(paper_row["quantity_in_stock"], 500)
+        self.assertEqual(paper_row["manager_visible_single_total"], "60.00")
+        self.assertEqual(paper_row["manager_visible_double_total"], "75.00")
+        self.assertIn("30 + 15 + 10 = 55", next(row for row in data["paper_rows"] if row["key"] == "250gsm_matte")["formula_shop_visible"]["single"])
+        self.assertEqual(next(row for row in data["paper_rows"] if row["key"] == "130gsm_matte_art")["quantity_in_stock"], 2000)
+        self.assertEqual(finishing_row["label"], "Matt Lamination Double")
         self.assertEqual(finishing_row["pricing_mode"], "per_sheet")
+        self.assertEqual(finishing_row["preview"]["final_total"], "100.00")
         self.assertEqual(data["summary"]["paper_rows_added"], 1)
-        self.assertEqual(data["example_quote"]["production_cost"], "1180.00")
-        self.assertEqual(data["example_quote"]["client_price"], "1888.00")
-        self.assertEqual(data["example_quote"]["estimated_total"], "1888.00")
+        self.assertIn("Business Cards", data["summary"]["unlocked_products"][0]["label"])
+        self.assertEqual(data["example_quote"]["production_cost"], "955.00")
+        self.assertEqual(data["example_quote"]["sample_job_previews"][0]["pieces_per_sheet"], 21)
+
+    def test_public_preview_disables_double_sided_for_sticker_and_returns_warning(self):
+        response = self.client.post(
+            "/api/for-shops/rate-card/public-preview/",
+            {
+                "paper_prices": [
+                    {
+                        "key": "150gsm_tictac_sticker",
+                        "paper_base_price": "25.00",
+                        "active": True,
+                    }
+                ]
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        paper_row = next(row for row in response.json()["paper_rows"] if row["key"] == "150gsm_tictac_sticker")
+        self.assertFalse(paper_row["double_sided_enabled"])
+        self.assertIsNone(paper_row["double_side_price"])
+        self.assertIn("Double-sided is disabled for sticker stock.", paper_row["warnings"])
 
     def test_public_preview_returns_400_for_unknown_predefined_key(self):
         response = self.client.post(
@@ -4119,8 +4853,43 @@ class MvpRateCardPublicPreviewAPITestCase(TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["sample_count"], 0)
-        self.assertFalse(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["has_enough_data"])
+
+
+class MvpRateCardShopSetupDefaultsTestCase(TestCase):
+    def setUp(self):
+        self.owner = User.objects.create_user(email="rate-card-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Rate Card Shop", slug="rate-card-shop", is_active=True)
+
+    def test_build_shop_rate_card_setup_applies_light_and_heavy_default_stock_quantities(self):
+        data = build_shop_rate_card_setup(self.shop)
+        rows = {row["key"]: row for row in data["paper_rows"]}
+
+        self.assertEqual(rows["130gsm_matte_art"]["quantity_in_stock"], 2000)
+        self.assertEqual(rows["150gsm_tictac_sticker"]["quantity_in_stock"], 2000)
+        self.assertEqual(rows["250gsm_matte"]["quantity_in_stock"], 500)
+        self.assertEqual(rows["300gsm_ivory"]["quantity_in_stock"], 500)
+
+    def test_build_shop_rate_card_setup_preserves_saved_custom_shop_values(self):
+        self.shop.mvp_rate_card = {
+            "paper_rows": [
+                {
+                    "key": "250gsm_matte",
+                    "paper_base_price": "44.00",
+                    "quantity_in_stock": 321,
+                    "active": True,
+                }
+            ],
+            "finishing_rows": [],
+            "shop_details": {},
+        }
+        self.shop.save(update_fields=["mvp_rate_card"])
+
+        data = build_shop_rate_card_setup(self.shop)
+        rows = {row["key"]: row for row in data["paper_rows"]}
+
+        self.assertEqual(rows["250gsm_matte"]["paper_base_price"], "44.00")
+        self.assertEqual(rows["250gsm_matte"]["quantity_in_stock"], 321)
+        self.assertEqual(rows["130gsm_matte_art"]["quantity_in_stock"], 2000)
 
 
 class MvpRateCardSaveAndSetupStatusAPITestCase(TestCase):
@@ -4318,6 +5087,44 @@ class CalculatorConfigContractAPITestCase(TestCase):
         self.assertTrue(digits, f"Could not derive a stock key for {label!r}")
         return f"{digits}gsm"
 
+    def _create_accepted_history_quote(
+        self,
+        *,
+        client_total: str,
+        quantity: int = 100,
+        product_type: str = "business_card",
+        finished_size: str = "85x55mm",
+        print_sides: str = "DUPLEX",
+        requested_gsm: int = 130,
+    ) -> ShopQuote:
+        quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.owner,
+            customer_name="History Client",
+            customer_email="history@test.com",
+            status=QuoteStatus.ACCEPTED,
+            request_snapshot={
+                "calculator_inputs": {
+                    "product_type": product_type,
+                    "quantity": quantity,
+                    "finished_size": finished_size,
+                    "print_sides": print_sides,
+                    "requested_gsm": requested_gsm,
+                    "width_mm": 85,
+                    "height_mm": 55,
+                }
+            },
+        )
+        return ShopQuote.objects.create(
+            quote_request=quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.ACCEPTED,
+            total=Decimal(client_total),
+            client_total=Decimal(client_total),
+            accepted_at=timezone.now(),
+        )
+
     def test_calculator_config_lists_supported_products_and_categories(self):
         response = self.client.get("/api/calculator/config/")
 
@@ -4392,17 +5199,21 @@ class CalculatorConfigContractAPITestCase(TestCase):
         data = response.json()
         self.assertTrue(data["can_calculate"])
         self.assertIn("production_preview", data)
-        self.assertIn("pricing_breakdown", data)
         self.assertIn("shop_matches", data)
         self.assertGreaterEqual(data["production_preview"]["pieces_per_sheet"], 1)
         self.assertGreaterEqual(data["production_preview"]["sheets_required"], 1)
-        self.assertEqual(data["pricing_breakdown"]["currency"], "KES")
-        self.assertIsInstance(data["pricing_breakdown"]["lines"], list)
+        self.assertIsNone(data["pricing_breakdown"])
+        self.assertIsNotNone(data["estimate_min"])
+        self.assertIsNotNone(data["estimate_max"])
+        self.assertTrue(data["display_price_text"])
+        self.assertEqual(data["source_label"], "Estimated market range")
         self.assertTrue(data["shop_matches"])
         first_match = data["shop_matches"][0]
         self.assertIn("missing_specs", first_match)
         self.assertIn("alternative_suggestions", first_match)
-        self.assertIn("estimated_price", first_match)
+        self.assertEqual(first_match["name"], "Verified Print Partner")
+        self.assertIsNone(first_match["pricing_breakdown"])
+        self.assertNotIn("pricing_breakdown", first_match["preview"])
 
     def test_public_preview_booklet_flow_still_returns_backend_booklet_fields(self):
         response = self.client.post(
@@ -4424,6 +5235,7 @@ class CalculatorConfigContractAPITestCase(TestCase):
         top_preview = data["matches"][0]["preview"]
         self.assertEqual(top_preview["normalized_pages"], 100)
         self.assertEqual(top_preview["blank_pages_added"], 2)
+        self.assertTrue(data["display_price_text"])
 
     def test_public_preview_returns_large_format_roll_usage_sections(self):
         response = self.client.post(
@@ -4445,12 +5257,89 @@ class CalculatorConfigContractAPITestCase(TestCase):
         self.assertTrue(data["can_calculate"])
         self.assertEqual(data["product_type"], "large_format")
         self.assertIn("production_preview", data)
-        self.assertIn("pricing_breakdown", data)
+        self.assertIsNone(data["pricing_breakdown"])
         self.assertGreaterEqual(data["production_preview"]["roll_width_m"], 1.0)
         self.assertGreaterEqual(data["production_preview"]["charged_area_m2"], 1.0)
-        self.assertEqual(data["pricing_breakdown"]["method"], "per_square_meter")
-        self.assertGreaterEqual(data["pricing_breakdown"]["charged_area_m2"], 1.0)
-        self.assertTrue(data["pricing_breakdown"]["lines"])
+        self.assertTrue(data["display_price_text"])
+
+    def test_public_preview_uses_history_range_when_accepted_quotes_exist(self):
+        self._create_accepted_history_quote(client_total="3200.00")
+        self._create_accepted_history_quote(client_total="3600.00")
+        self._create_accepted_history_quote(client_total="4100.00")
+
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "85x55mm",
+                "paper_stock": self._stock_key("Matt 130gsm"),
+                "requested_paper_category": "matt",
+                "requested_gsm": 130,
+                "print_sides": "DUPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["estimate_min"], "3200.00")
+        self.assertEqual(data["estimate_max"], "4100.00")
+        self.assertEqual(data["confidence_label"], "high")
+        self.assertEqual(data["source_label"], "Based on recent managed jobs")
+        self.assertEqual(data["display_mode"], "range")
+        self.assertNotIn("production_base_price", str(data))
+        self.assertNotIn("broker_margin_amount", str(data))
+        self.assertNotIn("platform_service_amount", str(data))
+
+    def test_public_preview_collapses_equal_history_totals_to_from_price(self):
+        self._create_accepted_history_quote(client_total="3200.00")
+        self._create_accepted_history_quote(client_total="3200.00")
+
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "85x55mm",
+                "paper_stock": self._stock_key("Matt 130gsm"),
+                "requested_paper_category": "matt",
+                "requested_gsm": 130,
+                "print_sides": "DUPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["display_mode"], "from_price")
+        self.assertTrue(str(data["display_price_text"]).startswith("From KES "))
+        self.assertNotEqual(data["estimate_min"], data["estimate_max"])
+
+    def test_public_preview_falls_back_to_managed_estimate_without_history(self):
+        response = self.client.post(
+            "/api/calculator/public-preview/",
+            {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "85x55mm",
+                "paper_stock": self._stock_key("Matt 130gsm"),
+                "requested_paper_category": "matt",
+                "requested_gsm": 130,
+                "print_sides": "DUPLEX",
+                "color_mode": "COLOR",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["estimate_min"])
+        self.assertTrue(data["estimate_max"])
+        self.assertEqual(data["source_label"], "Estimated market range")
+        self.assertIn(data["display_mode"], ["range", "from_price"])
 
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
@@ -4854,6 +5743,12 @@ class PartnerQuoteBuilderAPITestCase(TestCase):
             role="client",
             name="Acme Client",
         )
+        self.other_partner = User.objects.create_user(
+            email="other-partner-builder@test.com",
+            password="pass12345",
+            role="broker",
+            name="Other Partner",
+        )
         self.owner = User.objects.create_user(email="partner-shop@test.com", password="pass12345", role="shop_owner")
         self.shop = Shop.objects.create(owner=self.owner, name="Partner Builder Shop", slug="partner-builder-shop", is_active=True)
 
@@ -4924,6 +5819,376 @@ class PartnerQuoteBuilderAPITestCase(TestCase):
         self.assertEqual(payload["response_snapshot"]["estimated_total"], "1600.00")
         self.assertIsNone(payload["response_snapshot"]["pricing_summary"])
 
+    def test_assigned_manager_can_prepare_quote_for_existing_request(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.end_client,
+            assigned_manager=self.partner,
+            customer_name="Acme Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={
+                "source": "manager_led_intake",
+                "calculator_inputs": {
+                    "product_type": "letterhead",
+                    "quantity": 500,
+                    "finished_size": "A4",
+                },
+            },
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/prepare/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "300.00",
+                "note": "Prepared for review.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        shop_quote = ShopQuote.objects.get(pk=response.json()["shop_quote"]["id"])
+        quote_request.refresh_from_db()
+        self.assertEqual(shop_quote.quote_request_id, quote_request.id)
+        self.assertEqual(shop_quote.shop_id, self.shop.id)
+        self.assertEqual(str(shop_quote.total), "1000.00")
+        self.assertEqual(str(shop_quote.client_total), "1600.00")
+        self.assertEqual(quote_request.request_snapshot["partner_brand_name"], "Brian Print Solutions")
+
+        self.client.force_authenticate(user=self.end_client)
+        client_list = self.client.get("/api/dashboard/client/quotes/")
+        self.assertEqual(client_list.status_code, 200)
+        list_payload = next(item for item in client_list.json()["results"] if item["id"] == quote_request.id)
+        self.assertIsNotNone(list_payload["latest_response"])
+        self.assertEqual(list_payload["latest_response"]["status"], "sent")
+        self.assertEqual(Decimal(str(list_payload["latest_response"]["total"])), Decimal("1600.00"))
+        self.assertNotIn("shop_name", list_payload["latest_response"])
+        self.assertNotIn("production_base_price", list_payload["latest_response"]["response_snapshot"])
+        self.assertNotIn("broker_margin_amount", list_payload["latest_response"]["response_snapshot"])
+        self.assertNotIn("platform_service_amount", list_payload["latest_response"]["response_snapshot"])
+
+        dashboard_detail = self.client.get(f"/api/dashboard/client/quotes/{quote_request.id}/")
+        self.assertEqual(dashboard_detail.status_code, 200)
+        dashboard_payload = dashboard_detail.json()["quote"]
+        self.assertEqual(dashboard_payload["assigned_manager"]["display_name"], "Brian Print Solutions")
+        self.assertEqual(Decimal(str(dashboard_payload["responses"][0]["total"])), Decimal("1600.00"))
+        self.assertNotEqual(dashboard_payload["responses"][0]["shop_name"], self.shop.name)
+        self.assertNotIn("production_base_price", dashboard_payload["responses"][0]["response_snapshot"])
+        self.assertNotIn("broker_margin_amount", dashboard_payload["responses"][0]["response_snapshot"])
+        self.assertNotIn("platform_service_amount", dashboard_payload["responses"][0]["response_snapshot"])
+
+        client_detail = self.client.get(f"/api/client/requests/{quote_request.id}/")
+        self.assertEqual(client_detail.status_code, 200)
+        payload = client_detail.json()
+        self.assertEqual(payload["assigned_manager"]["display_name"], "Brian Print Solutions")
+        self.assertEqual(str(payload["responses"][0]["total"]), "1600.0")
+        self.assertNotIn("production_base_price", payload["responses"][0]["response_snapshot"])
+        self.assertNotIn("broker_margin_amount", payload["responses"][0]["response_snapshot"])
+        self.assertNotEqual(payload["responses"][0]["shop_name"], self.shop.name)
+
+    def test_assigned_manager_prepare_succeeds_when_legacy_blank_share_token_exists(self):
+        unrelated_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.end_client,
+            customer_name="Legacy Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.QUOTED,
+        )
+        unrelated_quote = ShopQuote.objects.create(
+            quote_request=unrelated_request,
+            shop=self.shop,
+            created_by=self.partner,
+            status=ShopQuoteStatus.SENT,
+            total=Decimal("900.00"),
+            response_snapshot={"totals": {"grand_total": "900.00"}},
+        )
+        QuoteShareLink.objects.create(shop_quote=unrelated_quote, token="")
+
+        quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.end_client,
+            assigned_manager=self.partner,
+            customer_name="Acme Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={
+                "source": "manager_led_intake",
+                "calculator_inputs": {
+                    "product_type": "letterhead",
+                    "quantity": 500,
+                    "finished_size": "A4",
+                },
+            },
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/prepare/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "300.00",
+                "note": "Prepared for review.",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        shop_quote = ShopQuote.objects.get(pk=response.json()["shop_quote"]["id"])
+        share_link = shop_quote.share_links.get()
+        self.assertTrue(share_link.token)
+        self.assertNotEqual(share_link.token, "")
+
+    def test_client_request_detail_handles_items_with_finishings(self):
+        self.client.force_authenticate(user=self.partner)
+        create_response = self.client.post(
+            "/api/partner/quotes/create/",
+            {
+                "shop": self.shop.id,
+                "title": "Partner quote",
+                "client_id": self.end_client.id,
+                "client_name": "Acme Client",
+                "client_email": "acme@example.com",
+                "calculator_inputs_snapshot": {"quantity": 100, "pricing_mode": "SHEET"},
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "300.00",
+                "note": "White-label quote ready.",
+            },
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=create_response.json()["quote_request_id"])
+        item = QuoteItem.objects.create(
+            quote_request=quote_request,
+            title="Business cards",
+            quantity=100,
+            item_type="CUSTOM",
+        )
+        finishing_rate = FinishingRate.objects.create(
+            shop=self.shop,
+            name="Gloss Lamination Double",
+            slug="gloss-lamination-double",
+            charge_unit=ChargeUnit.PER_SHEET,
+            billing_basis=FinishingBillingBasis.PER_SHEET,
+            side_mode=FinishingSideMode.PER_SELECTED_SIDE,
+            price=Decimal("20.00"),
+            minimum_charge=Decimal("60.00"),
+            is_active=True,
+        )
+        QuoteItemFinishing.objects.create(quote_item=item, finishing_rate=finishing_rate)
+
+        self.client.force_authenticate(user=self.end_client)
+        response = self.client.get(f"/api/client/requests/{quote_request.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("Gloss Lamination Double", [item["finishing_summary"] for item in payload["items"]])
+
+    def test_assigned_manager_prepare_returns_400_for_missing_selected_shop_price(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.end_client,
+            assigned_manager=self.partner,
+            customer_name="Acme Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={"source": "manager_led_intake"},
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/prepare/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": {"currency": "KES", "selected_shops": []},
+                "partner_markup": "300.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Production price is not available yet for the selected shop.", str(response.json()))
+        self.assertEqual(quote_request.shop_quotes.count(), 0)
+
+    def test_random_manager_cannot_prepare_quote_for_assigned_request(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.end_client,
+            assigned_manager=self.partner,
+            customer_name="Acme Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={"source": "manager_led_intake"},
+        )
+        self.client.force_authenticate(user=self.other_partner)
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/prepare/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "300.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+
+class ManagerShopOptionsAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.partner = User.objects.create_user(
+            email="manager-options@test.com",
+            password="pass12345",
+            role="broker",
+            name="Manager Options",
+        )
+        self.other_partner = User.objects.create_user(
+            email="manager-options-other@test.com",
+            password="pass12345",
+            role="broker",
+            name="Other Manager",
+        )
+        self.end_client = User.objects.create_user(
+            email="manager-options-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Options Client",
+        )
+
+        self.cheapest_shop = self._create_shop_with_pricing("Cheapest Shop", "cheapest-shop", paper_price="20.00", single_price="35.00")
+        self.expensive_shop = self._create_shop_with_pricing("Expensive Shop", "expensive-shop", paper_price="40.00", single_price="55.00")
+        self.unpriced_shop = self._create_shop_with_pricing("Needs Setup Shop", "needs-setup-shop", paper_price="25.00", single_price=None)
+
+        self.quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.end_client,
+            assigned_manager=self.partner,
+            customer_name="Options Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={
+                "source": "manager_led_intake",
+                "calculator_inputs": {
+                    "product_type": "business_card",
+                    "quantity": 100,
+                    "finished_size": "85x55mm",
+                    "paper_stock": "300gsm",
+                    "print_sides": "SIMPLEX",
+                    "color_mode": "COLOR",
+                },
+            },
+        )
+
+    def _create_shop_with_pricing(self, name: str, slug: str, *, paper_price: str, single_price: str | None):
+        owner = User.objects.create_user(email=f"{slug}@test.com", password="pass12345", role="shop_owner")
+        shop = Shop.objects.create(owner=owner, name=name, slug=slug, is_active=True, city="Nairobi")
+        machine = Machine.objects.create(
+            shop=shop,
+            name=f"{name} Press",
+            max_width_mm=320,
+            max_height_mm=450,
+            is_active=True,
+        )
+        Paper.objects.create(
+            shop=shop,
+            name="300gsm Art Card",
+            sheet_size="SRA3",
+            gsm=300,
+            paper_type="GLOSS",
+            buying_price=Decimal("10.00"),
+            selling_price=Decimal(paper_price),
+            width_mm=320,
+            height_mm=450,
+            is_active=True,
+        )
+        if single_price is not None:
+            PrintingRate.objects.create(
+                machine=machine,
+                sheet_size="SRA3",
+                color_mode="COLOR",
+                single_price=Decimal(single_price),
+                double_price=Decimal("70.00"),
+                is_active=True,
+            )
+        FinishingRate.objects.create(
+            shop=shop,
+            name="Cutting",
+            slug=f"cutting-{slug}",
+            charge_unit=ChargeUnit.FLAT,
+            billing_basis=FinishingBillingBasis.FLAT_PER_JOB,
+            side_mode=FinishingSideMode.IGNORE_SIDES,
+            price=Decimal("50.00"),
+            is_active=True,
+        )
+        return shop
+
+    def test_assigned_manager_can_get_ranked_shop_options(self):
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{self.quote_request.id}/shop-options/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["product_type"], "business_card")
+        self.assertEqual(payload["results"][0]["shop_display_name"], "Cheapest Shop")
+        self.assertEqual(payload["results"][0]["price_status"], "priced")
+        self.assertEqual(payload["results"][0]["recommendation_label"], "Recommended")
+        self.assertEqual(payload["results"][1]["price_status"], "priced")
+        self.assertEqual(payload["results"][-1]["price_status"], "missing_pricing")
+        self.assertLessEqual(
+            Decimal(str(payload["results"][0]["production_cost"])),
+            Decimal(str(payload["results"][1]["production_cost"])),
+        )
+
+    def test_random_manager_cannot_access_assigned_request_shop_options(self):
+        self.client.force_authenticate(user=self.other_partner)
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{self.quote_request.id}/shop-options/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_missing_specs_are_reported_clearly(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.end_client,
+            assigned_manager=self.partner,
+            customer_name="Options Client",
+            customer_email=self.end_client.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={
+                "source": "manager_led_intake",
+                "calculator_inputs": {
+                    "product_type": "business_card",
+                    "quantity": 100,
+                },
+            },
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/shop-options/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("finished_size", payload["missing_fields"])
+        self.assertIn("paper_stock", payload["missing_fields"])
+        self.assertEqual(payload["results"], [])
+
 
 class PartnerDraftSendGuardAPITestCase(TestCase):
     def setUp(self):
@@ -4956,6 +6221,164 @@ class PartnerDraftSendGuardAPITestCase(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["detail"], "client_id is required for partner quote requests.")
+
+
+class SpecsFirstQuoteBuilderTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.partner = User.objects.create_user(
+            email="specs-first-partner@test.com",
+            password="pass12345",
+            role="broker",
+            partner_profile_enabled=True,
+            name="Specs First Partner",
+        )
+        self.shop_owner = User.objects.create_user(
+            email="specs-first-shop@test.com",
+            password="pass12345",
+            role="shop_owner",
+        )
+        self.shop = Shop.objects.create(
+            owner=self.shop_owner,
+            name="Specs First Shop",
+            slug="specs-first-shop",
+            is_active=True,
+        )
+
+    def _pricing_snapshot(self):
+        return {
+            "currency": "KES",
+            "selected_shops": [
+                {
+                    "id": self.shop.id,
+                    "slug": self.shop.slug,
+                    "preview": {
+                        "totals": {"subtotal": "1000.00"},
+                        "breakdown": {"imposition": {"good_sheets": 4}},
+                    },
+                }
+            ],
+        }
+
+    def _draft_create_payload(self):
+        return {
+            "shop": self.shop.id,
+            "title": "Specs-first draft",
+            "calculator_inputs_snapshot": {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "90x50mm",
+                "paper_stock": "300gsm_matte_art_card",
+                "print_sides": "SIMPLEX",
+                "color_mode": "COLOR",
+                "lamination": "none",
+                "urgency_type": "standard",
+            },
+            "pricing_snapshot": self._pricing_snapshot(),
+            "partner_markup": "300.00",
+            "note": "Draft before client selection.",
+            "save_as_draft": True,
+        }
+
+    def _create_draft(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.post("/api/partner/quotes/create/", self._draft_create_payload(), format="json")
+        self.assertEqual(response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=response.json()["quote_request_id"])
+        return response, quote_request
+
+    def test_partner_creates_draft_without_client_id(self):
+        response, quote_request = self._create_draft()
+        shop_quote = ShopQuote.objects.get(quote_request=quote_request)
+
+        self.assertEqual(response.json()["status"], QuoteStatus.DRAFT)
+        self.assertEqual(quote_request.status, QuoteStatus.DRAFT)
+        self.assertIsNone(quote_request.on_behalf_of_id)
+        self.assertEqual(shop_quote.status, ShopQuoteStatus.PENDING)
+        self.assertEqual(shop_quote.client_quote_status, "draft")
+
+    def test_partner_attaches_client_to_draft(self):
+        _, quote_request = self._create_draft()
+
+        attach_response = self.client.patch(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/attach-client/",
+            {
+                "client_name": "Attach Later Client",
+                "client_email": "attach-later@test.com",
+                "client_phone": "+254700111222",
+                "client_company": "Attach Later Ltd",
+            },
+            format="json",
+        )
+
+        self.assertEqual(attach_response.status_code, 200)
+        quote_request.refresh_from_db()
+        pending_client = dict(quote_request.request_snapshot.get("pending_client") or {})
+        self.assertIsNone(quote_request.on_behalf_of_id)
+        self.assertEqual(quote_request.customer_email, "attach-later@test.com")
+        self.assertEqual(pending_client["email"], "attach-later@test.com")
+        self.assertEqual(pending_client["phone"], "+254700111222")
+        self.assertEqual(pending_client["company"], "Attach Later Ltd")
+        self.assertTrue(User.objects.filter(email="attach-later@test.com", role=User.Role.CLIENT).exists())
+
+    def test_partner_send_without_client_id_returns_400(self):
+        _, quote_request = self._create_draft()
+
+        response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/send-to-client/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "client_id is required for partner quote requests.")
+
+    def test_draft_appears_in_partner_quotes_list(self):
+        _, quote_request = self._create_draft()
+
+        response = self.client.get("/api/dashboard/partner/quotes/")
+
+        self.assertEqual(response.status_code, 200)
+        row = next(item for item in response.json()["results"] if item["id"] == quote_request.id)
+        self.assertEqual(row["status"], QuoteStatus.DRAFT)
+        self.assertIsNone(row["latest_response"])
+
+    def test_attached_email_only_client_can_receive_quote_without_leaking_internal_economics(self):
+        _, quote_request = self._create_draft()
+
+        attach_response = self.client.patch(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/attach-client/",
+            {
+                "client_email": "lightweight-client@test.com",
+            },
+            format="json",
+        )
+        self.assertEqual(attach_response.status_code, 200)
+
+        send_response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/send-to-client/",
+            {
+                "broker_margin_type": "fixed",
+                "broker_margin_value": "300.00",
+            },
+            format="json",
+        )
+        self.assertEqual(send_response.status_code, 200)
+
+        quote_request.refresh_from_db()
+        self.assertIsNotNone(quote_request.on_behalf_of_id)
+
+        lightweight_client = User.objects.get(pk=quote_request.on_behalf_of_id)
+        self.client.force_authenticate(user=lightweight_client)
+
+        client_list = self.client.get("/api/dashboard/client/quotes/")
+        self.assertEqual(client_list.status_code, 200)
+        list_row = next(item for item in client_list.json()["results"] if item["id"] == quote_request.id)
+        self.assertEqual(list_row["latest_response"]["status"], "sent")
+        self.assertNotIn("shop_name", list_row["latest_response"])
+        self.assertNotIn("production_base_price", list_row["latest_response"]["response_snapshot"])
+        self.assertNotIn("broker_margin_amount", list_row["latest_response"]["response_snapshot"])
+        self.assertNotIn("platform_service_amount", list_row["latest_response"]["response_snapshot"])
 
 
 class PartnerDispatchValidationTestCase(TestCase):
@@ -5031,6 +6454,14 @@ class PartnerDispatchValidationTestCase(TestCase):
         )
 
     def test_dispatch_succeeds_and_creates_assignment_with_production_total(self):
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
         self.client.force_authenticate(user=self.partner)
 
         response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
@@ -5052,7 +6483,44 @@ class PartnerDispatchValidationTestCase(TestCase):
             ).exists()
         )
 
+    def test_unpaid_job_cannot_be_dispatched(self):
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
+        self.managed_job.payment_status = "pending"
+        self.managed_job.status = "awaiting_payment"
+        self.managed_job.save(update_fields=["payment_status", "status", "updated_at"])
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Client payment must be confirmed before dispatch.")
+
+    def test_dispatch_is_blocked_when_artwork_is_missing(self):
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Artwork required before dispatch. Client has been notified.")
+        self.managed_job.refresh_from_db()
+        self.assertTrue(self.managed_job.artwork_required)
+
     def test_duplicate_dispatch_returns_safe_error(self):
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
         self.client.force_authenticate(user=self.partner)
 
         first = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
@@ -5083,3 +6551,106 @@ class PartnerDispatchValidationTestCase(TestCase):
         response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
 
         self.assertEqual(response.status_code, 403)
+
+
+class MarketRateAPITestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.partner = User.objects.create_user(
+            email="market-rates-partner@test.com",
+            password="pass12345",
+            role="partner",
+            partner_profile_enabled=True,
+        )
+        self.other_partner = User.objects.create_user(
+            email="market-rates-other-partner@test.com",
+            password="pass12345",
+            role="partner",
+            partner_profile_enabled=True,
+        )
+        self.client_user = User.objects.create_user(
+            email="market-rates-client@test.com",
+            password="pass12345",
+            role="client",
+        )
+        UserProfile.objects.create(user=self.partner, default_markup_rate=Decimal("0.30"))
+
+    def _shop_with_rate_card(self, *, slug: str, base_price: str):
+        owner = User.objects.create_user(email=f"{slug}@test.com", password="pass12345", role="shop_owner")
+        shop = Shop.objects.create(owner=owner, name=f"Shop {slug}", slug=slug, is_active=True)
+        shop.mvp_rate_card = {
+            "paper_rows": [
+                {
+                    "key": "300gsm_matte_art_card",
+                    "paper_base_price": base_price,
+                    "active": True,
+                }
+            ],
+            "finishing_rows": [],
+            "shop_details": {},
+        }
+        shop.save(update_fields=["mvp_rate_card"])
+        return shop
+
+    def test_market_rates_returns_real_median_for_three_shops(self):
+        self._shop_with_rate_card(slug="market-shop-1", base_price="30.00")
+        self._shop_with_rate_card(slug="market-shop-2", base_price="35.00")
+        self._shop_with_rate_card(slug="market-shop-3", base_price="40.00")
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.get("/api/dashboard/partner/market-rates/")
+
+        self.assertEqual(response.status_code, 200)
+        paper_row = next(row for row in response.json()["results"] if row["key"] == "300gsm_matte_art_card")
+        self.assertEqual(paper_row["shops_count"], 3)
+        self.assertEqual(paper_row["data_quality"], "good")
+        self.assertEqual(paper_row["confidence_label"], "high")
+        self.assertEqual(paper_row["market_single"]["median_total_100"], "300.00")
+        self.assertEqual(paper_row["market_single"]["min_total_100"], "275.00")
+        self.assertEqual(paper_row["market_single"]["max_total_100"], "325.00")
+        self.assertEqual(paper_row["market_double"]["median_total_100"], "375.00")
+
+    def test_market_rates_returns_estimated_baseline_when_no_live_data(self):
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.get("/api/dashboard/partner/market-rates/")
+
+        self.assertEqual(response.status_code, 200)
+        paper_row = next(row for row in response.json()["results"] if row["key"] == "300gsm_matte_art_card")
+        self.assertEqual(paper_row["shops_count"], 0)
+        self.assertEqual(paper_row["data_quality"], "estimated")
+        self.assertEqual(paper_row["confidence_label"], "insufficient_data")
+        self.assertEqual(paper_row["market_single"]["median_total_100"], "300.00")
+
+    def test_client_role_cannot_access_partner_market_rates(self):
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get("/api/dashboard/partner/market-rates/")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_market_rates_do_not_expose_individual_shop_prices(self):
+        first = self._shop_with_rate_card(slug="private-market-shop-1", base_price="35.00")
+        self._shop_with_rate_card(slug="private-market-shop-2", base_price="36.00")
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.get("/api/dashboard/partner/market-rates/")
+
+        self.assertEqual(response.status_code, 200)
+        payload_text = str(response.json())
+        self.assertNotIn(first.name, payload_text)
+        self.assertNotIn(first.slug, payload_text)
+        self.assertNotIn("formula_shop_visible", payload_text)
+
+    def test_partner_profile_alias_updates_default_markup_rate(self):
+        self.client.force_authenticate(user=self.other_partner)
+
+        response = self.client.patch(
+            "/api/dashboard/partner/profile/",
+            {"default_markup_rate": "0.45"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.other_partner.profile.refresh_from_db()
+        self.assertEqual(str(self.other_partner.profile.default_markup_rate), "0.45")

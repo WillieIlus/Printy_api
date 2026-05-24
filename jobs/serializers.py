@@ -13,6 +13,7 @@ from api.visibility import (
     can_actor_view_shop_name,
     resolve_actor,
 )
+from jobs.file_services import managed_job_has_artwork
 from jobs.models import JobAssignment, JobClaim, JobFile, JobPayment, JobRequest, JobSettlementSplit, ManagedJob, ManagedJobEvent
 from jobs.workflow import project_workflow_state
 
@@ -163,6 +164,7 @@ class ManagedJobSerializer(serializers.ModelSerializer):
     file_count = serializers.SerializerMethodField()
     payment_count = serializers.SerializerMethodField()
     urgency_label = serializers.SerializerMethodField()
+    artwork_uploaded = serializers.SerializerMethodField()
 
     class Meta:
         model = ManagedJob
@@ -181,6 +183,8 @@ class ManagedJobSerializer(serializers.ModelSerializer):
             "production_issue_flag",
             "delivery_issue_flag",
             "ops_review_required",
+            "artwork_required",
+            "artwork_uploaded",
             "urgency_type",
             "urgency_label",
             "urgency_fee",
@@ -222,6 +226,9 @@ class ManagedJobSerializer(serializers.ModelSerializer):
 
     def get_urgency_label(self, obj):
         return getattr(obj, "get_urgency_type_display", lambda: "")() or ""
+
+    def get_artwork_uploaded(self, obj):
+        return managed_job_has_artwork(managed_job=obj)
 
 
 class ManagedJobPublicTrackingSerializer(serializers.ModelSerializer):
@@ -280,6 +287,16 @@ class JobAssignmentSerializer(serializers.ModelSerializer):
     managed_job_payment_status = serializers.CharField(source="managed_job.payment_status", read_only=True)
     workflow_projection = serializers.SerializerMethodField()
     urgency_label = serializers.CharField(source="get_urgency_type_display", read_only=True)
+    production_stage = serializers.SerializerMethodField()
+    production_stage_label = serializers.SerializerMethodField()
+    production_timeline_steps = serializers.SerializerMethodField()
+    current_step = serializers.SerializerMethodField()
+    next_allowed_actions = serializers.SerializerMethodField()
+    payment_confirmed = serializers.SerializerMethodField()
+    payout_amount = serializers.SerializerMethodField()
+    payout_status_label = serializers.SerializerMethodField()
+    artwork_available = serializers.SerializerMethodField()
+    proof_status = serializers.SerializerMethodField()
 
     class Meta:
         model = JobAssignment
@@ -295,6 +312,16 @@ class JobAssignmentSerializer(serializers.ModelSerializer):
             "operational_priority_level",
             "managed_job_status",
             "managed_job_payment_status",
+            "production_stage",
+            "production_stage_label",
+            "production_timeline_steps",
+            "current_step",
+            "next_allowed_actions",
+            "payment_confirmed",
+            "payout_amount",
+            "payout_status_label",
+            "artwork_available",
+            "proof_status",
             "workflow_projection",
             "production_order",
             "due_at",
@@ -323,6 +350,134 @@ class JobAssignmentSerializer(serializers.ModelSerializer):
             urgency_type=obj.urgency_type or obj.managed_job.urgency_type,
             operational_priority_level=obj.operational_priority_level or obj.managed_job.operational_priority_level,
         )
+
+    def _production_stage(self, obj) -> str:
+        status = str(obj.status or "").lower()
+        return {
+            "pending": "dispatch_received",
+            "accepted": "accepted",
+            "in_production": "printing",
+            "finishing": "finishing",
+            "ready": "ready",
+            "completed": "completed",
+        }.get(status, status or "dispatch_received")
+
+    def _requires_finishing(self, obj) -> bool:
+        managed_job = obj.managed_job
+        snapshot = getattr(getattr(managed_job, "source_quote_request", None), "request_snapshot", None)
+        if not isinstance(snapshot, dict):
+            return False
+        request_snapshot = snapshot.get("request_snapshot") if isinstance(snapshot.get("request_snapshot"), dict) else snapshot
+        return bool(
+            request_snapshot.get("lamination")
+            or request_snapshot.get("lamination_label")
+            or request_snapshot.get("binding_type")
+            or request_snapshot.get("cover_lamination")
+        )
+
+    def get_production_stage(self, obj):
+        return self._production_stage(obj)
+
+    def get_production_stage_label(self, obj):
+        return self.get_production_stage(obj).replace("_", " ").title()
+
+    def get_current_step(self, obj):
+        return self.get_production_stage(obj)
+
+    def get_next_allowed_actions(self, obj):
+        status = str(obj.status or "").lower()
+        if status == "pending":
+            return ["accept", "reject"]
+        if status == "accepted":
+            return ["mark_printing"]
+        if status == "in_production":
+            actions = ["upload_proof"]
+            if self._requires_finishing(obj):
+                actions.append("mark_finishing")
+            else:
+                actions.append("mark_ready")
+            return actions
+        if status == "finishing":
+            return ["upload_proof", "mark_ready"]
+        if status == "ready":
+            return ["mark_completed"]
+        return []
+
+    def get_payment_confirmed(self, obj):
+        return str(obj.managed_job.payment_status or "").lower() in {"confirmed", "release_ready", "released"}
+
+    def get_payout_amount(self, obj):
+        return _money(obj.production_amount)
+
+    def get_payout_status_label(self, obj):
+        status = str(obj.managed_job.payment_status or "").lower()
+        if status == "released":
+            return "Payout completed"
+        if status == "release_ready":
+            return "Payout ready"
+        if status == "payout_on_hold":
+            return "Payout on hold"
+        if status == "confirmed":
+            return "Waiting for job completion"
+        return "Awaiting payment confirmation"
+
+    def get_artwork_available(self, obj):
+        return managed_job_has_artwork(managed_job=obj.managed_job)
+
+    def get_proof_status(self, obj):
+        latest_proof = obj.managed_job.job_files.filter(file_type="proof").order_by("-created_at", "-id").first()
+        return getattr(latest_proof, "status", "")
+
+    def get_production_timeline_steps(self, obj):
+        operational_snapshot = obj.operational_snapshot if isinstance(obj.operational_snapshot, dict) else {}
+        stage = self._production_stage(obj)
+        requires_finishing = self._requires_finishing(obj)
+        steps = [
+            {
+                "key": "dispatch_received",
+                "label": "Dispatch received",
+                "state": "completed",
+                "completed_at": getattr(obj.managed_job, "dispatched_at", None) or obj.created_at,
+            },
+            {
+                "key": "accepted",
+                "label": "Accepted",
+                "state": "completed" if stage in {"accepted", "printing", "finishing", "ready", "completed"} else ("current" if stage == "dispatch_received" else "pending"),
+                "completed_at": obj.accepted_at,
+            },
+            {
+                "key": "printing",
+                "label": "Printing",
+                "state": "completed" if stage in {"printing", "finishing", "ready", "completed"} else ("current" if stage == "accepted" else "pending"),
+                "completed_at": getattr(obj.managed_job, "production_started_at", None),
+            },
+        ]
+        if requires_finishing:
+            steps.append(
+                {
+                    "key": "finishing",
+                    "label": "Finishing",
+                    "state": "completed" if stage in {"finishing", "ready", "completed"} else ("current" if stage == "printing" else "pending"),
+                    "completed_at": operational_snapshot.get("finishing_started_at"),
+                }
+            )
+        steps.extend(
+            [
+                {
+                    "key": "ready",
+                    "label": "Ready",
+                    "state": "completed" if stage in {"ready", "completed"} else ("current" if stage == ("finishing" if requires_finishing else "printing") else "pending"),
+                    "completed_at": getattr(obj.managed_job, "ready_at", None),
+                },
+                {
+                    "key": "completed",
+                    "label": "Complete",
+                    "state": "completed" if stage == "completed" else ("current" if stage == "ready" else "pending"),
+                    "completed_at": getattr(obj.managed_job, "completed_at", None),
+                },
+            ]
+        )
+        return steps
 
 
 class JobFileSerializer(serializers.ModelSerializer):
@@ -426,7 +581,7 @@ class JobPaymentSerializer(serializers.ModelSerializer):
     def get_amount(self, obj):
         request = self.context.get("request")
         actor = resolve_actor(getattr(request, "user", None))
-        if actor in {OPS_ACTOR, SHOP_ACTOR, PARTNER_ACTOR, CLIENT_ACTOR}:
+        if actor in {OPS_ACTOR, PARTNER_ACTOR, CLIENT_ACTOR}:
             return _money(obj.amount)
         return None
 
@@ -440,14 +595,14 @@ class JobPaymentSerializer(serializers.ModelSerializer):
     def get_expected_amount(self, obj):
         request = self.context.get("request")
         actor = resolve_actor(getattr(request, "user", None))
-        if actor in {OPS_ACTOR, SHOP_ACTOR, PARTNER_ACTOR, CLIENT_ACTOR}:
+        if actor in {OPS_ACTOR, PARTNER_ACTOR, CLIENT_ACTOR}:
             return _money(obj.expected_amount if obj.expected_amount is not None else obj.amount)
         return None
 
     def get_received_amount(self, obj):
         request = self.context.get("request")
         actor = resolve_actor(getattr(request, "user", None))
-        if actor in {OPS_ACTOR, SHOP_ACTOR, PARTNER_ACTOR, CLIENT_ACTOR}:
+        if actor in {OPS_ACTOR, PARTNER_ACTOR, CLIENT_ACTOR}:
             return _money(obj.received_amount)
         return None
 

@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
+from quotes.models import ShopQuote
 from services.public_matching import get_booklet_marketplace_matches, get_marketplace_matches
 
 from .calculator_config import get_product_definition, resolve_finished_size, resolve_stock_option
 from .urgency import apply_priority_pricing
+
+MONEY_QUANTIZER = Decimal("0.01")
+DISPLAY_ROUNDING = Decimal("50")
+FALLBACK_MIN_MULTIPLIER = Decimal("1.45")
+FALLBACK_MAX_MULTIPLIER = Decimal("1.80")
+HISTORY_QUANTITY_TOLERANCE = Decimal("0.20")
+MIN_EQUAL_SPREAD_RATE = Decimal("0.10")
 
 
 def _parse_tier_gsm(raw: str | None) -> int | None:
@@ -30,6 +39,349 @@ PRODUCT_FAMILY_BY_TYPE = {
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _money(value: Any, default: Decimal | None = None) -> Decimal | None:
+    if value in (None, ""):
+        return default
+    try:
+        return Decimal(str(value)).quantize(MONEY_QUANTIZER, rounding=ROUND_HALF_UP)
+    except (ArithmeticError, InvalidOperation, TypeError, ValueError):
+        return default
+
+
+def _stringify_money(value: Decimal | None) -> str | None:
+    return str(value.quantize(MONEY_QUANTIZER, rounding=ROUND_HALF_UP)) if value is not None else None
+
+
+def _normalize_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _normalize_size_label(value: Any) -> str:
+    raw = _normalize_text(value)
+    return raw.replace(" ", "")
+
+
+def _rounded_display_money(value: Decimal) -> Decimal:
+    rounded = (value / DISPLAY_ROUNDING).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * DISPLAY_ROUNDING
+    return rounded.quantize(MONEY_QUANTIZER, rounding=ROUND_HALF_UP)
+
+
+def _format_display_amount(value: Decimal, currency: str) -> str:
+    rounded = _rounded_display_money(value)
+    integer_value = int(rounded)
+    return f"{currency} {integer_value:,}"
+
+
+def _extract_request_spec(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "product_type": _normalize_text(payload.get("product_type")),
+        "quantity": int(payload.get("quantity") or 0),
+        "finished_size": _normalize_size_label(payload.get("finished_size") or payload.get("size_label")),
+        "print_sides": _normalize_text(payload.get("print_sides") or payload.get("sides")),
+        "paper_gsm": int(payload.get("requested_gsm") or payload.get("paper_gsm") or 0) or None,
+        "width_mm": _money(payload.get("width_mm")),
+        "height_mm": _money(payload.get("height_mm")),
+    }
+
+
+def _extract_snapshot_spec(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    root = _as_dict(snapshot)
+    calculator = _as_dict(root.get("calculator_inputs"))
+    details = _as_dict(root.get("request_details"))
+    nested = calculator or details or root
+    return {
+        "product_type": _normalize_text(
+            nested.get("product_type")
+            or root.get("product_type")
+            or _as_dict(root.get("custom_product_snapshot")).get("product_type")
+        ),
+        "quantity": int(nested.get("quantity") or root.get("quantity") or 0),
+        "finished_size": _normalize_size_label(
+            nested.get("finished_size")
+            or nested.get("size_label")
+            or root.get("finished_size")
+            or root.get("size_label")
+        ),
+        "print_sides": _normalize_text(
+            nested.get("print_sides")
+            or nested.get("sides")
+            or root.get("print_sides")
+            or root.get("sides")
+        ),
+        "paper_gsm": int(nested.get("requested_gsm") or nested.get("paper_gsm") or root.get("paper_gsm") or 0) or None,
+        "width_mm": _money(nested.get("width_mm") or root.get("width_mm")),
+        "height_mm": _money(nested.get("height_mm") or root.get("height_mm")),
+    }
+
+
+def _is_similar_history_spec(request_spec: dict[str, Any], history_spec: dict[str, Any]) -> bool:
+    if not history_spec.get("product_type") or history_spec["product_type"] != request_spec["product_type"]:
+        return False
+
+    requested_quantity = request_spec.get("quantity") or 0
+    history_quantity = history_spec.get("quantity") or 0
+    if requested_quantity <= 0 or history_quantity <= 0:
+        return False
+
+    minimum = Decimal(str(requested_quantity)) * (Decimal("1.00") - HISTORY_QUANTITY_TOLERANCE)
+    maximum = Decimal(str(requested_quantity)) * (Decimal("1.00") + HISTORY_QUANTITY_TOLERANCE)
+    if Decimal(str(history_quantity)) < minimum or Decimal(str(history_quantity)) > maximum:
+        return False
+
+    requested_size = request_spec.get("finished_size")
+    history_size = history_spec.get("finished_size")
+    if requested_size and history_size and requested_size != history_size:
+        return False
+
+    requested_sides = request_spec.get("print_sides")
+    history_sides = history_spec.get("print_sides")
+    if requested_sides and history_sides and requested_sides != history_sides:
+        return False
+
+    requested_gsm = request_spec.get("paper_gsm")
+    history_gsm = history_spec.get("paper_gsm")
+    if requested_gsm and history_gsm and abs(int(history_gsm) - int(requested_gsm)) > 20:
+        return False
+
+    requested_width = request_spec.get("width_mm")
+    requested_height = request_spec.get("height_mm")
+    history_width = history_spec.get("width_mm")
+    history_height = history_spec.get("height_mm")
+    if requested_width and requested_height and history_width and history_height:
+        width_ratio = abs(history_width - requested_width) / requested_width if requested_width else Decimal("0")
+        height_ratio = abs(history_height - requested_height) / requested_height if requested_height else Decimal("0")
+        if width_ratio > Decimal("0.10") or height_ratio > Decimal("0.10"):
+            return False
+
+    return True
+
+
+def _ensure_estimate_spread(minimum: Decimal, maximum: Decimal) -> tuple[Decimal, Decimal, bool]:
+    collapsed = minimum == maximum
+    if maximum < minimum:
+        minimum, maximum = maximum, minimum
+        collapsed = minimum == maximum
+    if collapsed:
+        maximum = (minimum * (Decimal("1.00") + MIN_EQUAL_SPREAD_RATE)).quantize(MONEY_QUANTIZER, rounding=ROUND_HALF_UP)
+    return minimum, maximum, collapsed
+
+
+def _build_history_estimate(payload: dict[str, Any]) -> dict[str, Any] | None:
+    request_spec = _extract_request_spec(payload)
+    if not request_spec["product_type"] or request_spec["quantity"] <= 0:
+        return None
+
+    matching_totals: list[Decimal] = []
+    history_rows = (
+        ShopQuote.objects.filter(status=ShopQuote.ACCEPTED, client_total__isnull=False)
+        .select_related("quote_request")
+        .order_by("-accepted_at", "-created_at", "-id")[:200]
+    )
+    for quote in history_rows:
+        snapshot = getattr(getattr(quote, "quote_request", None), "request_snapshot", None)
+        if not _is_similar_history_spec(request_spec, _extract_snapshot_spec(snapshot)):
+            continue
+        client_total = _money(quote.client_total)
+        if client_total is not None:
+            matching_totals.append(client_total)
+
+    if not matching_totals:
+        return None
+
+    minimum = min(matching_totals)
+    maximum = max(matching_totals)
+    minimum, maximum, collapsed = _ensure_estimate_spread(minimum, maximum)
+    count = len(matching_totals)
+    confidence = "high" if count >= 2 else "medium"
+    source_label = "Based on recent managed jobs" if count >= 2 else "Estimated market range"
+    return {
+        "estimate_min": minimum,
+        "estimate_max": maximum,
+        "confidence_label": confidence,
+        "source_label": source_label,
+        "display_mode": "from_price" if collapsed else "range",
+        "history_count": count,
+    }
+
+
+def _build_shop_band_estimate(response: dict[str, Any]) -> dict[str, Any] | None:
+    client_totals: list[Decimal] = []
+    for match in _as_list(response.get("matches")):
+        preview = _as_dict(match.get("preview"))
+        marketplace = _as_dict(preview.get("marketplace_pricing"))
+        breakdown = _as_dict(preview.get("breakdown"))
+        marketplace = marketplace or _as_dict(breakdown.get("marketplace_pricing"))
+        totals = _as_dict(preview.get("totals"))
+        client_total = (
+            _money(marketplace.get("client_price"))
+            or _money(totals.get("grand_total"))
+            or _money(match.get("total"))
+        )
+        if client_total is not None:
+            client_totals.append(client_total)
+
+    if not client_totals:
+        response_min = _money(response.get("min_price"))
+        response_max = _money(response.get("max_price"))
+        if response_min is not None and response_max is not None:
+            client_totals.extend([response_min, response_max])
+
+    if not client_totals:
+        return None
+
+    minimum, maximum, collapsed = _ensure_estimate_spread(min(client_totals), max(client_totals))
+    return {
+        "estimate_min": minimum,
+        "estimate_max": maximum,
+        "confidence_label": "medium",
+        "source_label": "Estimated market range",
+        "display_mode": "from_price" if collapsed else "range",
+    }
+
+
+def _build_fallback_estimate(response: dict[str, Any]) -> dict[str, Any] | None:
+    pricing_breakdown = _as_dict(response.get("pricing_breakdown"))
+    base_price = _money(pricing_breakdown.get("base_price"))
+    if base_price is None:
+        base_price = _money(response.get("total")) or _money(response.get("min_price")) or _money(response.get("max_price"))
+    if base_price is None:
+        return None
+
+    minimum = (base_price * FALLBACK_MIN_MULTIPLIER).quantize(MONEY_QUANTIZER, rounding=ROUND_HALF_UP)
+    maximum = (base_price * FALLBACK_MAX_MULTIPLIER).quantize(MONEY_QUANTIZER, rounding=ROUND_HALF_UP)
+    minimum, maximum, collapsed = _ensure_estimate_spread(minimum, maximum)
+    return {
+        "estimate_min": minimum,
+        "estimate_max": maximum,
+        "confidence_label": "low",
+        "source_label": "Estimated Printy price range",
+        "display_mode": "from_price" if collapsed else "range",
+    }
+
+
+def _format_display_price_text(*, minimum: Decimal, maximum: Decimal, currency: str, display_mode: str) -> str:
+    if display_mode == "from_price":
+        return f"From {_format_display_amount(minimum, currency)}"
+    if display_mode == "exact_estimate":
+        return _format_display_amount(minimum, currency)
+    return f"{_format_display_amount(minimum, currency)} - {_format_display_amount(maximum, currency)}"
+
+
+def _attach_public_estimate(response: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    updated = deepcopy(response)
+    estimate = (
+        _build_history_estimate(payload)
+        or _build_shop_band_estimate(updated)
+        or _build_fallback_estimate(updated)
+    )
+    if estimate is None:
+        updated["estimate_min"] = None
+        updated["estimate_max"] = None
+        updated["display_price_text"] = None
+        updated["display_mode"] = None
+        updated["confidence_label"] = "low"
+        updated["source_label"] = "Estimated Printy price range"
+        return updated
+
+    estimate_min = estimate["estimate_min"]
+    estimate_max = estimate["estimate_max"]
+    currency = updated.get("currency") or "KES"
+    updated["estimate_min"] = _stringify_money(estimate_min)
+    updated["estimate_max"] = _stringify_money(estimate_max)
+    updated["min_price"] = updated["estimate_min"]
+    updated["max_price"] = updated["estimate_max"]
+    updated["display_mode"] = estimate["display_mode"]
+    updated["display_price_text"] = _format_display_price_text(
+        minimum=estimate_min,
+        maximum=estimate_max,
+        currency=currency,
+        display_mode=estimate["display_mode"],
+    )
+    updated["confidence_label"] = estimate["confidence_label"]
+    updated["source_label"] = estimate["source_label"]
+    return updated
+
+
+def _sanitize_public_preview(preview: dict[str, Any] | None) -> dict[str, Any] | None:
+    source = _as_dict(preview)
+    if not source:
+        return None
+    allowed_keys = (
+        "quote_type",
+        "product_type",
+        "size_label",
+        "quantity",
+        "normalized_pages",
+        "blank_pages_added",
+        "blanks_added",
+        "input_pages",
+        "cover_pages",
+        "insert_pages",
+        "cover_sheets",
+        "insert_sheets",
+        "matched_stock",
+        "warnings",
+        "explanations",
+        "production_preview",
+        "turnaround_label",
+        "human_ready_text",
+    )
+    return {key: source.get(key) for key in allowed_keys if source.get(key) not in (None, "", [], {})}
+
+
+def _sanitize_public_matches(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
+    for match in matches:
+        row = _as_dict(match)
+        sanitized.append(
+            {
+                "id": int(row.get("id") or 0),
+                "shop_id": 0,
+                "name": "Verified Print Partner",
+                "shop_name": "Verified Print Partner",
+                "slug": "partner",
+                "shop_slug": "partner",
+                "can_calculate": bool(row.get("can_calculate")),
+                "can_price_now": bool(row.get("can_price_now")),
+                "can_send_quote_request": bool(row.get("can_send_quote_request")),
+                "currency": row.get("currency") or "KES",
+                "reason": row.get("reason") or "",
+                "summary": row.get("summary") or "",
+                "missing_fields": row.get("missing_fields") or [],
+                "missing_specs": row.get("missing_specs") or row.get("missing_fields") or [],
+                "turnaround_hours": row.get("turnaround_hours"),
+                "estimated_working_hours": row.get("estimated_working_hours"),
+                "estimated_ready_at": row.get("estimated_ready_at"),
+                "human_ready_text": row.get("human_ready_text"),
+                "turnaround_label": row.get("turnaround_label"),
+                "exact_or_estimated": row.get("exact_or_estimated"),
+                "matched_specs": row.get("matched_specs") or [],
+                "needs_confirmation": row.get("needs_confirmation") or [],
+                "closest_alternatives": row.get("closest_alternatives") or [],
+                "alternative_suggestions": row.get("alternative_suggestions") or row.get("closest_alternatives") or [],
+                "price_range": row.get("price_range"),
+                "preview": _sanitize_public_preview(row.get("preview")),
+                "production_preview": row.get("production_preview"),
+                "pricing_breakdown": None,
+            }
+        )
+    return sanitized
+
+
+def _sanitize_public_response(response: dict[str, Any]) -> dict[str, Any]:
+    updated = deepcopy(response)
+    updated["matches"] = _sanitize_public_matches(_as_list(updated.get("matches")))
+    updated["shops"] = updated["matches"]
+    updated["selected_shops"] = updated["matches"]
+    updated["shop_matches"] = updated["matches"]
+    updated["pricing_breakdown"] = None
+    return updated
 
 
 def _has_requested_paper(payload: dict[str, Any], *, booklet: bool = False, prefix: str = "") -> bool:
@@ -99,6 +451,12 @@ def _build_missing_response(product_type: str, missing_fields: list[str]) -> dic
         "unsupported_reasons": [],
         "suggestions": [],
         "exact_or_estimated": False,
+        "estimate_min": None,
+        "estimate_max": None,
+        "display_price_text": None,
+        "display_mode": None,
+        "confidence_label": "low",
+        "source_label": "Estimated Printy price range",
     }
 
 
@@ -422,6 +780,12 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
             "unsupported_reasons": [],
             "suggestions": [],
             "exact_or_estimated": False,
+            "estimate_min": None,
+            "estimate_max": None,
+            "display_price_text": None,
+            "display_mode": None,
+            "confidence_label": "low",
+            "source_label": "Estimated Printy price range",
         }
 
     missing_fields = _required_missing(payload, definition)
@@ -467,7 +831,9 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         matches = response.get("matches", [])
         response["production_preview"] = _extract_production_preview(matches, product_type)
         response["pricing_breakdown"] = _extract_pricing_breakdown(matches)
-        return _apply_urgency_to_response(response, request_payload)
+        response = _apply_urgency_to_response(response, request_payload)
+        response = _attach_public_estimate(response, payload)
+        return _sanitize_public_response(response)
 
     finished_size_raw = payload.get("finished_size") or ""
     custom_warnings: list[str] = []
@@ -523,8 +889,9 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
         matches = response.get("matches", [])
         response["production_preview"] = _extract_production_preview(matches, product_type)
         response["pricing_breakdown"] = _extract_pricing_breakdown(matches)
-
-        return _apply_urgency_to_response(_attach_booklet_match_metadata(response, request_payload), request_payload)
+        response = _apply_urgency_to_response(_attach_booklet_match_metadata(response, request_payload), request_payload)
+        response = _attach_public_estimate(response, payload)
+        return _sanitize_public_response(response)
 
     paper_stock_raw = payload.get("paper_stock") or ""
     stock = resolve_stock_option(paper_stock_raw, usage="sticker" if product_type == "label_sticker" else "")
@@ -573,5 +940,6 @@ def build_public_calculator_preview(payload: dict[str, Any]) -> dict[str, Any]:
     matches = response.get("matches", [])
     response["production_preview"] = _extract_production_preview(matches, product_type)
     response["pricing_breakdown"] = _extract_pricing_breakdown(matches)
-
-    return _apply_urgency_to_response(_attach_flat_match_metadata(response, request_payload), request_payload)
+    response = _apply_urgency_to_response(_attach_flat_match_metadata(response, request_payload), request_payload)
+    response = _attach_public_estimate(response, payload)
+    return _sanitize_public_response(response)

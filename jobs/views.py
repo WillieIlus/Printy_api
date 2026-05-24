@@ -14,6 +14,7 @@ from api.visibility import CLIENT_ACTOR, OPS_ACTOR, PARTNER_ACTOR, SHOP_ACTOR, r
 from api.filters import JobRequestFilterSet
 from jobs.assignment_services import (
     accept_assignment,
+    mark_assignment_finishing,
     mark_assignment_completed,
     mark_assignment_in_production,
     mark_assignment_ready,
@@ -26,6 +27,8 @@ from jobs.file_services import (
     mark_file_print_ready,
     reject_job_proof,
     request_revision,
+    sync_managed_job_artwork_requirement,
+    upload_artwork_for_managed_job,
     upload_proof_for_managed_job,
 )
 from jobs.formatter import format_job_for_whatsapp_share
@@ -276,6 +279,34 @@ class ManagedJobFileListView(APIView):
         return Response(JobFileSerializer(files, many=True, context={"request": request}).data)
 
 
+class ManagedJobArtworkUploadView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("assigned_shop", "client", "broker", "created_by"),
+            pk=pk,
+        )
+        actor = resolve_actor(request.user)
+        if not _can_access_managed_job(user=request.user, managed_job=managed_job, actor=actor):
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        if actor not in {OPS_ACTOR, CLIENT_ACTOR, PARTNER_ACTOR}:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": _("An artwork file is required.")}, status=status.HTTP_400_BAD_REQUEST)
+        assignment = managed_job.assignments.filter(reassigned_from__isnull=True).first()
+        job_file = upload_artwork_for_managed_job(
+            managed_job=managed_job,
+            assignment=assignment,
+            uploaded_by=request.user,
+            file=upload,
+            original_filename=getattr(upload, "name", ""),
+            notes=request.data.get("note", "") or "Artwork uploaded for production.",
+        )
+        return Response(JobFileSerializer(job_file, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+
 class ManagedJobListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -504,18 +535,24 @@ class JobAssignmentActionView(APIView):
         serializer = JobActionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         note = serializer.validated_data.get("note", "")
-        if self.action_name == "accept":
-            assignment = accept_assignment(assignment=assignment, actor=request.user, note=note)
-        elif self.action_name == "reject":
-            assignment = reject_assignment(assignment=assignment, actor=request.user, note=note)
-        elif self.action_name == "in_production":
-            assignment = mark_assignment_in_production(assignment=assignment, actor=request.user, note=note)
-        elif self.action_name == "ready":
-            assignment = mark_assignment_ready(assignment=assignment, actor=request.user, note=note)
-        elif self.action_name == "completed":
-            assignment = mark_assignment_completed(assignment=assignment, actor=request.user, note=note)
-        else:
-            assignment = report_assignment_issue(assignment=assignment, actor=request.user, note=note)
+        try:
+            if self.action_name == "accept":
+                assignment = accept_assignment(assignment=assignment, actor=request.user, note=note)
+            elif self.action_name == "reject":
+                assignment = reject_assignment(assignment=assignment, actor=request.user, note=note)
+            elif self.action_name == "in_production":
+                assignment = mark_assignment_in_production(assignment=assignment, actor=request.user, note=note)
+            elif self.action_name == "finishing":
+                assignment = mark_assignment_finishing(assignment=assignment, actor=request.user, note=note)
+            elif self.action_name == "ready":
+                assignment = mark_assignment_ready(assignment=assignment, actor=request.user, note=note)
+            elif self.action_name == "completed":
+                assignment = mark_assignment_completed(assignment=assignment, actor=request.user, note=note)
+            else:
+                assignment = report_assignment_issue(assignment=assignment, actor=request.user, note=note)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        sync_managed_job_artwork_requirement(managed_job=assignment.managed_job)
         return Response(JobAssignmentSerializer(assignment, context={"request": request}).data)
 
 
@@ -529,6 +566,10 @@ class JobAssignmentRejectView(JobAssignmentActionView):
 
 class JobAssignmentInProductionView(JobAssignmentActionView):
     action_name = "in_production"
+
+
+class JobAssignmentFinishingView(JobAssignmentActionView):
+    action_name = "finishing"
 
 
 class JobAssignmentReadyView(JobAssignmentActionView):

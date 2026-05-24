@@ -347,9 +347,13 @@ def project_match_summary(
 def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[str, Any]:
     response = _as_dict(payload)
 
-    min_price = response.get("min_price")
-    max_price = response.get("max_price")
+    min_price = response.get("estimate_min") or response.get("min_price")
+    max_price = response.get("estimate_max") or response.get("max_price")
     currency = response.get("currency") or "KES"
+    display_price_text = response.get("display_price_text")
+    display_mode = response.get("display_mode")
+    confidence_label = response.get("confidence_label")
+    source_label = response.get("source_label")
     raw_matches = _as_list(response.get("matches"))
     projected_matches = []
     for match in raw_matches:
@@ -386,8 +390,12 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
         "min": min_price,
         "max": max_price,
         "currency": currency,
-        "label": f"{currency} {min_price} - {max_price}" if min_price and max_price and min_price != max_price else f"{currency} {min_price or max_price or '0.00'}",
-        "confidence": "verified" if response.get("exact_or_estimated") else "estimated",
+        "label": display_price_text or (
+            f"{currency} {min_price} - {max_price}" if min_price and max_price and min_price != max_price else f"{currency} {min_price or max_price or '0.00'}"
+        ),
+        "confidence": confidence_label or ("verified" if response.get("exact_or_estimated") else "estimated"),
+        "display_mode": display_mode,
+        "source_label": source_label,
     }
 
     # Production summary (safe)
@@ -403,6 +411,12 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
         "shop_matches": projected_matches,
         "min_price": min_price,
         "max_price": max_price,
+        "estimate_min": min_price,
+        "estimate_max": max_price,
+        "display_price_text": display_price_text or market_range["label"],
+        "display_mode": display_mode,
+        "confidence_label": confidence_label,
+        "source_label": source_label,
         "market_range": market_range,
         "currency": currency,
         "production_preview": production_preview,

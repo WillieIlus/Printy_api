@@ -227,7 +227,16 @@ class EmailVerificationFlowAPITestCase(TestCase):
         )
 
         self.assertEqual(register_response.status_code, 201)
+        self.assertEqual(register_response.json()["detail"], "Check your email to activate your Printy account.")
+        self.assertEqual(register_response.json()["email"], "new-user@test.com")
+        self.assertEqual(register_response.json()["verification_required"], True)
+        self.assertEqual(register_response.json()["resend_available"], True)
         self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject.strip(), "Welcome to Printy - please verify your email")
+        self.assertIn("Hello from Printy!", mail.outbox[0].body)
+        self.assertIn("https://printy.ke/auth/confirm-email?key=", mail.outbox[0].body)
+        self.assertNotIn("example.com", mail.outbox[0].body)
+        self.assertNotIn("localhost:3000", mail.outbox[0].body)
         confirmation_link = self._extract_link_with_key(mail.outbox[0].body)
         parsed_confirmation = urlparse(confirmation_link)
         self.assertEqual(parsed_confirmation.scheme, "https")
@@ -244,7 +253,10 @@ class EmailVerificationFlowAPITestCase(TestCase):
         )
 
         self.assertEqual(login_response.status_code, 400)
-        self.assertIn("not verified", login_response.json()["message"].lower())
+        self.assertEqual(login_response.json()["message"], "Your account exists but needs email verification.")
+        self.assertEqual(login_response.json()["field_errors"]["code"][0], "EMAIL_UNVERIFIED")
+        self.assertEqual(login_response.json()["field_errors"]["email"][0], "new-user@test.com")
+        self.assertEqual(login_response.json()["field_errors"]["resend_available"][0], "True")
 
     def test_client_signup_creates_client_role(self):
         response = self.client.post(

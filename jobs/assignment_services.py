@@ -40,6 +40,9 @@ def _sync_production_order_status(*, assignment: JobAssignment, status: str) -> 
     elif status == JobAssignmentStatus.IN_PRODUCTION and production_order.status != ProductionOrder.IN_PROGRESS:
         production_order.status = ProductionOrder.IN_PROGRESS
         update_fields.append("status")
+    elif status == JobAssignmentStatus.FINISHING and production_order.status != ProductionOrder.IN_PROGRESS:
+        production_order.status = ProductionOrder.IN_PROGRESS
+        update_fields.append("status")
     elif status == JobAssignmentStatus.READY and production_order.status != ProductionOrder.READY:
         production_order.status = ProductionOrder.READY
         update_fields.append("status")
@@ -59,6 +62,27 @@ def _sync_production_order_status(*, assignment: JobAssignment, status: str) -> 
 
     if len(update_fields) > 1:
         production_order.save(update_fields=update_fields)
+
+
+def _ensure_current_status(*, assignment: JobAssignment, allowed: set[str], action: str) -> None:
+    if assignment.status not in allowed:
+        allowed_labels = ", ".join(sorted(allowed))
+        raise ValueError(f"Cannot {action} from '{assignment.status}'. Allowed states: {allowed_labels}.")
+
+
+def _notify_progress(*, assignment: JobAssignment, actor, message: str) -> None:
+    managed_job = assignment.managed_job
+    recipients = [managed_job.broker, managed_job.client]
+    for recipient in recipients:
+        if recipient and getattr(recipient, "id", None) != getattr(actor, "id", None):
+            notify_quote_event(
+                recipient=recipient,
+                notification_type=Notification.JOB_STATUS_UPDATED,
+                message=message,
+                object_type="managed_job",
+                object_id=managed_job.id,
+                actor=actor,
+            )
 
 
 def _transition_assignment(
@@ -126,7 +150,8 @@ def _transition_assignment(
 
 @transaction.atomic
 def accept_assignment(*, assignment: JobAssignment, actor=None, note: str = "") -> JobAssignment:
-    return _transition_assignment(
+    _ensure_current_status(assignment=assignment, allowed={JobAssignmentStatus.PENDING}, action="accept assignment")
+    assignment = _transition_assignment(
         assignment=assignment,
         actor=actor,
         status=JobAssignmentStatus.ACCEPTED,
@@ -135,10 +160,17 @@ def accept_assignment(*, assignment: JobAssignment, actor=None, note: str = "") 
         summary="Assignment accepted.",
         note=note,
     )
+    _notify_progress(assignment=assignment, actor=actor, message=f"{assignment.managed_job.managed_reference or 'Managed job'} was accepted by production.")
+    return assignment
 
 
 @transaction.atomic
 def reject_assignment(*, assignment: JobAssignment, actor=None, note: str = "") -> JobAssignment:
+    _ensure_current_status(
+        assignment=assignment,
+        allowed={JobAssignmentStatus.PENDING, JobAssignmentStatus.ACCEPTED},
+        action="reject assignment",
+    )
     return _transition_assignment(
         assignment=assignment,
         actor=actor,
@@ -153,7 +185,8 @@ def reject_assignment(*, assignment: JobAssignment, actor=None, note: str = "") 
 
 @transaction.atomic
 def mark_assignment_in_production(*, assignment: JobAssignment, actor=None, note: str = "") -> JobAssignment:
-    return _transition_assignment(
+    _ensure_current_status(assignment=assignment, allowed={JobAssignmentStatus.ACCEPTED}, action="start printing")
+    assignment = _transition_assignment(
         assignment=assignment,
         actor=actor,
         status=JobAssignmentStatus.IN_PRODUCTION,
@@ -162,11 +195,40 @@ def mark_assignment_in_production(*, assignment: JobAssignment, actor=None, note
         summary="Assignment moved into production.",
         note=note,
     )
+    _notify_progress(assignment=assignment, actor=actor, message=f"{assignment.managed_job.managed_reference or 'Managed job'} moved into printing.")
+    return assignment
+
+
+@transaction.atomic
+def mark_assignment_finishing(*, assignment: JobAssignment, actor=None, note: str = "") -> JobAssignment:
+    _ensure_current_status(assignment=assignment, allowed={JobAssignmentStatus.IN_PRODUCTION}, action="start finishing")
+    assignment = _transition_assignment(
+        assignment=assignment,
+        actor=actor,
+        status=JobAssignmentStatus.FINISHING,
+        managed_status=ManagedJobStatus.FINISHING,
+        managed_assignment_status=ManagedJobAssignmentStatus.ASSIGNED,
+        summary="Assignment moved into finishing.",
+        note=note,
+        metadata={"finishing_started_at": timezone.now().isoformat()},
+    )
+    assignment.operational_snapshot = {
+        **_as_dict(assignment.operational_snapshot),
+        "finishing_started_at": timezone.now().isoformat(),
+    }
+    assignment.save(update_fields=["operational_snapshot", "updated_at"])
+    _notify_progress(assignment=assignment, actor=actor, message=f"{assignment.managed_job.managed_reference or 'Managed job'} moved into finishing.")
+    return assignment
 
 
 @transaction.atomic
 def mark_assignment_ready(*, assignment: JobAssignment, actor=None, note: str = "") -> JobAssignment:
-    return _transition_assignment(
+    _ensure_current_status(
+        assignment=assignment,
+        allowed={JobAssignmentStatus.IN_PRODUCTION, JobAssignmentStatus.FINISHING},
+        action="mark assignment ready",
+    )
+    assignment = _transition_assignment(
         assignment=assignment,
         actor=actor,
         status=JobAssignmentStatus.READY,
@@ -175,10 +237,13 @@ def mark_assignment_ready(*, assignment: JobAssignment, actor=None, note: str = 
         summary="Assignment marked ready.",
         note=note,
     )
+    _notify_progress(assignment=assignment, actor=actor, message=f"{assignment.managed_job.managed_reference or 'Managed job'} is ready for collection.")
+    return assignment
 
 
 @transaction.atomic
 def mark_assignment_completed(*, assignment: JobAssignment, actor=None, note: str = "") -> JobAssignment:
+    _ensure_current_status(assignment=assignment, allowed={JobAssignmentStatus.READY}, action="complete assignment")
     assignment = _transition_assignment(
         assignment=assignment,
         actor=actor,
@@ -189,16 +254,7 @@ def mark_assignment_completed(*, assignment: JobAssignment, actor=None, note: st
         note=note,
     )
     managed_job = assignment.managed_job
-    recipient = managed_job.broker or managed_job.client
-    if recipient and getattr(recipient, "id", None) != getattr(actor, "id", None):
-        notify_quote_event(
-            recipient=recipient,
-            notification_type=Notification.JOB_STATUS_UPDATED,
-            message=f"{managed_job.managed_reference or 'Managed job'} is marked completed.",
-            object_type="managed_job",
-            object_id=managed_job.id,
-            actor=actor,
-        )
+    _notify_progress(assignment=assignment, actor=actor, message=f"{managed_job.managed_reference or 'Managed job'} is marked completed.")
     return assignment
 
 

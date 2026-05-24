@@ -5,6 +5,7 @@ import requests as http_requests
 from django.contrib.auth import get_user_model
 from allauth.account.forms import ResetPasswordForm, ResetPasswordKeyForm, UserTokenForm
 from allauth.account.internal.flows.password_reset import finalize_password_reset
+from django.conf import settings as django_settings
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -47,6 +48,23 @@ class RegisterView(generics.CreateAPIView):
         context["default_role"] = self.default_role
         context["role_source"] = self.role_source
         return context
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        headers = self.get_success_headers(serializer.data)
+        verification_required = getattr(django_settings, "ACCOUNT_EMAIL_VERIFICATION", "none") != "none"
+        return Response(
+            {
+                "detail": "Check your email to activate your Printy account.",
+                "email": user.email,
+                "verification_required": verification_required,
+                "resend_available": True,
+            },
+            status=status.HTTP_201_CREATED,
+            headers=headers,
+        )
 
 
 class ClientRegisterView(RegisterView):

@@ -322,7 +322,12 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
             email_obj = EmailAddress.objects.filter(user=self.user, primary=True).first()
             if email_obj and not email_obj.verified:
                 raise serializers.ValidationError(
-                    {"detail": "Email address is not verified. Please check your inbox."}
+                    {
+                        "detail": "Your account exists but needs email verification.",
+                        "code": "EMAIL_UNVERIFIED",
+                        "email": self.user.email,
+                        "resend_available": True,
+                    }
                 )
 
         refresh = self.get_token(self.user)

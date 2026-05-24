@@ -1,7 +1,9 @@
 """Canonical draft/request/response workflow services."""
 
+import secrets
+
 from accounts.models import User
-from accounts.services.roles import is_broker
+from accounts.services.roles import is_broker, user_can_manage_clients, user_can_source_jobs
 from django.db import transaction
 from django.utils import timezone
 
@@ -16,6 +18,7 @@ from api.visibility import (
     project_match_summary,
     project_pricing_breakdown,
     project_production_intelligence,
+    resolve_topology_mode_for_quote_request,
 )
 from pricing.models import FinishingRate, Material
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
@@ -35,6 +38,25 @@ from shops.models import Shop
 
 def _build_reference(prefix: str, instance_id: int) -> str:
     return f"{prefix}-{timezone.now():%Y%m%d}-{instance_id}"
+
+
+def _generate_share_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _ensure_share_link(response: ShopQuote, *, user=None) -> QuoteShareLink:
+    share_link = response.share_links.order_by("-id").first()
+    if share_link:
+        if not share_link.token:
+            share_link.token = _generate_share_token()
+            share_link.save(update_fields=["token", "updated_at"])
+        return share_link
+    return QuoteShareLink.objects.create(
+        shop_quote=response,
+        token=_generate_share_token(),
+        expires_at=timezone.now() + timezone.timedelta(days=30),
+        created_by=user if user and getattr(user, "is_authenticated", False) else None,
+    )
 
 
 def _coerce_positive_int(value):
@@ -66,6 +88,25 @@ def _resolve_shop_resource(model, shop: Shop, candidate, *, active_only: bool = 
     if active_only and hasattr(model, "is_active"):
         queryset = queryset.filter(is_active=True)
     return queryset.first()
+
+
+def resolve_assigned_manager(candidate):
+    manager_id = _coerce_positive_int(candidate)
+    if not manager_id:
+        return None
+
+    manager = User.objects.filter(pk=manager_id, is_active=True).first()
+    if manager is None:
+        raise ValueError("Selected manager is invalid or inactive.")
+
+    if not (
+        user_can_manage_clients(manager)
+        or user_can_source_jobs(manager)
+        or bool(getattr(manager, "partner_profile_enabled", False))
+    ):
+        raise ValueError("Selected manager is not eligible to manage client requests.")
+
+    return manager
 
 
 def _resolve_product_for_shop(draft: QuoteDraft, shop: Shop):
@@ -141,6 +182,45 @@ def _build_request_snapshot(*, draft: QuoteDraft, shop: Shop, merged_request_det
     }
 
 
+def _build_manager_intake_snapshot(*, draft: QuoteDraft, merged_request_details: dict, assigned_manager=None):
+    snapshot = {
+        "source": "manager_led_intake",
+        "draft_reference": draft.draft_reference,
+        "calculator_inputs": draft.calculator_inputs_snapshot or {},
+        "production_preview_snapshot": (draft.pricing_snapshot or {}).get("production_preview"),
+        "pricing_preview_snapshot": (draft.pricing_snapshot or {}).get("pricing_preview"),
+        "pricing_snapshot": draft.pricing_snapshot,
+        "matched_specs": [],
+        "needs_confirmation": [],
+        "request_details": merged_request_details,
+        "custom_product_snapshot": draft.custom_product_snapshot,
+        "selected_shop_ids": [],
+        "buyer": _build_buyer_snapshot(draft=draft, merged_request_details=merged_request_details),
+        "customer_pricing": {
+            "currency": (draft.pricing_snapshot or {}).get("currency") or "KES",
+            "min_price": (draft.pricing_snapshot or {}).get("min_price"),
+            "max_price": (draft.pricing_snapshot or {}).get("max_price"),
+            "production_preview": project_production_intelligence((draft.pricing_snapshot or {}).get("production_preview")),
+            "pricing_summary": project_pricing_breakdown((draft.pricing_snapshot or {}).get("pricing_preview"), actor=CLIENT_ACTOR),
+            "selected_shop_preview": None,
+        },
+        "visibility": {
+            "actor": CLIENT_ACTOR,
+            "topology_mode": TOPOLOGY_MANAGED,
+            "exposes_internal_economics": False,
+        },
+    }
+    if assigned_manager is not None:
+        snapshot["relationship_owner_type"] = "user"
+        snapshot["relationship_owner_user_id"] = assigned_manager.id
+        snapshot["assigned_manager"] = {
+            "id": assigned_manager.id,
+            "display_name": getattr(assigned_manager, "name", "") or getattr(assigned_manager, "email", "") or "Print Manager",
+            "short_title": "Print Manager",
+        }
+    return snapshot
+
+
 def _build_item_spec_snapshot(*, draft: QuoteDraft, merged_request_details: dict, shop: Shop):
     selected_shop_preview = _extract_shop_preview(draft.pricing_snapshot, shop)
     return {
@@ -171,6 +251,35 @@ def _build_item_spec_snapshot(*, draft: QuoteDraft, merged_request_details: dict
             "exposes_internal_economics": False,
         },
     }
+
+
+def _build_manager_intake_item_spec_snapshot(*, draft: QuoteDraft, merged_request_details: dict, assigned_manager=None):
+    snapshot = {
+        "source": "manager_led_intake",
+        "draft_reference": draft.draft_reference,
+        "calculator_inputs": draft.calculator_inputs_snapshot or {},
+        "custom_product_snapshot": draft.custom_product_snapshot or {},
+        "request_details": merged_request_details,
+        "production_preview_snapshot": (draft.pricing_snapshot or {}).get("production_preview"),
+        "pricing_preview_snapshot": (draft.pricing_snapshot or {}).get("pricing_preview"),
+        "selected_shop_preview": {},
+        "matched_specs": [],
+        "needs_confirmation": [],
+        "selected_shop_ids": [],
+        "customer_pricing": {
+            "currency": (draft.pricing_snapshot or {}).get("currency") or "KES",
+            "production_preview": project_production_intelligence((draft.pricing_snapshot or {}).get("production_preview")),
+            "pricing_summary": project_pricing_breakdown((draft.pricing_snapshot or {}).get("pricing_preview"), actor=CLIENT_ACTOR),
+        },
+        "visibility": {
+            "actor": CLIENT_ACTOR,
+            "topology_mode": TOPOLOGY_MANAGED,
+            "exposes_internal_economics": False,
+        },
+    }
+    if assigned_manager is not None:
+        snapshot["assigned_manager_id"] = assigned_manager.id
+    return snapshot
 
 
 def _build_quote_item(*, quote_request: QuoteRequest, draft: QuoteDraft, shop: Shop, merged_request_details: dict) -> QuoteItem:
@@ -277,6 +386,46 @@ def _build_quote_item(*, quote_request: QuoteRequest, draft: QuoteDraft, shop: S
     return item
 
 
+def _build_manager_intake_quote_item(*, quote_request: QuoteRequest, draft: QuoteDraft, merged_request_details: dict, assigned_manager=None) -> QuoteItem:
+    calculator_inputs = draft.calculator_inputs_snapshot or {}
+    custom_snapshot = draft.custom_product_snapshot or {}
+    pricing_mode = (
+        calculator_inputs.get("product_pricing_mode")
+        or calculator_inputs.get("pricing_mode")
+        or ("LARGE_FORMAT" if calculator_inputs.get("material_id") else "SHEET")
+    )
+    width_mm = _coerce_positive_int(
+        calculator_inputs.get("width_mm")
+        or custom_snapshot.get("width_mm")
+    )
+    height_mm = _coerce_positive_int(
+        calculator_inputs.get("height_mm")
+        or custom_snapshot.get("height_mm")
+    )
+
+    return QuoteItem.objects.create(
+        quote_request=quote_request,
+        item_type="CUSTOM",
+        title=(custom_snapshot.get("custom_title") or calculator_inputs.get("custom_title") or draft.title or "Print job")[:120],
+        spec_text=(custom_snapshot.get("custom_brief") or calculator_inputs.get("custom_brief") or merged_request_details.get("notes") or "")[:5000],
+        has_artwork=True,
+        quantity=_coerce_positive_int(calculator_inputs.get("quantity")) or 1,
+        pricing_mode=pricing_mode if pricing_mode in {"SHEET", "LARGE_FORMAT"} else "SHEET",
+        chosen_width_mm=width_mm,
+        chosen_height_mm=height_mm,
+        sides=calculator_inputs.get("print_sides") or calculator_inputs.get("sides") or "SIMPLEX",
+        color_mode=calculator_inputs.get("colour_mode") or calculator_inputs.get("color_mode") or "COLOR",
+        special_instructions=(merged_request_details.get("notes") or custom_snapshot.get("custom_brief") or "")[:5000],
+        pricing_snapshot=draft.pricing_snapshot,
+        item_spec_snapshot=_build_manager_intake_item_spec_snapshot(
+            draft=draft,
+            merged_request_details=merged_request_details,
+            assigned_manager=assigned_manager,
+        ),
+        needs_review=True,
+    )
+
+
 def _create_request_message(*, quote_request: QuoteRequest, sender, metadata: dict | None = None):
     return create_quote_message(
         quote_request=quote_request,
@@ -293,6 +442,11 @@ def _create_request_message(*, quote_request: QuoteRequest, sender, metadata: di
         send_email_copy=bool(getattr(quote_request.shop.owner, "email", "")),
         create_failure_notice=True,
     )
+
+
+def _intake_has_artwork(request_details: dict | None) -> bool:
+    details = request_details if isinstance(request_details, dict) else {}
+    return bool(str(details.get("artwork_reference") or "").strip())
 
 
 def save_quote_draft(*, user, selected_product=None, shop=None, title: str = "", calculator_inputs_snapshot: dict, pricing_snapshot: dict | None = None, custom_product_snapshot: dict | None = None, request_details_snapshot: dict | None = None) -> QuoteDraft:
@@ -352,6 +506,11 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
         **(request_details_snapshot or {}),
     }
     merged_request_details["selected_shop_ids"] = [shop.id for shop in shops]
+    assigned_manager = resolve_assigned_manager(
+        merged_request_details.get("selected_manager_id")
+        or merged_request_details.get("assigned_manager_id")
+        or merged_request_details.get("assigned_manager")
+    )
     on_behalf_of = None
     client_id = merged_request_details.get("client_id") or merged_request_details.get("on_behalf_of")
     if client_id:
@@ -361,10 +520,88 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
     created_requests = []
 
     with transaction.atomic():
+        if not shops:
+            quote_request = QuoteRequest.objects.create(
+                shop=None,
+                created_by=draft.user,
+                assigned_manager=assigned_manager,
+                on_behalf_of=on_behalf_of,
+                customer_name=merged_request_details.get("customer_name") or getattr(draft.user, "name", "") or draft.user.email,
+                customer_email=merged_request_details.get("customer_email") or getattr(draft.user, "email", ""),
+                customer_phone=merged_request_details.get("customer_phone", ""),
+                notes=merged_request_details.get("notes", ""),
+                status=QuoteStatus.SUBMITTED,
+                delivery_preference=merged_request_details.get("delivery_preference", ""),
+                delivery_address=merged_request_details.get("delivery_address", ""),
+                delivery_location=_resolve_location(merged_request_details.get("delivery_location")),
+                source_draft=draft,
+                request_snapshot=_build_manager_intake_snapshot(
+                    draft=draft,
+                    merged_request_details=merged_request_details,
+                    assigned_manager=assigned_manager,
+                ),
+            )
+            quote_request.request_reference = _build_reference("QR", quote_request.id)
+            quote_request.save(update_fields=["request_reference", "updated_at"])
+            _build_manager_intake_quote_item(
+                quote_request=quote_request,
+                draft=draft,
+                merged_request_details=merged_request_details,
+                assigned_manager=assigned_manager,
+            )
+            if assigned_manager and assigned_manager.id != draft.user.id:
+                notify_quote_event(
+                    recipient=assigned_manager,
+                    notification_type=Notification.QUOTE_REQUEST_SUBMITTED,
+                    message=f"New client intake request #{quote_request.id} has been assigned to you.",
+                    object_type="quote_request",
+                    object_id=quote_request.id,
+                    actor=draft.user,
+                )
+            if draft.user_id:
+                notify_quote_event(
+                    recipient=draft.user,
+                    notification_type=Notification.QUOTE_REQUEST_SENT,
+                    message=f"Your quote request #{quote_request.id} was received by Printy.",
+                    object_type="quote_request",
+                    object_id=quote_request.id,
+                    actor=draft.user,
+                )
+                if not _intake_has_artwork(merged_request_details):
+                    Notification.objects.create(
+                        user=draft.user,
+                        actor=draft.user,
+                        notification_type=Notification.QUOTE_REQUEST_SENT,
+                        message=(
+                            "Your quote request was sent. Don't forget to upload your artwork so production can begin "
+                            "as soon as you accept a quote."
+                        ),
+                        object_type="quote_request",
+                        object_id=quote_request.id,
+                    )
+                    from django.conf import settings
+                    from django.core.mail import send_mail
+
+                    send_mail(
+                        subject="Upload your artwork to keep your Printy request moving",
+                        message=(
+                            "Your quote request was sent. Don't forget to upload your artwork so production can begin "
+                            "as soon as you accept a quote."
+                        ),
+                        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                        recipient_list=[draft.user.email],
+                        fail_silently=True,
+                    )
+            created_requests.append(quote_request)
+            draft.status = QuoteDraftStatus.SENT
+            draft.save(update_fields=["status", "updated_at"])
+            return created_requests
+
         for shop in shops:
             quote_request = QuoteRequest.objects.create(
                 shop=shop,
                 created_by=draft.user,
+                assigned_manager=assigned_manager,
                 on_behalf_of=on_behalf_of,
                 customer_name=merged_request_details.get("customer_name") or getattr(draft.user, "name", "") or draft.user.email,
                 customer_email=merged_request_details.get("customer_email") or draft.user.email,
@@ -507,14 +744,13 @@ def create_quote_response(*, quote_request: QuoteRequest, shop, user, status: st
 
     share_link = None
     if status != ShopQuoteStatus.PENDING:
-        # Create share link for client visibility
-        share_link, _ = QuoteShareLink.objects.get_or_create(
-            shop_quote=response,
-            defaults={
-                "expires_at": timezone.now() + timezone.timedelta(days=30),
-                "created_by": user if user and user.is_authenticated else None,
-            }
+        sender_name = project_identity(
+            getattr(shop, "name", None),
+            actor=CLIENT_ACTOR,
+            topology_mode=resolve_topology_mode_for_quote_request(quote_request),
         )
+        # Create share link for client visibility
+        share_link = _ensure_share_link(response, user=user)
 
         create_quote_message(
             quote_request=quote_request,
@@ -527,7 +763,7 @@ def create_quote_response(*, quote_request: QuoteRequest, shop, user, status: st
             message_kind=QuoteRequestMessage.MessageKind.QUOTE,
             message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
             direction=QuoteRequestMessage.Direction.INBOUND,
-            subject=f"{project_identity(quote_request.shop.name, actor=CLIENT_ACTOR)} sent a quote",
+            subject=f"{sender_name} sent a quote",
             body=note or "A shop sent you a quote in Printy.",
             metadata={
                 "status": quote_request.status, 
@@ -598,13 +834,15 @@ def update_quote_response(
 
     share_link = None
     if status != ShopQuoteStatus.PENDING:
+        sender_name = project_identity(
+            getattr(response.shop, "name", None),
+            actor=CLIENT_ACTOR,
+            topology_mode=resolve_topology_mode_for_quote_request(quote_request),
+        )
         # Create or update share link for client visibility
-        share_link, _ = QuoteShareLink.objects.get_or_create(
-            shop_quote=response,
-            defaults={
-                "expires_at": timezone.now() + timezone.timedelta(days=30),
-                "created_by": response.created_by if response.created_by and response.created_by.is_authenticated else None,
-            }
+        share_link = _ensure_share_link(
+            response,
+            user=response.created_by if response.created_by and response.created_by.is_authenticated else None,
         )
 
         create_quote_message(
@@ -618,7 +856,7 @@ def update_quote_response(
             message_kind=QuoteRequestMessage.MessageKind.QUOTE,
             message_type=QuoteRequestMessage.MessageType.QUOTE_RESPONSE_SENT,
             direction=QuoteRequestMessage.Direction.INBOUND,
-            subject=f"{project_identity(quote_request.shop.name, actor=CLIENT_ACTOR)} sent a quote",
+            subject=f"{sender_name} sent a quote",
             body=response.note or "A shop updated your quote in Printy.",
             metadata={
                 "status": quote_request.status, 

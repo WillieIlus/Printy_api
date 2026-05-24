@@ -10,7 +10,9 @@ from django.db import transaction
 from api.visibility import TOPOLOGY_MANAGED
 from jobs.payment_services import calculate_partner_job_split, get_default_platform_service_percent
 from production.models import Customer
-from quotes.services_workflow import create_quote_response, save_quote_draft, send_quote_draft_to_shops
+from quotes.choices import QuoteStatus, ShopQuoteStatus
+from quotes.models import QuoteRequest, ShopQuote
+from quotes.services_workflow import _build_reference, create_quote_response
 from services.pricing.projections import project_broker_projection
 from shops.models import Shop
 
@@ -116,6 +118,58 @@ def get_or_create_partner_customer(
     return customer
 
 
+def _build_partner_request_snapshot(
+    *,
+    shop: Shop,
+    calculator_inputs_snapshot: dict[str, Any],
+    pricing_snapshot: dict[str, Any],
+    partner_user,
+    partner_brand_name: str,
+    partner_markup: Decimal,
+    client_name: str,
+    client_email: str,
+    client_phone: str,
+    client_company: str,
+    client_user=None,
+) -> dict[str, Any]:
+    return {
+        "source": "partner_quote_builder",
+        "quote_source": "partner_quote_builder",
+        "calculator_inputs": calculator_inputs_snapshot,
+        "pricing_snapshot": pricing_snapshot,
+        "request_details": {
+            "customer_name": client_name,
+            "customer_email": client_email,
+            "customer_phone": client_phone,
+            "client_company": client_company,
+        },
+        "selected_shop_ids": [shop.id],
+        "selected_shop_preview": {
+            "id": shop.id,
+            "slug": shop.slug,
+            "name": shop.name,
+        },
+        "partner_brand_name": partner_brand_name,
+        "white_label_mode": True,
+        "partner_markup": str(partner_markup.quantize(Decimal("0.01"))),
+        "relationship_owner_type": "user",
+        "relationship_owner_user_id": partner_user.id,
+        "topology_mode": TOPOLOGY_MANAGED,
+        "visibility": {
+            "actor": "client",
+            "topology_mode": TOPOLOGY_MANAGED,
+            "exposes_internal_economics": False,
+        },
+        "pending_client": {
+            "client_user_id": getattr(client_user, "id", None),
+            "name": client_name,
+            "email": client_email,
+            "phone": client_phone,
+            "company": client_company,
+        },
+    }
+
+
 @transaction.atomic
 def create_partner_quote(
     *,
@@ -125,11 +179,13 @@ def create_partner_quote(
     client_name: str,
     client_email: str = "",
     client_phone: str = "",
+    client_company: str = "",
     calculator_inputs_snapshot: dict[str, Any],
     pricing_snapshot: dict[str, Any],
     partner_markup: Decimal,
     title: str = "",
     note: str = "",
+    save_as_draft: bool = False,
 ) -> dict[str, Any]:
     validate_partner_markup(pricing_snapshot=pricing_snapshot, shop=shop, partner_markup=partner_markup)
     preview = build_partner_quote_preview(
@@ -146,66 +202,41 @@ def create_partner_quote(
         partner_user=partner_user,
     )
     partner_brand_name = getattr(partner_user, "name", "") or getattr(partner_user, "email", "") or "Partner"
-
-    draft = save_quote_draft(
-        user=partner_user,
+    customer = None
+    if client_name or client_email or client_phone:
+        customer = get_or_create_partner_customer(
+            shop=shop,
+            partner_user=partner_user,
+            client_name=client_name or client_email or client_phone,
+            client_email=client_email,
+            client_phone=client_phone,
+        )
+    quote_request = QuoteRequest.objects.create(
         shop=shop,
-        title=title or f"Partner quote for {client_name or 'client'}",
-        calculator_inputs_snapshot=calculator_inputs_snapshot,
-        pricing_snapshot=pricing_snapshot,
-        request_details_snapshot={
-            "customer_name": client_name,
-            "customer_email": client_email,
-            "customer_phone": client_phone,
-            "selected_shop_ids": [shop.id],
-            "quote_source": "partner_quote_builder",
-            "white_label_mode": True,
-            "partner_brand_name": partner_brand_name,
-            "partner_markup": str(partner_markup.quantize(Decimal("0.01"))),
-        },
+        created_by=partner_user,
+        on_behalf_of=client_user if not save_as_draft else None,
+        customer=customer,
+        customer_name=client_name or client_email or client_phone or "Client",
+        customer_email=client_email,
+        customer_phone=client_phone,
+        notes=note or "Partner quote prepared in Printy.",
+        status=QuoteStatus.DRAFT if save_as_draft else QuoteStatus.QUOTED,
+        request_snapshot=_build_partner_request_snapshot(
+            shop=shop,
+            calculator_inputs_snapshot=calculator_inputs_snapshot,
+            pricing_snapshot=pricing_snapshot,
+            partner_user=partner_user,
+            partner_brand_name=partner_brand_name,
+            partner_markup=partner_markup,
+            client_name=client_name,
+            client_email=client_email,
+            client_phone=client_phone,
+            client_company=client_company,
+            client_user=client_user,
+        ),
     )
-    quote_request = send_quote_draft_to_shops(
-        draft=draft,
-        shops=[shop],
-        request_details_snapshot={
-            "client_id": getattr(client_user, "id", None),
-            "customer_name": client_name,
-            "customer_email": client_email,
-            "customer_phone": client_phone,
-            "quote_source": "partner_quote_builder",
-            "white_label_mode": True,
-            "partner_brand_name": partner_brand_name,
-        },
-    )[0]
-
-    customer = get_or_create_partner_customer(
-        shop=shop,
-        partner_user=partner_user,
-        client_name=client_name,
-        client_email=client_email,
-        client_phone=client_phone,
-    )
-    request_snapshot = _as_dict(quote_request.request_snapshot)
-    request_snapshot.update(
-        {
-            "quote_source": "partner_quote_builder",
-            "partner_brand_name": partner_brand_name,
-            "white_label_mode": True,
-            "partner_markup": str(partner_markup.quantize(Decimal("0.01"))),
-            "relationship_owner_type": "user",
-            "relationship_owner_user_id": partner_user.id,
-            "topology_mode": TOPOLOGY_MANAGED,
-        }
-    )
-    request_snapshot["visibility"] = {
-        "actor": "client",
-        "topology_mode": TOPOLOGY_MANAGED,
-        "exposes_internal_economics": False,
-    }
-    quote_request.customer = customer
-    quote_request.on_behalf_of = client_user
-    quote_request.request_snapshot = request_snapshot
-    quote_request.save(update_fields=["customer", "on_behalf_of", "request_snapshot", "updated_at"])
+    quote_request.request_reference = _build_reference("QR", quote_request.id)
+    quote_request.save(update_fields=["request_reference", "updated_at"])
 
     response_snapshot = {
         "currency": pricing_snapshot.get("currency") or "KES",
@@ -228,6 +259,152 @@ def create_partner_quote(
         "payment_terms": "Pay through Printy before production starts.",
         "note": note or "Partner quote prepared in Printy.",
     }
+    if save_as_draft:
+        response = ShopQuote.objects.create(
+            quote_request=quote_request,
+            shop=shop,
+            created_by=partner_user,
+            status=ShopQuoteStatus.PENDING,
+            total=production_base_price,
+            note=note or "Partner quote draft prepared in Printy.",
+            response_snapshot=response_snapshot,
+            revised_pricing_snapshot=None,
+        )
+        response.quote_reference = _build_reference("QS", response.id)
+        response.production_base_price = split["production_amount"]
+        response.broker_margin_type = "fixed"
+        response.broker_margin_value = partner_markup.quantize(Decimal("0.01"))
+        response.broker_margin_amount = split["broker_margin_amount"]
+        response.platform_service_percent = split["platform_service_percent"]
+        response.platform_service_amount = split["platform_service_amount"]
+        response.client_total = split["client_total"]
+        response.client_quote_status = "draft"
+        response.save(
+            update_fields=[
+                "quote_reference",
+                "production_base_price",
+                "broker_margin_type",
+                "broker_margin_value",
+                "broker_margin_amount",
+                "platform_service_percent",
+                "platform_service_amount",
+                "client_total",
+                "client_quote_status",
+                "updated_at",
+            ]
+        )
+    else:
+        response = create_quote_response(
+            quote_request=quote_request,
+            shop=shop,
+            user=partner_user,
+            status="sent",
+            response_snapshot=response_snapshot,
+            revised_pricing_snapshot=None,
+            total=production_base_price,
+            note=note or "Partner quote prepared in Printy.",
+        )
+    response.production_base_price = split["production_amount"]
+    response.broker_margin_type = "fixed"
+    response.broker_margin_value = partner_markup.quantize(Decimal("0.01"))
+    response.broker_margin_amount = split["broker_margin_amount"]
+    response.platform_service_percent = split["platform_service_percent"]
+    response.platform_service_amount = split["platform_service_amount"]
+    response.client_total = split["client_total"]
+    response.sent_to_client_at = response.sent_at if not save_as_draft else None
+    response.sent_to_client_by = partner_user if not save_as_draft else None
+    response.client_quote_status = "draft" if save_as_draft else "sent"
+    response.save(
+        update_fields=[
+            "production_base_price",
+            "broker_margin_type",
+            "broker_margin_value",
+            "broker_margin_amount",
+            "platform_service_percent",
+            "platform_service_amount",
+            "client_total",
+            "sent_to_client_at",
+            "sent_to_client_by",
+            "client_quote_status",
+            "updated_at",
+        ]
+    )
+    return {
+        "draft": None,
+        "quote_request": quote_request,
+        "shop_quote": response,
+        "preview": preview,
+    }
+
+
+@transaction.atomic
+def respond_to_assigned_quote_request(
+    *,
+    partner_user,
+    quote_request,
+    shop: Shop,
+    pricing_snapshot: dict[str, Any],
+    partner_markup: Decimal,
+    note: str = "",
+) -> dict[str, Any]:
+    validate_partner_markup(pricing_snapshot=pricing_snapshot, shop=shop, partner_markup=partner_markup)
+    preview = build_partner_quote_preview(
+        pricing_snapshot=pricing_snapshot,
+        shop=shop,
+        partner_markup=partner_markup,
+    )
+    production_base_price = _money(preview.get("production_estimate"))
+    split = calculate_partner_job_split(
+        production_base_price,
+        broker_margin_percent=(partner_markup / production_base_price * Decimal("100")) if production_base_price > 0 else Decimal("0"),
+        platform_service_percent=get_default_platform_service_percent(),
+        partner_user=partner_user,
+    )
+    partner_brand_name = getattr(partner_user, "name", "") or getattr(partner_user, "email", "") or "Print Manager"
+
+    request_snapshot = _as_dict(quote_request.request_snapshot)
+    request_snapshot.update(
+        {
+            "partner_brand_name": partner_brand_name,
+            "relationship_owner_type": "user",
+            "relationship_owner_user_id": partner_user.id,
+            "selected_shop_ids": [shop.id],
+            "selected_shop_preview": {
+                "id": shop.id,
+                "slug": shop.slug,
+                "name": shop.name,
+            },
+            "topology_mode": TOPOLOGY_MANAGED,
+        }
+    )
+    request_snapshot["visibility"] = {
+        "actor": "client",
+        "topology_mode": TOPOLOGY_MANAGED,
+        "exposes_internal_economics": False,
+    }
+    quote_request.request_snapshot = request_snapshot
+    quote_request.save(update_fields=["request_snapshot", "updated_at"])
+
+    response_snapshot = {
+        "currency": pricing_snapshot.get("currency") or "KES",
+        "partner_brand_name": partner_brand_name,
+        "customer_pricing": {
+            "production_base_price": str(split["production_amount"]),
+            "broker_margin_percent": str(split["broker_margin_percent"]),
+            "broker_margin_amount": str(split["broker_margin_amount"]),
+            "platform_service_percent": str(split["platform_service_percent"]),
+            "platform_service_amount": str(split["platform_service_amount"]),
+            "final_client_price": str(split["client_total"]),
+        },
+        "pricing": {
+            "grand_total": str(split["client_total"]),
+        },
+        "totals": {
+            "grand_total": str(split["client_total"]),
+        },
+        "payment_terms": "Pay through Printy before production starts.",
+        "note": note or "Your Print Manager prepared an exact quote in Printy.",
+    }
     response = create_quote_response(
         quote_request=quote_request,
         shop=shop,
@@ -236,7 +413,7 @@ def create_partner_quote(
         response_snapshot=response_snapshot,
         revised_pricing_snapshot=None,
         total=production_base_price,
-        note=note or "Partner quote prepared in Printy.",
+        note=note or "Your Print Manager prepared an exact quote in Printy.",
     )
     response.production_base_price = split["production_amount"]
     response.broker_margin_type = "fixed"
@@ -264,7 +441,6 @@ def create_partner_quote(
         ]
     )
     return {
-        "draft": draft,
         "quote_request": quote_request,
         "shop_quote": response,
         "preview": preview,

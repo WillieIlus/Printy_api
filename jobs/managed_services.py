@@ -64,8 +64,17 @@ def _resolve_customer(quote_request: QuoteRequest | None) -> Customer | None:
     return None
 
 
-def _resolve_relationship_snapshot(customer: Customer | None) -> dict[str, Any]:
+def _resolve_relationship_snapshot(customer: Customer | None, quote_request: QuoteRequest | None = None) -> dict[str, Any]:
     if not customer:
+        assigned_manager = getattr(quote_request, "assigned_manager", None) if quote_request else None
+        if assigned_manager is not None:
+            return {
+                "owner_type": Customer.RelationshipOwnerType.USER,
+                "owner_reference": f"user:{assigned_manager.id}",
+                "owner_user_id": assigned_manager.id,
+                "owner_shop_id": None,
+                "acquisition_source": Customer.AcquisitionSource.PARTNER,
+            }
         return {}
     return {
         "owner_type": customer.relationship_owner_type,
@@ -76,7 +85,10 @@ def _resolve_relationship_snapshot(customer: Customer | None) -> dict[str, Any]:
     }
 
 
-def _resolve_broker(customer: Customer | None):
+def _resolve_broker(customer: Customer | None, quote_request: QuoteRequest | None = None):
+    assigned_manager = getattr(quote_request, "assigned_manager", None) if quote_request else None
+    if assigned_manager is not None:
+        return assigned_manager
     if not customer:
         return None
     if customer.relationship_owner_type == Customer.RelationshipOwnerType.USER:
@@ -97,7 +109,9 @@ def _resolve_fulfillment_mode(quote_request: QuoteRequest | None) -> str:
     return "pickup"
 
 
-def _resolve_topology_type(customer: Customer | None) -> str:
+def _resolve_topology_type(customer: Customer | None, quote_request: QuoteRequest | None = None) -> str:
+    if getattr(quote_request, "assigned_manager_id", None):
+        return ManagedJobTopologyType.CLIENT_PARTNER
     if customer and customer.relationship_owner_type == Customer.RelationshipOwnerType.USER:
         return ManagedJobTopologyType.CLIENT_PARTNER
     return ManagedJobTopologyType.CLIENT_PRINTY_SUPPORT
@@ -248,7 +262,7 @@ def create_managed_job_from_accepted_quote(
 
     source_draft = _resolve_source_draft(quote_request)
     customer = _resolve_customer(quote_request)
-    broker = _resolve_broker(customer)
+    broker = _resolve_broker(customer, quote_request=quote_request)
     topology_mode = resolve_topology_mode_for_quote_request(quote_request)
     urgency_payload = _resolve_urgency_payload(quote_request=quote_request, shop_quote=shop_quote)
     request_snapshot = _as_dict(getattr(quote_request, "request_snapshot", None))
@@ -282,7 +296,7 @@ def create_managed_job_from_accepted_quote(
         assignment_status=initial_assignment_status,
         exception_status="clear",
         fulfillment_mode=_resolve_fulfillment_mode(quote_request),
-        topology_type=_resolve_topology_type(customer),
+        topology_type=_resolve_topology_type(customer, quote_request=quote_request),
         urgency_type=urgency_payload["urgency_type"],
         urgency_multiplier=urgency_payload["urgency_multiplier"],
         urgency_fee=urgency_payload["urgency_fee"],
@@ -310,7 +324,7 @@ def create_managed_job_from_accepted_quote(
             "accepted_via_shop_quote_id": shop_quote.id,
             "topology_mode": topology_mode,
         },
-        relationship_snapshot=_resolve_relationship_snapshot(customer),
+        relationship_snapshot=_resolve_relationship_snapshot(customer, quote_request=quote_request),
         accepted_at=shop_quote.accepted_at or timezone.now(),
     )
     import_legacy_files_to_managed_job(
