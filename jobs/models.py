@@ -371,6 +371,7 @@ class ManagedJob(TimeStampedModel):
     broker_commission = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     payout_hold = models.BooleanField(default=False)
     artwork_required = models.BooleanField(default=False)
+    artwork_reminder_sent = models.BooleanField(default=False)
     dispute_open = models.BooleanField(default=False)
     production_issue_flag = models.BooleanField(default=False)
     delivery_issue_flag = models.BooleanField(default=False)

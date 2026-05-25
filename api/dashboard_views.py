@@ -31,8 +31,9 @@ from jobs.serializers import JobSettlementSplitSerializer
 from inventory.models import Paper
 from notifications.models import Notification
 from notifications.services import notify_quote_event
-from jobs.file_services import managed_job_has_artwork, notify_missing_artwork
+from jobs.file_services import managed_job_artwork_state, managed_job_has_artwork, notify_missing_artwork
 from pricing.models import FinishingRate, PrintingRate
+from quotes.guardrails import calculate_quote_expiry, validate_partner_markup_amount
 from quotes.models import QuoteRequest, ShopQuote
 from quotes.partner_services import respond_to_assigned_quote_request
 from quotes.services_workflow import update_quote_response
@@ -577,6 +578,7 @@ class BaseRoleDetailView(BaseDashboardHomeView):
         return row
 
     def _job_row(self, job: ManagedJob, *, role: str) -> dict[str, object]:
+        artwork_state = managed_job_artwork_state(managed_job=job)
         row = {
             "id": job.id,
             "reference": job.managed_reference,
@@ -586,8 +588,7 @@ class BaseRoleDetailView(BaseDashboardHomeView):
             "assignment_status": job.assignment_status,
             "requested_deadline": job.requested_deadline,
             "updated_at": job.updated_at,
-            "artwork_required": job.artwork_required,
-            "artwork_uploaded": self._has_artwork(job),
+            **artwork_state,
             "payment_confirmed": str(job.payment_status or "").lower() in {"confirmed", "release_ready", "released"},
             "pricing": _job_pricing_snapshot(job, role),
         }
@@ -744,6 +745,10 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
         base_price = Decimal(str(latest_response.total))
 
         if broker_margin_type == "fixed":
+            try:
+                validate_partner_markup_amount(base_price=base_price, markup_amount=broker_margin_value)
+            except ValueError as exc:
+                return Response({"detail": str(exc)}, status=400)
             broker_margin_amount = broker_margin_value.quantize(Decimal("0.01"))
             broker_margin_percent = (
                 (broker_margin_amount / base_price) * Decimal("100")
@@ -758,6 +763,14 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
                 "client_total": (base_price + broker_margin_amount + platform_service_amount).quantize(Decimal("0.01")),
             }
         else:
+            rate = Decimal(str(request.data.get("broker_margin_value") or "30")).quantize(Decimal("0.01"))
+            try:
+                validate_partner_markup_amount(
+                    base_price=base_price,
+                    markup_amount=(base_price * rate / Decimal("100")).quantize(Decimal("0.01")),
+                )
+            except ValueError as exc:
+                return Response({"detail": str(exc)}, status=400)
             split = calculate_partner_job_split(
                 base_price,
                 broker_margin_percent=broker_margin_value,
@@ -788,6 +801,7 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
         else:
             latest_response.response_snapshot = response_snapshot
             latest_response.sent_at = latest_response.sent_at or timezone.now()
+        latest_response.expires_at = calculate_quote_expiry(sent_at=latest_response.sent_at)
         latest_response.production_base_price = split["production_amount"]
         latest_response.broker_margin_type = broker_margin_type
         latest_response.broker_margin_value = broker_margin_value.quantize(Decimal("0.01"))
@@ -802,6 +816,7 @@ class PartnerQuoteSendToClientView(BaseRoleDetailView):
             update_fields=[
                 "response_snapshot",
                 "sent_at",
+                "expires_at",
                 "production_base_price",
                 "broker_margin_type",
                 "broker_margin_value",
@@ -960,6 +975,10 @@ class PartnerJobListDetailView(BaseRoleDetailView):
     def get(self, request, pk=None):
         if pk is not None:
             job = self.get_queryset(request).get(pk=pk)
+            artwork_state = managed_job_artwork_state(managed_job=job)
+            if artwork_state["artwork_missing"] and not artwork_state["artwork_reminder_sent"]:
+                notify_missing_artwork(managed_job=job, actor=request.user, source="manager_requested_artwork")
+                job.refresh_from_db()
             settlement = JobSettlementSplit.objects.filter(managed_job=job).order_by("-id").first()
             return Response(
                 {

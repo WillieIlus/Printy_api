@@ -1,11 +1,13 @@
 import logging
 from decimal import Decimal
 
+from django.http import FileResponse
 from django.db import OperationalError, ProgrammingError, transaction
 from django.db.models import Count, OuterRef, Q, Subquery
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status
+from rest_framework.parsers import MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -19,8 +21,16 @@ from notifications.services import notify_quote_event
 from jobs.managed_services import create_assignment_for_managed_job, create_managed_job_from_accepted_quote
 from jobs.models import ManagedJob
 from quotes.choices import QuoteStatus, ShopQuoteStatus
+from quotes.guardrails import expire_shop_quote
 from quotes.messaging import create_quote_message
 from quotes.models import QuoteDraft, QuoteRequest, QuoteRequestMessage, ShopQuote
+from quotes.pending_artwork import (
+    create_pending_artwork_upload,
+    delete_pending_artwork,
+    get_pending_artwork_for_token,
+    pending_artwork_is_expired,
+    serialize_pending_artwork_upload,
+)
 from quotes.partner_services import build_partner_quote_preview, create_partner_quote
 from quotes.services_workflow import (
     create_quote_response,
@@ -67,6 +77,9 @@ from .workflow_serializers import (
     ClientResponseReplySerializer,
     ClientQuoteRequestDetailSerializer,
     DashboardCalculatorPayloadSerializer,
+    GuestArtworkUploadSerializer,
+    GuestDraftClaimSerializer,
+    GuestQuoteDraftSerializer,
     DashboardQuoteRequestSummarySerializer,
     IntakeRecommendedManagerQuerySerializer,
     IntakeSubmitSerializer,
@@ -957,6 +970,118 @@ class LargeFormatCalculatorPreviewView(APIView):
         return Response(pricing)
 
 
+def _latest_guest_draft(*, session_key: str):
+    return (
+        QuoteDraft.objects.filter(guest_session_key=session_key, user__isnull=True)
+        .select_related("shop", "selected_product")
+        .order_by("-updated_at", "-created_at")
+        .first()
+    )
+
+
+def _claim_guest_draft_to_user(*, session_key: str, user):
+    draft = _latest_guest_draft(session_key=session_key)
+    if draft is None:
+        return None
+    draft.user = user
+    draft.guest_session_key = ""
+    draft.save(update_fields=["user", "guest_session_key", "updated_at"])
+    return draft
+
+
+class GuestQuoteDraftUpsertView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = GuestQuoteDraftSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+        draft = _latest_guest_draft(session_key=validated["session_key"])
+        if draft is None:
+            draft = save_quote_draft(
+                user=None,
+                guest_session_key=validated["session_key"],
+                title=validated.get("title", ""),
+                calculator_inputs_snapshot=validated["calculator_inputs_snapshot"],
+                pricing_snapshot=validated.get("pricing_snapshot"),
+                request_details_snapshot=validated.get("request_details_snapshot"),
+                artwork_token=validated.get("artwork_token", ""),
+                artwork_filename=validated.get("artwork_filename", ""),
+            )
+        else:
+            draft = update_quote_draft(
+                draft=draft,
+                title=validated.get("title", ""),
+                calculator_inputs_snapshot=validated["calculator_inputs_snapshot"],
+                pricing_snapshot=validated.get("pricing_snapshot"),
+                request_details_snapshot=validated.get("request_details_snapshot"),
+                artwork_token=validated.get("artwork_token", ""),
+                artwork_filename=validated.get("artwork_filename", ""),
+            )
+        return Response(QuoteDraftReadSerializer(draft).data, status=status.HTTP_201_CREATED)
+
+
+class GuestQuoteDraftClaimView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        if not is_client(request.user):
+            return Response({"detail": "Only client accounts can claim calculator drafts."}, status=status.HTTP_403_FORBIDDEN)
+        serializer = GuestDraftClaimSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        draft = _claim_guest_draft_to_user(session_key=serializer.validated_data["session_key"], user=request.user)
+        if draft is None:
+            return Response({"detail": "No guest calculator draft was found for this session."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(QuoteDraftReadSerializer(draft).data)
+
+
+class GuestArtworkUploadView(APIView):
+    permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        serializer = GuestArtworkUploadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            upload = create_pending_artwork_upload(
+                uploaded_file=serializer.validated_data["file"],
+                session_key=serializer.validated_data["session_key"],
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serialize_pending_artwork_upload(request=request, upload=upload), status=status.HTTP_201_CREATED)
+
+
+class GuestArtworkUploadDetailView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, token):
+        upload = get_pending_artwork_for_token(token=token)
+        if upload is None:
+            return Response({"detail": "Artwork upload not found."}, status=status.HTTP_404_NOT_FOUND)
+        if pending_artwork_is_expired(upload):
+            delete_pending_artwork(upload)
+            return Response({"detail": "Artwork upload expired."}, status=status.HTTP_410_GONE)
+        return Response(serialize_pending_artwork_upload(request=request, upload=upload))
+
+
+class GuestArtworkUploadPreviewView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request, token):
+        upload = get_pending_artwork_for_token(token=token)
+        if upload is None or not upload.file:
+            return Response({"detail": "Artwork preview not found."}, status=status.HTTP_404_NOT_FOUND)
+        if pending_artwork_is_expired(upload):
+            delete_pending_artwork(upload)
+            return Response({"detail": "Artwork upload expired."}, status=status.HTTP_410_GONE)
+        return FileResponse(
+            upload.file.open("rb"),
+            as_attachment=False,
+            filename=upload.original_filename or upload.file.name.rsplit("/", 1)[-1],
+        )
+
+
 class QuoteDraftListCreateView(generics.ListCreateAPIView):
     permission_classes = [IsAuthenticated]
     serializer_class = QuoteDraftReadSerializer
@@ -975,16 +1100,34 @@ class QuoteDraftListCreateView(generics.ListCreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         validated = serializer.validated_data
-        draft = save_quote_draft(
-            user=request.user,
-            selected_product=validated.get("selected_product"),
-            shop=validated.get("shop"),
-            title=validated.get("title", ""),
-            calculator_inputs_snapshot=validated["calculator_inputs_snapshot"],
-            pricing_snapshot=validated.get("pricing_snapshot"),
-            custom_product_snapshot=validated.get("custom_product_snapshot"),
-            request_details_snapshot=validated.get("request_details_snapshot"),
-        )
+        session_key = validated.get("session_key", "")
+        draft = _claim_guest_draft_to_user(session_key=session_key, user=request.user) if session_key else None
+        if draft is None:
+            draft = save_quote_draft(
+                user=request.user,
+                selected_product=validated.get("selected_product"),
+                shop=validated.get("shop"),
+                title=validated.get("title", ""),
+                calculator_inputs_snapshot=validated["calculator_inputs_snapshot"],
+                pricing_snapshot=validated.get("pricing_snapshot"),
+                custom_product_snapshot=validated.get("custom_product_snapshot"),
+                request_details_snapshot=validated.get("request_details_snapshot"),
+                artwork_token=validated.get("artwork_token", ""),
+                artwork_filename=validated.get("artwork_filename", ""),
+            )
+        else:
+            draft = update_quote_draft(
+                draft=draft,
+                title=validated.get("title", ""),
+                shop=validated.get("shop"),
+                selected_product=validated.get("selected_product"),
+                calculator_inputs_snapshot=validated["calculator_inputs_snapshot"],
+                pricing_snapshot=validated.get("pricing_snapshot"),
+                custom_product_snapshot=validated.get("custom_product_snapshot"),
+                request_details_snapshot=validated.get("request_details_snapshot"),
+                artwork_token=validated.get("artwork_token", ""),
+                artwork_filename=validated.get("artwork_filename", ""),
+            )
         return Response(QuoteDraftReadSerializer(draft).data, status=status.HTTP_201_CREATED)
 
 
@@ -1069,17 +1212,32 @@ class IntakeSubmitView(APIView):
                 calculator_inputs_snapshot=validated["calculator_inputs_snapshot"],
                 pricing_snapshot=validated.get("pricing_snapshot"),
                 request_details_snapshot=validated.get("request_details_snapshot"),
+                artwork_token=validated.get("artwork_token", ""),
+                artwork_filename=validated.get("artwork_filename", ""),
             )
 
         request_details_snapshot = dict(validated.get("request_details_snapshot") or draft.request_details_snapshot or {})
         request_details_snapshot["selected_manager_id"] = validated.get("selected_manager_id")
         if validated.get("artwork_reference"):
             request_details_snapshot["artwork_reference"] = validated.get("artwork_reference")
-        quote_requests = send_quote_draft_to_shops(
-            draft=draft,
-            shops=[],
-            request_details_snapshot=request_details_snapshot,
-        )
+        if validated.get("artwork_token"):
+            request_details_snapshot["artwork_token"] = validated.get("artwork_token")
+        if validated.get("artwork_filename"):
+            request_details_snapshot["artwork_filename"] = validated.get("artwork_filename")
+        if validated.get("artwork_token") and validated.get("artwork_token") != draft.artwork_token:
+            draft = update_quote_draft(
+                draft=draft,
+                artwork_token=validated.get("artwork_token", ""),
+                artwork_filename=validated.get("artwork_filename", ""),
+            )
+        try:
+            quote_requests = send_quote_draft_to_shops(
+                draft=draft,
+                shops=[],
+                request_details_snapshot=request_details_snapshot,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         quote_request = quote_requests[0]
         manager_name = (
             getattr(getattr(quote_request, "assigned_manager", None), "name", "")
@@ -1558,6 +1716,12 @@ class ClientResponseAcceptView(APIView):
             ),
             pk=response_id,
         )
+        if shop_quote.is_expired:
+            expire_shop_quote(shop_quote=shop_quote)
+            return Response(
+                {"detail": "This quote has expired. Please request a new quote from your print manager."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if shop_quote.status not in (ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED, ShopQuoteStatus.MODIFIED):
             return Response({"detail": "Only sent or revised quotes can be accepted."}, status=status.HTTP_400_BAD_REQUEST)
         quote_request = shop_quote.quote_request

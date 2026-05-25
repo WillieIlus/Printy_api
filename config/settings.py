@@ -354,6 +354,11 @@ MPESA_TRANSACTION_DESC_DEFAULT = _get_env(
     default="Printy payment",
 )
 PRINTY_PLATFORM_FEE_RATE = Decimal(str(_get_env("PRINTY_PLATFORM_FEE_RATE", default="0.30")))
+QUOTE_EXPIRY_HOURS = int(_get_env("QUOTE_EXPIRY_HOURS", default="48"))
+PARTNER_MARKUP_MIN = Decimal(str(_get_env("PARTNER_MARKUP_MIN", default="0.05")))
+PARTNER_MARKUP_MAX = Decimal(str(_get_env("PARTNER_MARKUP_MAX", default="2.00")))
+PARTNER_MARKUP_DEFAULT = Decimal(str(_get_env("PARTNER_MARKUP_DEFAULT", default="0.30")))
+PARTNER_MARKUP_WARNING = Decimal(str(_get_env("PARTNER_MARKUP_WARNING", default="1.00")))
 
 if MPESA_ENV == "production":
     parsed_callback = MPESA_CALLBACK_URL.lower()

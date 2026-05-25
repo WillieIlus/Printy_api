@@ -2,6 +2,7 @@
 from django.conf import settings
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
+from django.db.models import Q
 from django.utils.translation import gettext as _
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status, viewsets
@@ -38,6 +39,7 @@ from jobs.payment_services import (
     initiate_job_stk_push,
     reconcile_job_payment_status,
 )
+from quotes.services_workflow import save_quote_draft
 from jobs.serializers import (
     JobActionSerializer,
     JobAssignmentSerializer,
@@ -56,6 +58,175 @@ from jobs.serializers import (
     JobRequestPublicSerializer,
     JobSettlementSplitSerializer,
 )
+
+
+def _as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _first_non_empty(*values):
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def _normalize_reorder_finishing_list(*, request_snapshot: dict, quote_item=None) -> list[str]:
+    values: list[str] = []
+    raw_finishings = request_snapshot.get("finishings")
+    if isinstance(raw_finishings, list):
+        for entry in raw_finishings:
+            if isinstance(entry, dict):
+                label = (
+                    entry.get("label")
+                    or entry.get("name")
+                    or entry.get("value")
+                    or entry.get("slug")
+                )
+            else:
+                label = entry
+            label = str(label or "").strip()
+            if label:
+                values.append(label)
+    lamination = str(request_snapshot.get("lamination") or "").strip()
+    if lamination:
+        values.append(lamination)
+    if quote_item is not None:
+        for finishing in quote_item.finishings.select_related("finishing_rate").all():
+            rate = getattr(finishing, "finishing_rate", None)
+            label = ""
+            if rate is not None:
+                label = str(getattr(rate, "name", "") or "").strip()
+            if label:
+                values.append(label)
+    unique_values: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_values.append(value)
+    return unique_values
+
+
+def _format_finished_size(*, request_snapshot: dict, quote_item=None) -> str:
+    explicit = _first_non_empty(
+        request_snapshot.get("finished_size"),
+        request_snapshot.get("size"),
+        request_snapshot.get("size_label"),
+    )
+    if explicit is not None:
+        return str(explicit).strip()
+    if quote_item is None:
+        return ""
+    width = getattr(quote_item, "chosen_width_mm", None)
+    height = getattr(quote_item, "chosen_height_mm", None)
+    if width and height:
+        return f"{width}x{height}mm"
+    return ""
+
+
+def _build_reorder_draft_payload(*, managed_job: ManagedJob) -> dict:
+    quote_request = getattr(managed_job, "source_quote_request", None)
+    snapshot_root = _as_dict(getattr(quote_request, "request_snapshot", None))
+    request_snapshot = _as_dict(snapshot_root.get("request_snapshot")) or snapshot_root
+    quote_item = None
+    if quote_request is not None:
+        quote_item = (
+            quote_request.items.select_related("paper")
+            .prefetch_related("finishings__finishing_rate")
+            .order_by("id")
+            .first()
+        )
+    if not request_snapshot and quote_item is None:
+        raise ValueError("Original job specs unavailable for reorder.")
+
+    product_type = str(
+        _first_non_empty(
+            request_snapshot.get("product_type"),
+            _as_dict(snapshot_root.get("calculator_inputs")).get("product_type"),
+        ) or ""
+    ).strip()
+    quantity = _first_non_empty(
+        request_snapshot.get("quantity"),
+        _as_dict(snapshot_root.get("calculator_inputs")).get("quantity"),
+        getattr(quote_item, "quantity", None),
+        1,
+    )
+    paper_stock = str(_first_non_empty(request_snapshot.get("paper_stock"), "") or "").strip()
+    requested_gsm = _first_non_empty(
+        request_snapshot.get("requested_gsm"),
+        getattr(getattr(quote_item, "paper", None), "gsm", None),
+    )
+    print_sides = str(
+        _first_non_empty(request_snapshot.get("print_sides"), getattr(quote_item, "sides", None), "SIMPLEX") or "SIMPLEX"
+    ).strip() or "SIMPLEX"
+    color_mode = str(
+        _first_non_empty(request_snapshot.get("color_mode"), getattr(quote_item, "color_mode", None), "COLOR") or "COLOR"
+    ).strip() or "COLOR"
+    lamination = str(_first_non_empty(request_snapshot.get("lamination"), "none") or "none").strip() or "none"
+    finished_size = _format_finished_size(request_snapshot=request_snapshot, quote_item=quote_item)
+    finishing_list = _normalize_reorder_finishing_list(request_snapshot=request_snapshot, quote_item=quote_item)
+    special_instructions = str(
+        _first_non_empty(
+            request_snapshot.get("special_instructions"),
+            request_snapshot.get("custom_brief"),
+            getattr(quote_item, "special_instructions", None),
+            getattr(quote_request, "notes", None),
+            "",
+        ) or ""
+    ).strip()
+
+    product_label = str(
+        _first_non_empty(
+            request_snapshot.get("product_label"),
+            product_type.replace("_", " ").title() if product_type else "",
+        ) or "Print Job"
+    ).strip()
+    title = f"Reorder {product_label}".strip()
+    if len(title) > 255:
+        title = title[:255]
+
+    calculator_inputs_snapshot = {
+        "product_type": product_type,
+        "quantity": int(quantity or 1),
+        "finished_size": finished_size,
+        "paper_stock": paper_stock,
+        "requested_gsm": int(requested_gsm) if requested_gsm not in (None, "") else None,
+        "print_sides": print_sides,
+        "color_mode": color_mode,
+        "lamination": lamination,
+        "finishings": finishing_list,
+        "custom_brief": special_instructions,
+        "special_instructions": special_instructions,
+    }
+    request_details_snapshot = {
+        "title": title,
+        "notes": special_instructions,
+        "request_snapshot": {
+            **calculator_inputs_snapshot,
+            "product_label": product_label,
+            "size_label": str(request_snapshot.get("size_label") or finished_size or "").strip(),
+            "paper_label": str(request_snapshot.get("paper_label") or "").strip(),
+            "print_sides_label": str(request_snapshot.get("print_sides_label") or "").strip(),
+            "color_mode_label": str(request_snapshot.get("color_mode_label") or "").strip(),
+            "lamination_label": str(request_snapshot.get("lamination_label") or "").strip(),
+        },
+        "reorder_meta": {
+            "source_job_id": managed_job.id,
+            "specs_copied_from": managed_job.id,
+            "finishing_list": finishing_list,
+        },
+    }
+    return {
+        "title": title,
+        "calculator_inputs_snapshot": calculator_inputs_snapshot,
+        "request_details_snapshot": request_details_snapshot,
+    }
 
 
 class JobRequestViewSet(viewsets.ModelViewSet):
@@ -322,6 +493,41 @@ class ManagedJobListView(APIView):
         else:
             items = queryset.filter(client=request.user).order_by("-operational_priority_level", "-created_at")
         return Response(ManagedJobSerializer(items, many=True, context={"request": request}).data)
+
+
+class ManagedJobReorderView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        actor = resolve_actor(request.user)
+        if actor != CLIENT_ACTOR:
+            return Response({"detail": _("Not authorized.")}, status=status.HTTP_403_FORBIDDEN)
+        managed_job = get_object_or_404(
+            ManagedJob.objects.select_related("source_quote_request").prefetch_related("source_quote_request__items__finishings__finishing_rate"),
+            Q(client=request.user) | Q(created_by=request.user),
+            pk=pk,
+        )
+        if managed_job.status != "completed":
+            return Response({"detail": "Can only reorder completed jobs"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            payload = _build_reorder_draft_payload(managed_job=managed_job)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        draft = save_quote_draft(
+            user=request.user,
+            source_job=managed_job,
+            title=payload["title"],
+            calculator_inputs_snapshot=payload["calculator_inputs_snapshot"],
+            request_details_snapshot=payload["request_details_snapshot"],
+        )
+        return Response(
+            {
+                "draft_id": draft.id,
+                "specs_copied_from": managed_job.id,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ManagedJobPaymentListView(APIView):

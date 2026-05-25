@@ -32,6 +32,7 @@ from quotes.models import (
     QuoteShareLink,
     ShopQuote,
 )
+from quotes.pending_artwork import claim_pending_artwork_to_quote_request
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours
 from shops.models import Shop
 
@@ -446,19 +447,26 @@ def _create_request_message(*, quote_request: QuoteRequest, sender, metadata: di
 
 def _intake_has_artwork(request_details: dict | None) -> bool:
     details = request_details if isinstance(request_details, dict) else {}
-    return bool(str(details.get("artwork_reference") or "").strip())
+    return bool(
+        str(details.get("artwork_reference") or "").strip()
+        or str(details.get("artwork_token") or "").strip()
+    )
 
 
-def save_quote_draft(*, user, selected_product=None, shop=None, title: str = "", calculator_inputs_snapshot: dict, pricing_snapshot: dict | None = None, custom_product_snapshot: dict | None = None, request_details_snapshot: dict | None = None) -> QuoteDraft:
+def save_quote_draft(*, user=None, guest_session_key: str = "", selected_product=None, shop=None, source_job=None, title: str = "", calculator_inputs_snapshot: dict, pricing_snapshot: dict | None = None, custom_product_snapshot: dict | None = None, request_details_snapshot: dict | None = None, artwork_token: str = "", artwork_filename: str = "") -> QuoteDraft:
     draft = QuoteDraft.objects.create(
         user=user,
+        guest_session_key=guest_session_key,
         shop=shop,
         selected_product=selected_product,
+        source_job=source_job,
         title=title,
         calculator_inputs_snapshot=calculator_inputs_snapshot,
         pricing_snapshot=pricing_snapshot,
         custom_product_snapshot=custom_product_snapshot,
         request_details_snapshot=request_details_snapshot,
+        artwork_token=artwork_token,
+        artwork_filename=artwork_filename,
     )
     draft.draft_reference = _build_reference("QD", draft.id)
     draft.save(update_fields=["draft_reference", "updated_at"])
@@ -475,6 +483,9 @@ def update_quote_draft(
     pricing_snapshot: dict | None = None,
     custom_product_snapshot: dict | None = None,
     request_details_snapshot: dict | None = None,
+    artwork_token: str | None = None,
+    artwork_filename: str | None = None,
+    guest_session_key: str | None = None,
 ) -> QuoteDraft:
     if draft.status != QuoteDraftStatus.DRAFT:
         raise ValueError("Only draft quote drafts can be updated.")
@@ -493,6 +504,12 @@ def update_quote_draft(
         draft.custom_product_snapshot = custom_product_snapshot
     if request_details_snapshot is not None:
         draft.request_details_snapshot = request_details_snapshot
+    if artwork_token is not None:
+        draft.artwork_token = artwork_token
+    if artwork_filename is not None:
+        draft.artwork_filename = artwork_filename
+    if guest_session_key is not None:
+        draft.guest_session_key = guest_session_key
     draft.save()
     return draft
 
@@ -505,6 +522,10 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
         **(draft.request_details_snapshot or {}),
         **(request_details_snapshot or {}),
     }
+    if draft.artwork_token and not merged_request_details.get("artwork_token"):
+        merged_request_details["artwork_token"] = draft.artwork_token
+    if draft.artwork_filename and not merged_request_details.get("artwork_filename"):
+        merged_request_details["artwork_filename"] = draft.artwork_filename
     merged_request_details["selected_shop_ids"] = [shop.id for shop in shops]
     assigned_manager = resolve_assigned_manager(
         merged_request_details.get("selected_manager_id")
@@ -549,6 +570,12 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                 merged_request_details=merged_request_details,
                 assigned_manager=assigned_manager,
             )
+            if merged_request_details.get("artwork_token"):
+                claim_pending_artwork_to_quote_request(
+                    token=str(merged_request_details["artwork_token"]),
+                    quote_request=quote_request,
+                    claimed_by=draft.user,
+                )
             if assigned_manager and assigned_manager.id != draft.user.id:
                 notify_quote_event(
                     recipient=assigned_manager,
@@ -626,6 +653,12 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                 shop=shop,
                 merged_request_details=merged_request_details,
             )
+            if merged_request_details.get("artwork_token"):
+                claim_pending_artwork_to_quote_request(
+                    token=str(merged_request_details["artwork_token"]),
+                    quote_request=quote_request,
+                    claimed_by=draft.user,
+                )
             _create_request_message(quote_request=quote_request, sender=draft.user)
             create_quote_message(
                 quote_request=quote_request,

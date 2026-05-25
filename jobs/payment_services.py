@@ -81,8 +81,9 @@ def get_default_platform_service_percent() -> Decimal:
 
 def get_default_partner_markup_rate(*, partner_user=None, partner_profile=None) -> Decimal:
     profile = partner_profile or getattr(partner_user, "profile", None)
-    configured = getattr(profile, "default_markup_rate", DEFAULT_PARTNER_MARKUP_RATE)
-    return _money(configured, default=str(DEFAULT_PARTNER_MARKUP_RATE)).quantize(Decimal("0.01"))
+    configured = getattr(profile, "default_markup_rate", None)
+    fallback = getattr(settings, "PARTNER_MARKUP_DEFAULT", DEFAULT_PARTNER_MARKUP_RATE)
+    return _money(configured if configured is not None else fallback, default=str(DEFAULT_PARTNER_MARKUP_RATE)).quantize(Decimal("0.01"))
 
 
 def get_default_partner_markup_percent(*, partner_user=None, partner_profile=None) -> Decimal:

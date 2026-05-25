@@ -21,6 +21,7 @@ from api.visibility import (
     resolve_topology_mode_for_quote_request,
 )
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
+from quotes.guardrails import validate_partner_markup_amount
 from quotes.models import QuoteDraft, QuoteItem, QuoteRequest, QuoteRequestMessage, ShopQuote
 from quotes.request_brief import build_quote_request_whatsapp_handoff
 from quotes.status_normalization import (
@@ -409,28 +410,71 @@ class DashboardCalculatorPayloadSerializer(serializers.Serializer):
 
 class QuoteDraftCreateSerializer(serializers.Serializer):
     title = serializers.CharField(required=False, allow_blank=True)
+    session_key = serializers.CharField(required=False, allow_blank=True, max_length=64)
     shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all(), required=False, allow_null=True)
     selected_product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all(), required=False, allow_null=True)
     calculator_inputs_snapshot = serializers.JSONField()
     pricing_snapshot = serializers.JSONField(required=False)
     custom_product_snapshot = serializers.JSONField(required=False)
     request_details_snapshot = serializers.JSONField(required=False)
+    artwork_token = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    artwork_filename = serializers.CharField(required=False, allow_blank=True, max_length=255)
 
 
 class QuoteDraftUpdateSerializer(serializers.Serializer):
     title = serializers.CharField(required=False, allow_blank=True)
+    session_key = serializers.CharField(required=False, allow_blank=True, max_length=64)
     shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all(), required=False, allow_null=True)
     selected_product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all(), required=False, allow_null=True)
     calculator_inputs_snapshot = serializers.JSONField(required=False)
     pricing_snapshot = serializers.JSONField(required=False)
     custom_product_snapshot = serializers.JSONField(required=False)
     request_details_snapshot = serializers.JSONField(required=False)
+    artwork_token = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    artwork_filename = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+
+class GuestQuoteDraftSerializer(serializers.Serializer):
+    session_key = serializers.CharField(max_length=64)
+    title = serializers.CharField(required=False, allow_blank=True)
+    calculator_inputs_snapshot = serializers.JSONField()
+    pricing_snapshot = serializers.JSONField(required=False)
+    request_details_snapshot = serializers.JSONField(required=False)
+    artwork_token = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    artwork_filename = serializers.CharField(required=False, allow_blank=True, max_length=255)
+
+
+class GuestDraftClaimSerializer(serializers.Serializer):
+    session_key = serializers.CharField(max_length=64)
+
+
+class GuestArtworkUploadSerializer(serializers.Serializer):
+    session_key = serializers.CharField(max_length=64)
+    file = serializers.FileField()
 
 
 class PartnerQuotePreviewSerializer(serializers.Serializer):
     shop = serializers.PrimaryKeyRelatedField(queryset=Shop.objects.all())
     pricing_snapshot = serializers.JSONField()
     partner_markup = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=Decimal("0.00"))
+
+    def validate(self, attrs):
+        selected_shops = attrs.get("pricing_snapshot", {}).get("selected_shops") or []
+        shop_entry = next(
+            (
+                entry for entry in selected_shops
+                if isinstance(entry, dict) and (entry.get("id") == attrs["shop"].id or entry.get("slug") == attrs["shop"].slug)
+            ),
+            {},
+        )
+        preview = _as_dict(shop_entry.get("preview")) or shop_entry
+        totals = _as_dict(preview.get("totals"))
+        base_price = totals.get("shop_total") or totals.get("subtotal") or totals.get("grand_total")
+        try:
+            validate_partner_markup_amount(base_price=base_price, markup_amount=attrs["partner_markup"])
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+        return attrs
 
 
 class PartnerAssignedRequestShopOptionsSerializer(serializers.Serializer):
@@ -482,6 +526,21 @@ class PartnerQuoteCreateSerializer(serializers.Serializer):
     save_as_draft = serializers.BooleanField(required=False, default=False)
 
     def validate(self, attrs):
+        selected_shops = attrs.get("pricing_snapshot", {}).get("selected_shops") or []
+        shop_entry = next(
+            (
+                entry for entry in selected_shops
+                if isinstance(entry, dict) and (entry.get("id") == attrs["shop"].id or entry.get("slug") == attrs["shop"].slug)
+            ),
+            {},
+        )
+        preview = _as_dict(shop_entry.get("preview")) or shop_entry
+        totals = _as_dict(preview.get("totals"))
+        base_price = totals.get("shop_total") or totals.get("subtotal") or totals.get("grand_total")
+        try:
+            validate_partner_markup_amount(base_price=base_price, markup_amount=attrs["partner_markup"])
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
         if attrs.get("save_as_draft"):
             return attrs
         if not (attrs.get("client_user") or attrs.get("client_email") or attrs.get("client_phone") or attrs.get("client_name")):
@@ -514,6 +573,7 @@ class QuoteDraftReadSerializer(serializers.ModelSerializer):
     shop_name = serializers.SerializerMethodField()
     shop_slug = serializers.CharField(source="shop.slug", read_only=True)
     shop_currency = serializers.CharField(source="shop.currency", read_only=True)
+    source_job_id = serializers.IntegerField(read_only=True)
     raw_status = serializers.CharField(source="status", read_only=True)
     status = serializers.SerializerMethodField()
     status_label = serializers.SerializerMethodField()
@@ -532,10 +592,13 @@ class QuoteDraftReadSerializer(serializers.ModelSerializer):
             "shop_slug",
             "shop_currency",
             "selected_product",
+            "source_job_id",
             "calculator_inputs_snapshot",
             "pricing_snapshot",
             "custom_product_snapshot",
             "request_details_snapshot",
+            "artwork_token",
+            "artwork_filename",
             "generated_request_ids",
             "created_at",
             "updated_at",
@@ -615,6 +678,8 @@ class IntakeSubmitSerializer(serializers.Serializer):
     draft_id = serializers.IntegerField(required=False, allow_null=True)
     selected_manager_id = serializers.IntegerField(required=False, allow_null=True)
     artwork_reference = serializers.CharField(required=False, allow_blank=True)
+    artwork_token = serializers.CharField(required=False, allow_blank=True, max_length=64)
+    artwork_filename = serializers.CharField(required=False, allow_blank=True, max_length=255)
     title = serializers.CharField(required=False, allow_blank=True)
     calculator_inputs_snapshot = serializers.JSONField(required=False)
     pricing_snapshot = serializers.JSONField(required=False)
@@ -860,6 +925,8 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
     response_snapshot = serializers.SerializerMethodField()
     revised_pricing_snapshot = serializers.SerializerMethodField()
     total = serializers.SerializerMethodField()
+    expires_at = serializers.DateTimeField(read_only=True)
+    is_expired = serializers.SerializerMethodField()
 
     class Meta:
         model = ShopQuote
@@ -875,6 +942,8 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
             "raw_status",
             "status_label",
             "total",
+            "expires_at",
+            "is_expired",
             "note",
             "turnaround_days",
             "turnaround_hours",
@@ -900,7 +969,12 @@ class QuoteResponseReadSerializer(serializers.ModelSerializer):
         ]
 
     def get_status(self, obj):
+        if obj.is_expired and obj.status in {ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED, ShopQuoteStatus.MODIFIED}:
+            return ShopQuoteStatus.EXPIRED
         return normalize_quote_response_status(obj.status)
+
+    def get_is_expired(self, obj):
+        return obj.is_expired and obj.status != ShopQuoteStatus.ACCEPTED
 
     def get_total(self, obj):
         actor = self._visibility_actor(obj)

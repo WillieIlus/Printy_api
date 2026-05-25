@@ -1,9 +1,12 @@
 """API endpoint tests."""
 from decimal import Decimal
 from datetime import timedelta
+import shutil
+import tempfile
 from unittest.mock import patch
 
 from django.core import mail
+from django.core.management import call_command
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import ProgrammingError
 from django.test import TestCase, override_settings
@@ -25,9 +28,10 @@ from pricing.choices import ChargeUnit, ColorMode, FinishingBillingBasis, Finish
 from pricing.models import FinishingRate, Material, PrintingRate, VolumeDiscount
 from production.models import Customer
 from quotes.choices import QuoteStatus, ShopQuoteStatus
-from quotes.models import QuoteDraft, QuoteDraftFile, QuoteItem, QuoteItemFinishing, QuoteRequest, QuoteRequestMessage, QuoteShareLink, ShopQuote
+from quotes.models import PendingArtworkUpload, QuoteDraft, QuoteDraftFile, QuoteItem, QuoteItemFinishing, QuoteRequest, QuoteRequestMessage, QuoteShareLink, ShopQuote
 from jobs.managed_services import create_managed_job_from_accepted_quote
 from jobs.models import JobAssignment, JobFile, JobPayment, ManagedJob
+from jobs.payment_services import create_job_payment, mark_payment_confirmed
 from jobs.serializers import JobPaymentSerializer
 from services.public_matching import recompute_shop_match_readiness
 from services.pricing.mvp_rate_card import build_shop_rate_card_setup
@@ -3239,6 +3243,177 @@ class IntakeSubmitArtworkReminderTestCase(TestCase):
         self.assertEqual(len(mail.outbox), 0)
 
 
+@override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+class ArtworkPersistenceTestCase(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media_dir = tempfile.mkdtemp(prefix="printy-artwork-tests-")
+        cls.override = override_settings(MEDIA_ROOT=cls._media_dir)
+        cls.override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.override.disable()
+        shutil.rmtree(cls._media_dir, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        self.client = APIClient()
+        self.session_key = "guest-session-123"
+        self.client_user = User.objects.create_user(
+            email="artwork-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Artwork Client",
+        )
+        self.manager = User.objects.create_user(
+            email="artwork-manager@test.com",
+            password="pass12345",
+            role="partner",
+            name="Artwork Manager",
+            partner_profile_enabled=True,
+        )
+        self.other_user = User.objects.create_user(
+            email="other-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Other Client",
+        )
+
+    def _upload_artwork(self, *, filename="design.pdf", content=b"%PDF-1.7 test bytes", content_type="application/pdf"):
+        return self.client.post(
+            "/api/calculator/artwork-upload/",
+            {
+                "session_key": self.session_key,
+                "file": SimpleUploadedFile(filename, content, content_type=content_type),
+            },
+        )
+
+    def _create_guest_draft(self, *, artwork_token="", artwork_filename=""):
+        return self.client.post(
+            "/api/calculator/guest-drafts/",
+            {
+                "session_key": self.session_key,
+                "title": "Business Cards - Nairobi",
+                "calculator_inputs_snapshot": {
+                    "product_type": "business_card",
+                    "quantity": 250,
+                    "finished_size": "85x55mm",
+                },
+                "request_details_snapshot": {
+                    "customer_name": "Artwork Client",
+                    "notes": "Need a fast quote.",
+                },
+                "artwork_token": artwork_token,
+                "artwork_filename": artwork_filename,
+            },
+            format="json",
+        )
+
+    def test_guest_draft_survives_login_claim(self):
+        draft_response = self._create_guest_draft()
+        self.assertEqual(draft_response.status_code, 201)
+
+        self.client.force_authenticate(user=self.client_user)
+        claim_response = self.client.post(
+            "/api/calculator/drafts/claim/",
+            {"session_key": self.session_key},
+            format="json",
+        )
+
+        self.assertEqual(claim_response.status_code, 200)
+        draft = QuoteDraft.objects.get(pk=claim_response.json()["id"])
+        self.assertEqual(draft.user_id, self.client_user.id)
+        self.assertEqual(draft.guest_session_key, "")
+
+    def test_guest_upload_returns_token_and_detail_survives_one_hour(self):
+        upload_response = self._upload_artwork()
+        self.assertEqual(upload_response.status_code, 201)
+        payload = upload_response.json()
+        self.assertTrue(payload["artwork_token"])
+        self.assertEqual(payload["filename"], "design.pdf")
+
+        upload = PendingArtworkUpload.objects.get(token=payload["artwork_token"])
+        with patch("quotes.pending_artwork.timezone.now", return_value=upload.created_at + timedelta(hours=1)):
+            detail_response = self.client.get(f"/api/calculator/artwork-upload/{upload.token}/")
+
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertEqual(detail_response.json()["filename"], "design.pdf")
+
+    def test_token_auto_deletes_after_seventy_two_hours(self):
+        upload_response = self._upload_artwork()
+        self.assertEqual(upload_response.status_code, 201)
+        token = upload_response.json()["artwork_token"]
+        upload = PendingArtworkUpload.objects.get(token=token)
+        upload.expires_at = timezone.now() - timedelta(minutes=1)
+        upload.save(update_fields=["expires_at", "updated_at"])
+
+        deleted = call_command("purge_pending_artwork")
+
+        self.assertIsNone(deleted)
+        self.assertFalse(PendingArtworkUpload.objects.filter(token=token).exists())
+
+    def test_authenticated_intake_with_token_attaches_file_to_quote_request(self):
+        upload_response = self._upload_artwork()
+        self.assertEqual(upload_response.status_code, 201)
+        token = upload_response.json()["artwork_token"]
+        self._create_guest_draft(artwork_token=token, artwork_filename="design.pdf")
+
+        self.client.force_authenticate(user=self.client_user)
+        claim_response = self.client.post(
+            "/api/calculator/drafts/claim/",
+            {"session_key": self.session_key},
+            format="json",
+        )
+        draft_id = claim_response.json()["id"]
+
+        response = self.client.post(
+            "/api/intake/submit/",
+            {
+                "draft_id": draft_id,
+                "selected_manager_id": self.manager.id,
+                "artwork_token": token,
+                "artwork_filename": "design.pdf",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=response.json()["intake_id"])
+        self.assertEqual(quote_request.attachments.count(), 1)
+        self.assertEqual(quote_request.attachments.first().name, "design.pdf")
+        self.assertFalse(PendingArtworkUpload.objects.filter(token=token).exists())
+
+    def test_wrong_file_type_is_rejected(self):
+        response = self.client.post(
+            "/api/calculator/artwork-upload/",
+            {
+                "session_key": self.session_key,
+                "file": SimpleUploadedFile("bad.exe", b"binary-bytes", content_type="application/octet-stream"),
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Unsupported artwork file type", response.json()["detail"])
+
+    def test_file_over_fifty_mb_is_rejected(self):
+        response = self.client.post(
+            "/api/calculator/artwork-upload/",
+            {
+                "session_key": self.session_key,
+                "file": SimpleUploadedFile(
+                    "huge.pdf",
+                    b"0" * ((50 * 1024 * 1024) + 1),
+                    content_type="application/pdf",
+                ),
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot exceed 50MB", response.json()["detail"])
+
+
 class ShopPaymentVisibilityTestCase(TestCase):
     def setUp(self):
         self.client_user = User.objects.create_user(email="api-payment-client@test.com", password="pass12345", role="client")
@@ -6381,6 +6556,207 @@ class SpecsFirstQuoteBuilderTestCase(TestCase):
         self.assertNotIn("platform_service_amount", list_row["latest_response"]["response_snapshot"])
 
 
+@override_settings(
+    QUOTE_EXPIRY_HOURS=48,
+    PARTNER_MARKUP_MIN=Decimal("0.05"),
+    PARTNER_MARKUP_MAX=Decimal("2.00"),
+    PARTNER_MARKUP_DEFAULT=Decimal("0.30"),
+    PARTNER_MARKUP_WARNING=Decimal("1.00"),
+)
+class QuoteExpiryGuardrailTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.partner = User.objects.create_user(
+            email="quote-guardrails-partner@test.com",
+            password="pass12345",
+            role="broker",
+            partner_profile_enabled=True,
+            name="Guardrails Partner",
+        )
+        self.end_client = User.objects.create_user(
+            email="quote-guardrails-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Guardrails Client",
+        )
+        self.shop_owner = User.objects.create_user(
+            email="quote-guardrails-shop@test.com",
+            password="pass12345",
+            role="shop_owner",
+        )
+        self.shop = Shop.objects.create(
+            owner=self.shop_owner,
+            name="Guardrails Shop",
+            slug="guardrails-shop",
+            is_active=True,
+        )
+
+    def _pricing_snapshot(self):
+        return {
+            "currency": "KES",
+            "selected_shops": [
+                {
+                    "id": self.shop.id,
+                    "slug": self.shop.slug,
+                    "preview": {
+                        "totals": {"subtotal": "1000.00"},
+                        "breakdown": {"imposition": {"good_sheets": 4}},
+                    },
+                }
+            ],
+        }
+
+    def _draft_payload(self, *, markup="300.00"):
+        return {
+            "shop": self.shop.id,
+            "title": "Guardrails draft",
+            "client_id": self.end_client.id,
+            "client_name": "Guardrails Client",
+            "client_email": self.end_client.email,
+            "calculator_inputs_snapshot": {
+                "product_type": "business_card",
+                "quantity": 100,
+                "finished_size": "90x50mm",
+                "paper_stock": "300gsm_matte_art_card",
+                "print_sides": "SIMPLEX",
+                "color_mode": "COLOR",
+                "lamination": "none",
+                "urgency_type": "standard",
+            },
+            "pricing_snapshot": self._pricing_snapshot(),
+            "partner_markup": markup,
+            "note": "Guardrail draft",
+            "save_as_draft": True,
+        }
+
+    def _create_sent_quote(self, *, markup="300.00"):
+        self.client.force_authenticate(user=self.partner)
+        create_response = self.client.post(
+            "/api/partner/quotes/create/",
+            self._draft_payload(markup=markup),
+            format="json",
+        )
+        self.assertEqual(create_response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=create_response.json()["quote_request_id"])
+        send_response = self.client.post(
+            f"/api/dashboard/partner/quotes/{quote_request.id}/send-to-client/",
+            {
+                "broker_margin_type": "fixed",
+                "broker_margin_value": markup,
+            },
+            format="json",
+        )
+        self.assertEqual(send_response.status_code, 200)
+        return QuoteRequest.objects.get(pk=quote_request.id), ShopQuote.objects.get(quote_request=quote_request)
+
+    def test_quote_sent_sets_expires_at_correctly(self):
+        _, shop_quote = self._create_sent_quote()
+
+        self.assertIsNotNone(shop_quote.sent_at)
+        self.assertIsNotNone(shop_quote.expires_at)
+        self.assertEqual(shop_quote.expires_at, shop_quote.sent_at + timedelta(hours=48))
+
+    def test_expired_quote_accept_returns_400(self):
+        quote_request, shop_quote = self._create_sent_quote()
+        shop_quote.expires_at = timezone.now() - timedelta(minutes=5)
+        shop_quote.save(update_fields=["expires_at", "updated_at"])
+
+        self.client.force_authenticate(user=self.end_client)
+        response = self.client.post(f"/api/client/responses/{shop_quote.id}/accept/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "This quote has expired. Please request a new quote from your print manager.")
+        shop_quote.refresh_from_db()
+        quote_request.refresh_from_db()
+        self.assertEqual(shop_quote.status, ShopQuoteStatus.EXPIRED)
+        self.assertEqual(quote_request.status, QuoteStatus.EXPIRED)
+
+    def test_warning_threshold_returns_warning(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.post(
+            "/api/partner/quotes/preview/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "1100.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["markup_warning"],
+            "Your client will pay more than double production cost. Are you sure?",
+        )
+
+    def test_markup_below_five_percent_returns_400(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.post(
+            "/api/partner/quotes/preview/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "40.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["field_errors"]["non_field_errors"][0],
+            "Markup cannot be below 5%.",
+        )
+
+    def test_markup_above_two_hundred_percent_returns_400(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.post(
+            "/api/partner/quotes/preview/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "2100.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["field_errors"]["non_field_errors"][0],
+            "Markup cannot exceed 200%.",
+        )
+
+    def test_markup_thirty_percent_is_accepted(self):
+        self.client.force_authenticate(user=self.partner)
+        response = self.client.post(
+            "/api/partner/quotes/preview/",
+            {
+                "shop": self.shop.id,
+                "pricing_snapshot": self._pricing_snapshot(),
+                "partner_markup": "300.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["broker_markup"], "300.00")
+        self.assertEqual(response.json()["markup_warning"], "")
+
+    def test_expire_quotes_command_marks_correct_quotes(self):
+        _, expired_quote = self._create_sent_quote(markup="300.00")
+        _, active_quote = self._create_sent_quote(markup="350.00")
+        expired_quote.expires_at = timezone.now() - timedelta(minutes=1)
+        active_quote.expires_at = timezone.now() + timedelta(hours=12)
+        expired_quote.save(update_fields=["expires_at", "updated_at"])
+        active_quote.save(update_fields=["expires_at", "updated_at"])
+
+        call_command("expire_quotes")
+
+        expired_quote.refresh_from_db()
+        active_quote.refresh_from_db()
+        self.assertEqual(expired_quote.status, ShopQuoteStatus.EXPIRED)
+        self.assertEqual(active_quote.status, ShopQuoteStatus.SENT)
+
+
 class PartnerDispatchValidationTestCase(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -6553,6 +6929,152 @@ class PartnerDispatchValidationTestCase(TestCase):
         self.assertEqual(response.status_code, 403)
 
 
+class ArtworkNotificationTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.partner = User.objects.create_user(
+            email="artwork-partner@test.com",
+            password="pass12345",
+            role="broker",
+            partner_profile_enabled=True,
+            name="Artwork Partner",
+        )
+        self.end_client = User.objects.create_user(
+            email="artwork-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Artwork Client",
+        )
+        self.production_user = User.objects.create_user(
+            email="artwork-production@test.com",
+            password="pass12345",
+            role="production",
+            name="Artwork Production",
+        )
+        self.production_shop = Shop.objects.create(
+            owner=self.production_user,
+            name="Artwork Shop",
+            slug="artwork-shop",
+            is_active=True,
+        )
+        self.quote_request = QuoteRequest.objects.create(
+            shop=self.production_shop,
+            created_by=self.end_client,
+            on_behalf_of=self.end_client,
+            customer_name="Artwork Client",
+            customer_email="artwork-client@test.com",
+            status=QuoteStatus.CLOSED,
+            request_snapshot={
+                "request_snapshot": {
+                    "product_type": "flyer",
+                    "product_label": "Flyer",
+                    "quantity": 500,
+                }
+            },
+        )
+        self.shop_quote = ShopQuote.objects.create(
+            quote_request=self.quote_request,
+            shop=self.production_shop,
+            created_by=self.partner,
+            status=ShopQuoteStatus.ACCEPTED,
+            total=Decimal("2000.00"),
+            client_total=Decimal("3200.00"),
+            production_base_price=Decimal("2000.00"),
+            broker_margin_amount=Decimal("600.00"),
+            platform_service_amount=Decimal("600.00"),
+            revision_number=1,
+            accepted_at=timezone.now(),
+        )
+        self.managed_job = ManagedJob.objects.create(
+            title="Artwork reminder job",
+            source_quote_request=self.quote_request,
+            source_shop_quote=self.shop_quote,
+            client=self.end_client,
+            created_by=self.end_client,
+            broker=self.partner,
+            payment_status="pending",
+            status="awaiting_payment",
+            assignment_status="unassigned",
+            client_total=Decimal("3200.00"),
+            production_total=Decimal("2000.00"),
+            broker_commission=Decimal("600.00"),
+            platform_fee=Decimal("600.00"),
+        )
+
+    def _confirm_payment(self):
+        payment = create_job_payment(
+            managed_job=self.managed_job,
+            payer=self.end_client,
+            amount=Decimal("3200.00"),
+            payment_method="mpesa",
+        )
+        mark_payment_confirmed(job_payment=payment)
+        self.managed_job.refresh_from_db()
+
+    def test_payment_confirmed_without_artwork_sends_single_reminder_to_client_and_partner(self):
+        self._confirm_payment()
+
+        self.assertTrue(self.managed_job.artwork_required)
+        self.assertTrue(self.managed_job.artwork_reminder_sent)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].subject, "Action needed: Upload your artwork - Printy")
+        self.assertIn("Upload artwork", mail.outbox[0].body)
+        self.assertTrue(
+            Notification.objects.filter(
+                user=self.end_client,
+                notification_type=Notification.JOB_STATUS_UPDATED,
+                object_type="managed_job",
+                object_id=self.managed_job.id,
+            ).exists()
+        )
+        self.assertTrue(
+            Notification.objects.filter(
+                user=self.partner,
+                notification_type=Notification.JOB_STATUS_UPDATED,
+                object_type="managed_job",
+                object_id=self.managed_job.id,
+            ).exists()
+        )
+
+    def test_missing_artwork_reminder_is_idempotent_across_dispatch_attempt(self):
+        self._confirm_payment()
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(
+            Notification.objects.filter(
+                notification_type=Notification.JOB_STATUS_UPDATED,
+                object_type="managed_job",
+                object_id=self.managed_job.id,
+            ).count(),
+            2,
+        )
+
+    def test_artwork_upload_clears_missing_state_but_preserves_reminder_history(self):
+        self._confirm_payment()
+        self.client.force_authenticate(user=self.end_client)
+
+        upload_response = self.client.post(
+            f"/api/managed-jobs/{self.managed_job.id}/files/artwork/",
+            {"file": SimpleUploadedFile("client-artwork.pdf", b"artwork", content_type="application/pdf")},
+            format="multipart",
+        )
+
+        self.assertEqual(upload_response.status_code, 201)
+        self.managed_job.refresh_from_db()
+        self.assertTrue(self.managed_job.artwork_reminder_sent)
+        self.assertFalse(self.managed_job.artwork_required)
+
+        detail_response = self.client.get(f"/api/dashboard/client/jobs/{self.managed_job.id}/")
+
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertFalse(detail_response.json()["job"]["artwork_missing"])
+        self.assertEqual(detail_response.json()["job"]["artwork_status_label"], "Artwork uploaded")
+
+
 class MarketRateAPITestCase(TestCase):
     def setUp(self):
         self.client = APIClient()
@@ -6654,3 +7176,131 @@ class MarketRateAPITestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         self.other_partner.profile.refresh_from_db()
         self.assertEqual(str(self.other_partner.profile.default_markup_rate), "0.45")
+
+
+class ReorderJobTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client_user = User.objects.create_user(
+            email="reorder-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Repeat Client",
+        )
+        self.other_client = User.objects.create_user(
+            email="reorder-other@test.com",
+            password="pass12345",
+            role="client",
+            name="Other Client",
+        )
+        self.partner = User.objects.create_user(
+            email="reorder-partner@test.com",
+            password="pass12345",
+            role="broker",
+            partner_profile_enabled=True,
+            name="Partner User",
+        )
+        self.production_user = User.objects.create_user(
+            email="reorder-production@test.com",
+            password="pass12345",
+            role="production",
+            name="Production User",
+        )
+        self.production_shop = Shop.objects.create(
+            owner=self.production_user,
+            name="Reorder Shop",
+            slug="reorder-shop",
+            is_active=True,
+        )
+        self.quote_request = QuoteRequest.objects.create(
+            shop=self.production_shop,
+            created_by=self.client_user,
+            customer_name="Repeat Client",
+            customer_email="reorder-client@test.com",
+            status=QuoteStatus.CLOSED,
+            notes="Trim accurately and keep the same front layout.",
+            request_snapshot={
+                "request_snapshot": {
+                    "product_type": "flyer",
+                    "product_label": "Flyer",
+                    "quantity": 500,
+                    "finished_size": "A5",
+                    "paper_stock": "art-card",
+                    "requested_gsm": 300,
+                    "print_sides": "DUPLEX",
+                    "color_mode": "COLOR",
+                    "lamination": "matt-lamination",
+                    "finishings": ["matt-lamination", "cutting"],
+                    "custom_brief": "Trim accurately and keep the same front layout.",
+                }
+            },
+        )
+        self.managed_job = ManagedJob.objects.create(
+            title="Repeat flyers",
+            source_quote_request=self.quote_request,
+            client=self.client_user,
+            created_by=self.client_user,
+            broker=self.partner,
+            assigned_shop=self.production_shop,
+            status="completed",
+            payment_status="confirmed",
+            assignment_status="assigned",
+            client_total=Decimal("3200.00"),
+            production_total=Decimal("2000.00"),
+            broker_commission=Decimal("600.00"),
+            platform_fee=Decimal("600.00"),
+            completed_at=timezone.now(),
+        )
+
+    def test_completed_job_reorder_creates_client_draft_with_source_job(self):
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.post(f"/api/managed-jobs/{self.managed_job.id}/reorder/", {}, format="json")
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["specs_copied_from"], self.managed_job.id)
+
+        draft = QuoteDraft.objects.get(pk=response.json()["draft_id"])
+        self.assertEqual(draft.user_id, self.client_user.id)
+        self.assertEqual(draft.source_job_id, self.managed_job.id)
+        self.assertEqual(draft.status, QuoteDraft.Status.DRAFT)
+        self.assertIsNone(draft.pricing_snapshot)
+        self.assertEqual(draft.artwork_token, "")
+        self.assertEqual(draft.artwork_filename, "")
+        self.assertEqual(draft.calculator_inputs_snapshot["product_type"], "flyer")
+        self.assertEqual(draft.calculator_inputs_snapshot["quantity"], 500)
+        self.assertEqual(draft.calculator_inputs_snapshot["finished_size"], "A5")
+        self.assertEqual(draft.calculator_inputs_snapshot["requested_gsm"], 300)
+        self.assertEqual(draft.calculator_inputs_snapshot["print_sides"], "DUPLEX")
+        self.assertEqual(draft.calculator_inputs_snapshot["color_mode"], "COLOR")
+        self.assertEqual(draft.calculator_inputs_snapshot["lamination"], "matt-lamination")
+        self.assertEqual(draft.calculator_inputs_snapshot["finishings"], ["matt-lamination", "cutting"])
+        self.assertEqual(
+            draft.calculator_inputs_snapshot["custom_brief"],
+            "Trim accurately and keep the same front layout.",
+        )
+        self.assertEqual(draft.request_details_snapshot["reorder_meta"]["source_job_id"], self.managed_job.id)
+
+    def test_reorder_rejects_non_completed_jobs(self):
+        self.managed_job.status = "ready"
+        self.managed_job.save(update_fields=["status", "updated_at"])
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.post(f"/api/managed-jobs/{self.managed_job.id}/reorder/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Can only reorder completed jobs")
+
+    def test_reorder_requires_job_ownership(self):
+        self.client.force_authenticate(user=self.other_client)
+
+        response = self.client.post(f"/api/managed-jobs/{self.managed_job.id}/reorder/", {}, format="json")
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_reorder_requires_client_role(self):
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/managed-jobs/{self.managed_job.id}/reorder/", {}, format="json")
+
+        self.assertEqual(response.status_code, 403)

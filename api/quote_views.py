@@ -25,6 +25,7 @@ from jobs.managed_services import (
     create_managed_job_from_accepted_quote,
 )
 from quotes.choices import QuoteStatus, ShopQuoteStatus
+from quotes.guardrails import expire_shop_quote
 from quotes.messaging import create_quote_message, mark_message_read, mark_messages_read
 from quotes.models import QuoteRequest, QuoteRequestAttachment, QuoteRequestMessage, ShopQuote, ShopQuoteAttachment
 from quotes.draft_pdf import render_quote_draft_pdf
@@ -260,6 +261,12 @@ class CustomerQuoteRequestViewSet(viewsets.ModelViewSet):
             ShopQuote.objects.filter(quote_request=qr),
             pk=shop_quote_id,
         )
+        if shop_quote.is_expired:
+            expire_shop_quote(shop_quote=shop_quote)
+            return Response(
+                {"detail": "This quote has expired. Please request a new quote from your print manager."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if shop_quote.status not in (ShopQuoteStatus.SENT, ShopQuoteStatus.REVISED):
             return Response(
                 {"detail": "Only sent or revised quotes can be accepted."},

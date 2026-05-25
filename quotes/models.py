@@ -10,6 +10,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from common.models import TimeStampedModel
@@ -393,6 +394,12 @@ class ShopQuote(TimeStampedModel):
         verbose_name=_("sent at"),
         help_text=_("When the quote was sent to the customer."),
     )
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("expires at"),
+        help_text=_("When the client-facing quote expires."),
+    )
     whatsapp_message = models.TextField(
         blank=True,
         default="",
@@ -501,6 +508,10 @@ class ShopQuote(TimeStampedModel):
 
     def is_terminal_status(self) -> bool:
         return self.status in {ShopQuoteStatus.ACCEPTED, ShopQuoteStatus.REJECTED}
+
+    @property
+    def is_expired(self) -> bool:
+        return bool(self.expires_at and timezone.now() > self.expires_at)
 
 
 class QuoteRequestMessage(TimeStampedModel):
@@ -1094,8 +1105,11 @@ class QuoteDraft(TimeStampedModel):
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name="quote_drafts_v2",
     )
+    guest_session_key = models.CharField(max_length=64, blank=True, default="", db_index=True)
     shop = models.ForeignKey(
         Shop,
         on_delete=models.SET_NULL,
@@ -1110,6 +1124,13 @@ class QuoteDraft(TimeStampedModel):
         blank=True,
         related_name="saved_quote_drafts",
     )
+    source_job = models.ForeignKey(
+        "jobs.ManagedJob",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reorder_quote_drafts",
+    )
     title = models.CharField(max_length=255, blank=True, default="")
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
     draft_reference = models.CharField(max_length=50, blank=True, default="")
@@ -1117,6 +1138,8 @@ class QuoteDraft(TimeStampedModel):
     calculator_inputs_snapshot = models.JSONField()
     pricing_snapshot = models.JSONField(null=True, blank=True)
     request_details_snapshot = models.JSONField(null=True, blank=True)
+    artwork_token = models.CharField(max_length=64, blank=True, default="")
+    artwork_filename = models.CharField(max_length=255, blank=True, default="")
 
     class Meta:
         ordering = ["-updated_at", "-created_at"]
@@ -1346,6 +1369,42 @@ class QuoteRequestAttachment(TimeStampedModel):
 
     def __str__(self):
         return self.name or self.file.name
+
+
+def pending_artwork_upload_to(instance, filename):
+    session_key = getattr(instance, "session_key", "") or "guest"
+    return f"pending_artwork/{session_key}/{filename}"
+
+
+class PendingArtworkUpload(TimeStampedModel):
+    """Temporary guest artwork upload linked by unguessable token."""
+
+    token = models.CharField(max_length=64, unique=True, db_index=True)
+    session_key = models.CharField(max_length=64, db_index=True)
+    file = models.FileField(upload_to=pending_artwork_upload_to, verbose_name=_("file"))
+    original_filename = models.CharField(max_length=255, blank=True, default="")
+    file_size = models.BigIntegerField(default=0)
+    content_type = models.CharField(max_length=100, blank=True, default="")
+    expires_at = models.DateTimeField()
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    claimed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="claimed_pending_artwork",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = _("pending artwork upload")
+        verbose_name_plural = _("pending artwork uploads")
+        indexes = [
+            models.Index(fields=["session_key", "expires_at"], name="pending_art_exp_idx"),
+        ]
+
+    def __str__(self):
+        return self.original_filename or self.token
 
 
 class ShopQuoteAttachment(TimeStampedModel):

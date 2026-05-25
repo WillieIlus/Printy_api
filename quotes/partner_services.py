@@ -6,11 +6,13 @@ from decimal import Decimal
 from typing import Any
 
 from django.db import transaction
+from django.utils import timezone
 
 from api.visibility import TOPOLOGY_MANAGED
 from jobs.payment_services import calculate_partner_job_split, get_default_platform_service_percent
 from production.models import Customer
 from quotes.choices import QuoteStatus, ShopQuoteStatus
+from quotes.guardrails import build_partner_markup_warning, calculate_quote_expiry, validate_partner_markup_amount
 from quotes.models import QuoteRequest, ShopQuote
 from quotes.services_workflow import _build_reference, create_quote_response
 from services.pricing.projections import project_broker_projection
@@ -61,6 +63,10 @@ def build_partner_quote_preview(*, pricing_snapshot: dict[str, Any], shop: Shop,
             "platform_service_percent": str(platform_service_percent),
             "client_price": str(final_client_price.quantize(Decimal("0.01"))),
             "margin": str(partner_markup.quantize(Decimal("0.01"))),
+            "markup_warning": build_partner_markup_warning(
+                base_price=production_estimate,
+                markup_amount=partner_markup,
+            ),
         }
     )
     return broker_projection
@@ -69,12 +75,7 @@ def build_partner_quote_preview(*, pricing_snapshot: dict[str, Any], shop: Shop,
 def validate_partner_markup(*, pricing_snapshot: dict[str, Any], shop: Shop, partner_markup: Decimal) -> None:
     preview = build_partner_quote_preview(pricing_snapshot=pricing_snapshot, shop=shop, partner_markup=partner_markup)
     production_estimate = _money(preview.get("production_estimate"))
-    if partner_markup < 0:
-        raise ValueError("Partner markup cannot be negative.")
-    if production_estimate <= 0:
-        raise ValueError("Production price is not available yet for the selected shop.")
-    if production_estimate > 0 and partner_markup > (production_estimate * Decimal("1.50")):
-        raise ValueError("Partner markup exceeds the current guardrail.")
+    validate_partner_markup_amount(base_price=production_estimate, markup_amount=partner_markup)
 
 
 def get_or_create_partner_customer(
@@ -304,6 +305,10 @@ def create_partner_quote(
             total=production_base_price,
             note=note or "Partner quote prepared in Printy.",
         )
+    if not save_as_draft:
+        sent_at = response.sent_at or timezone.now()
+        response.sent_at = sent_at
+        response.expires_at = calculate_quote_expiry(sent_at=sent_at)
     response.production_base_price = split["production_amount"]
     response.broker_margin_type = "fixed"
     response.broker_margin_value = partner_markup.quantize(Decimal("0.01"))
@@ -316,6 +321,8 @@ def create_partner_quote(
     response.client_quote_status = "draft" if save_as_draft else "sent"
     response.save(
         update_fields=[
+            "sent_at",
+            "expires_at",
             "production_base_price",
             "broker_margin_type",
             "broker_margin_value",
@@ -415,6 +422,9 @@ def respond_to_assigned_quote_request(
         total=production_base_price,
         note=note or "Your Print Manager prepared an exact quote in Printy.",
     )
+    sent_at = response.sent_at or timezone.now()
+    response.sent_at = sent_at
+    response.expires_at = calculate_quote_expiry(sent_at=sent_at)
     response.production_base_price = split["production_amount"]
     response.broker_margin_type = "fixed"
     response.broker_margin_value = partner_markup.quantize(Decimal("0.01"))
@@ -427,6 +437,8 @@ def respond_to_assigned_quote_request(
     response.client_quote_status = "sent"
     response.save(
         update_fields=[
+            "sent_at",
+            "expires_at",
             "production_base_price",
             "broker_margin_type",
             "broker_margin_value",

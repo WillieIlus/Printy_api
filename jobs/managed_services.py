@@ -19,7 +19,7 @@ from jobs.audit_services import (
     EVENT_QUOTE_ACCEPTED,
     record_managed_job_event,
 )
-from jobs.file_services import import_legacy_files_to_managed_job
+from jobs.file_services import import_legacy_files_to_managed_job, notify_missing_artwork, sync_managed_job_artwork_requirement
 from jobs.choices import ManagedJobTopologyType
 from jobs.models import JobAssignment, ManagedJob
 from jobs.workflow import assignment_status_from_production_order, managed_status_from_shop_quote_status
@@ -332,6 +332,7 @@ def create_managed_job_from_accepted_quote(
         quote_request=quote_request,
         shop_quote=shop_quote,
     )
+    has_artwork = sync_managed_job_artwork_requirement(managed_job=managed_job)
     record_managed_job_event(
         managed_job=managed_job,
         actor=accepted_by or managed_job.created_by,
@@ -357,6 +358,12 @@ def create_managed_job_from_accepted_quote(
         create_assignment_for_managed_job(
             managed_job=managed_job,
             shop_quote=shop_quote,
+        )
+    if not has_artwork:
+        notify_missing_artwork(
+            managed_job=managed_job,
+            actor=accepted_by or managed_job.created_by,
+            source="quote_accepted",
         )
     return managed_job
 
