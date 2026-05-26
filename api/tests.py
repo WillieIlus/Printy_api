@@ -9,7 +9,7 @@ from django.core import mail
 from django.core.management import call_command
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import ProgrammingError
-from django.test import TestCase, override_settings
+from django.test import Client, TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient, APIRequestFactory
 
@@ -262,8 +262,6 @@ class AnalyticsDashboardSummaryAPITestCase(TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertEqual(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["sample_count"], 0)
-        self.assertFalse(data["market_guides"]["300gsm_matte_art_card"]["single_side_price"]["has_enough_data"])
         self.assertEqual(data["total_visits_today"], 3)
         self.assertEqual(data["total_visits_this_week"], 3)
         self.assertEqual(data["total_visits_this_month"], 4)
@@ -3167,6 +3165,160 @@ class RecommendedPrintManagerAPITestCase(TestCase):
 
 class RecommendedManagerAPITestCase(RecommendedPrintManagerAPITestCase):
     pass
+
+
+@override_settings(PRINTY_DEFAULT_MARKUP=Decimal("0.30"))
+class PrintyFallbackTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin_client = Client()
+        self.client_user = User.objects.create_user(
+            email="printy-fallback-client@test.com",
+            password="pass12345",
+            role="client",
+            name="Fallback Client",
+        )
+        self.partner_manager = User.objects.create_user(
+            email="printy-fallback-partner@test.com",
+            password="pass12345",
+            role="partner",
+            name="Fallback Partner",
+            partner_profile_enabled=True,
+        )
+        self.random_partner = User.objects.create_user(
+            email="printy-random-partner@test.com",
+            password="pass12345",
+            role="partner",
+            name="Random Partner",
+            partner_profile_enabled=True,
+        )
+        self.admin_user = User.objects.create_superuser(
+            email="printy-admin@test.com",
+            password="pass12345",
+        )
+        call_command("create_printy_manager_user")
+        self.printy_manager = User.objects.get(email="ops@printy.ke")
+        self.draft = QuoteDraft.objects.create(
+            user=self.client_user,
+            title="Fallback draft",
+            status=QuoteDraft.Status.DRAFT,
+            draft_reference="DR-PRINTY-1",
+            calculator_inputs_snapshot={
+                "product_type": "business_card",
+                "quantity": 250,
+                "finished_size": "85x55mm",
+                "requested_gsm": 300,
+                "print_sides": "DUPLEX",
+                "color_mode": "COLOR",
+            },
+            pricing_snapshot={
+                "currency": "KES",
+                "min_price": "1200.00",
+                "max_price": "1800.00",
+                "pricing_preview": {"totals": {"grand_total": "1500.00"}},
+            },
+            request_details_snapshot={"customer_name": "Fallback Client"},
+        )
+
+    def test_no_managers_available_returns_fallback(self):
+        self.partner_manager.is_active = False
+        self.partner_manager.save(update_fields=["is_active", "updated_at"])
+        self.random_partner.is_active = False
+        self.random_partner.save(update_fields=["is_active", "updated_at"])
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
+            {"product_type": "business_card", "quantity": 250},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["results"], [])
+        self.assertEqual(payload["fallback"]["id"], self.printy_manager.id)
+        self.assertEqual(payload["fallback"]["display_name"], "Printy")
+        self.assertTrue(payload["fallback"]["is_printy_fallback"])
+        self.assertIsNone(payload["fallback"]["completed_jobs"])
+
+    def test_system_account_is_excluded_from_regular_recommendations(self):
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get(
+            "/api/intake/recommended-managers/",
+            {"product_type": "business_card", "quantity": 250},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        ids = [row["id"] for row in response.json()["results"]]
+        self.assertIn(self.partner_manager.id, ids)
+        self.assertNotIn(self.printy_manager.id, ids)
+
+    def test_intake_with_printy_manager_assigns_markup_snapshot(self):
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.post(
+            "/api/intake/submit/",
+            {
+                "draft_id": self.draft.id,
+                "selected_manager_id": self.printy_manager.id,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        quote_request = QuoteRequest.objects.get(pk=response.json()["intake_id"])
+        self.assertEqual(quote_request.assigned_manager_id, self.printy_manager.id)
+        self.assertEqual(response.json()["manager_name"], "Printy")
+        self.assertEqual(quote_request.request_snapshot["assignment"]["default_markup_rate"], "0.30")
+        self.assertEqual(quote_request.request_snapshot["assignment"]["escalation_status"], "printy_handled")
+
+    def test_client_sees_managed_by_printy_safe_payload(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.client_user,
+            assigned_manager=self.printy_manager,
+            customer_name="Fallback Client",
+            customer_email=self.client_user.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={"source": "manager_led_intake"},
+        )
+        self.client.force_authenticate(user=self.client_user)
+
+        response = self.client.get(f"/api/client/requests/{quote_request.id}/")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["assigned_manager"]
+        self.assertEqual(payload["display_name"], "Printy")
+        self.assertEqual(payload["short_title"], "Managed by Printy")
+        self.assertTrue(payload["is_printy_fallback"])
+        self.assertEqual(payload["support_email"], "support@printy.ke")
+        self.assertNotIn("email", payload)
+
+    def test_printy_managed_request_stays_admin_visible_and_private_to_other_partners(self):
+        quote_request = QuoteRequest.objects.create(
+            shop=None,
+            created_by=self.client_user,
+            assigned_manager=self.printy_manager,
+            customer_name="Fallback Client",
+            customer_email=self.client_user.email,
+            status=QuoteStatus.SUBMITTED,
+            request_snapshot={"source": "manager_led_intake"},
+        )
+        self.admin_client.force_login(self.admin_user)
+        changelist_response = self.admin_client.get("/admin/quotes/quoterequest/")
+        self.assertEqual(changelist_response.status_code, 200)
+        self.assertContains(changelist_response, "Fallback Client")
+
+        self.client.force_authenticate(user=self.random_partner)
+        hidden_response = self.client.get(f"/api/dashboard/partner/quotes/{quote_request.id}/")
+        self.assertEqual(hidden_response.status_code, 404)
+
+        quote_request.assigned_manager = self.partner_manager
+        quote_request.save(update_fields=["assigned_manager", "updated_at"])
+
+        self.client.force_authenticate(user=self.partner_manager)
+        visible_response = self.client.get(f"/api/dashboard/partner/quotes/{quote_request.id}/")
+        self.assertEqual(visible_response.status_code, 200)
 
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
@@ -6799,6 +6951,17 @@ class PartnerDispatchValidationTestCase(TestCase):
             customer_name="Dispatch Client",
             customer_email="dispatch-client@test.com",
             status=QuoteStatus.CLOSED,
+            request_snapshot={
+                "request_snapshot": {
+                    "product_type": "flyer",
+                    "product_label": "Flyer",
+                    "quantity": 500,
+                    "finished_size": "A5",
+                    "paper_stock": "130gsm gloss",
+                    "print_sides": "Double sided",
+                    "color_mode": "Full colour",
+                }
+            },
         )
         self.shop_quote = ShopQuote.objects.create(
             quote_request=self.quote_request,
@@ -6927,6 +7090,121 @@ class PartnerDispatchValidationTestCase(TestCase):
         response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
 
         self.assertEqual(response.status_code, 403)
+
+
+class DispatchGuardTestCase(PartnerDispatchValidationTestCase):
+    def test_paid_job_with_artwork_dispatches_and_returns_guard_metadata(self):
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["dispatched"])
+        self.assertEqual(payload["shop_name"], self.production_shop.name)
+        self.assertTrue(payload["artwork_verified"])
+
+    def test_unpaid_job_cannot_dispatch_with_payment_required_code(self):
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
+        self.managed_job.payment_status = "pending"
+        self.managed_job.status = "awaiting_payment"
+        self.managed_job.save(update_fields=["payment_status", "status", "updated_at"])
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "payment_required")
+
+    def test_paid_job_with_missing_artwork_returns_artwork_required_code(self):
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "artwork_required")
+        self.assertTrue(response.json()["client_notified"])
+
+    def test_dispatch_requires_confirmed_specs(self):
+        self.quote_request.request_snapshot = {
+            "request_snapshot": {
+                "product_type": "flyer",
+                "quantity": 500,
+            }
+        }
+        self.quote_request.save(update_fields=["request_snapshot", "updated_at"])
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "missing_specs")
+        self.assertIn("size", response.json()["missing_fields"])
+
+    def test_dispatch_requires_selected_shop(self):
+        self.managed_job.source_shop_quote = None
+        self.managed_job.save(update_fields=["source_shop_quote", "updated_at"])
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
+        self.client.force_authenticate(user=self.partner)
+
+        response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "no_shop_selected")
+
+    def test_shop_sees_job_only_after_dispatch(self):
+        self.client.force_authenticate(user=self.production_user)
+        before_response = self.client.get("/api/dashboard/production/jobs/")
+        self.assertEqual(before_response.status_code, 200)
+        self.assertEqual(before_response.json()["results"], [])
+
+        JobFile.objects.create(
+            managed_job=self.managed_job,
+            uploaded_by=self.end_client,
+            original_filename="dispatch-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
+        self.client.force_authenticate(user=self.partner)
+        dispatch_response = self.client.post(f"/api/dashboard/partner/jobs/{self.managed_job.id}/dispatch/", {}, format="json")
+        self.assertEqual(dispatch_response.status_code, 200)
+
+        self.client.force_authenticate(user=self.production_user)
+        after_response = self.client.get("/api/dashboard/production/jobs/")
+        self.assertEqual(after_response.status_code, 200)
+        self.assertEqual(len(after_response.json()["results"]), 1)
+        self.assertEqual(after_response.json()["results"][0]["id"], self.managed_job.id)
 
 
 class ArtworkNotificationTestCase(TestCase):

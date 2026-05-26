@@ -193,6 +193,7 @@ class UserProfile(TimeStampedModel):
     state = models.CharField(max_length=100, blank=True, default="")
     country = models.CharField(max_length=100, blank=True, default="")
     postal_code = models.CharField(max_length=20, blank=True, default="")
+    is_system_account = models.BooleanField(default=False)
     default_markup_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.30"))
 
     class Meta:

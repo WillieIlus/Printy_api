@@ -2,8 +2,10 @@
 
 import secrets
 
+from django.conf import settings
 from accounts.models import User
 from accounts.services.roles import is_broker, user_can_manage_clients, user_can_source_jobs
+from accounts.services.system_accounts import get_printy_manager_user, is_system_account
 from django.db import transaction
 from django.utils import timezone
 
@@ -110,6 +112,39 @@ def resolve_assigned_manager(candidate):
     return manager
 
 
+def _resolved_manager_short_title(manager: User | None) -> str:
+    if manager is not None and is_system_account(manager):
+        return "Managed by Printy"
+    return "Print Manager"
+
+
+def _build_assignment_snapshot(*, assigned_manager: User | None, merged_request_details: dict) -> dict:
+    snapshot = {
+        "selected_manager_id": getattr(assigned_manager, "id", None),
+        "escalation_status": str(merged_request_details.get("escalation_status") or "").strip(),
+        "failed_manager_attempts": int(merged_request_details.get("failed_manager_attempts") or 0),
+    }
+    if assigned_manager is not None and is_system_account(assigned_manager):
+        snapshot.update(
+            {
+                "is_printy_fallback": True,
+                "default_markup_rate": str(getattr(settings, "PRINTY_DEFAULT_MARKUP", "0.30")),
+                "escalation_status": snapshot["escalation_status"] or "printy_handled",
+                "support_email": "support@printy.ke",
+            }
+        )
+    return snapshot
+
+
+def _should_assign_printy_fallback(*, merged_request_details: dict, assigned_manager: User | None) -> bool:
+    if assigned_manager is not None:
+        return False
+    failed_attempts = int(merged_request_details.get("failed_manager_attempts") or 0)
+    if failed_attempts >= 3:
+        return True
+    return bool(merged_request_details.get("force_printy_fallback"))
+
+
 def _resolve_product_for_shop(draft: QuoteDraft, shop: Shop):
     product = draft.selected_product
     if product and product.shop_id == shop.id:
@@ -210,6 +245,10 @@ def _build_manager_intake_snapshot(*, draft: QuoteDraft, merged_request_details:
             "topology_mode": TOPOLOGY_MANAGED,
             "exposes_internal_economics": False,
         },
+        "assignment": _build_assignment_snapshot(
+            assigned_manager=assigned_manager,
+            merged_request_details=merged_request_details,
+        ),
     }
     if assigned_manager is not None:
         snapshot["relationship_owner_type"] = "user"
@@ -217,7 +256,7 @@ def _build_manager_intake_snapshot(*, draft: QuoteDraft, merged_request_details:
         snapshot["assigned_manager"] = {
             "id": assigned_manager.id,
             "display_name": getattr(assigned_manager, "name", "") or getattr(assigned_manager, "email", "") or "Print Manager",
-            "short_title": "Print Manager",
+            "short_title": _resolved_manager_short_title(assigned_manager),
         }
     return snapshot
 
@@ -277,6 +316,10 @@ def _build_manager_intake_item_spec_snapshot(*, draft: QuoteDraft, merged_reques
             "topology_mode": TOPOLOGY_MANAGED,
             "exposes_internal_economics": False,
         },
+        "assignment": _build_assignment_snapshot(
+            assigned_manager=assigned_manager,
+            merged_request_details=merged_request_details,
+        ),
     }
     if assigned_manager is not None:
         snapshot["assigned_manager_id"] = assigned_manager.id
@@ -532,6 +575,15 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
         or merged_request_details.get("assigned_manager_id")
         or merged_request_details.get("assigned_manager")
     )
+    if _should_assign_printy_fallback(
+        merged_request_details=merged_request_details,
+        assigned_manager=assigned_manager,
+    ):
+        assigned_manager = get_printy_manager_user()
+    if assigned_manager is not None and is_system_account(assigned_manager):
+        merged_request_details["selected_manager_id"] = assigned_manager.id
+        merged_request_details["force_printy_fallback"] = True
+        merged_request_details["escalation_status"] = "printy_handled"
     on_behalf_of = None
     client_id = merged_request_details.get("client_id") or merged_request_details.get("on_behalf_of")
     if client_id:

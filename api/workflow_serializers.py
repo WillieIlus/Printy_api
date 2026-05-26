@@ -50,8 +50,28 @@ def _client_visible_quote_total(raw_total, raw_snapshot, *, client_total=None):
     )
 from quotes.turnaround import estimate_turnaround, legacy_days_from_hours
 from shops.models import Shop
+from accounts.services.system_accounts import is_system_account
 from .serializers import QuoteItemReadSerializer
 from .quote_serializers import QuoteItemCustomerSerializer, QuoteRequestAttachmentSerializer
+
+
+def _assigned_manager_payload(manager):
+    if manager is None:
+        return None
+    is_printy_managed = is_system_account(manager)
+    payload = {
+        "id": manager.id,
+        "display_name": (
+            "Printy"
+            if is_printy_managed
+            else getattr(manager, "name", "") or getattr(manager, "email", "") or "Print Manager"
+        ),
+        "short_title": "Managed by Printy" if is_printy_managed else "Print Manager",
+    }
+    if is_printy_managed:
+        payload["is_printy_fallback"] = True
+        payload["support_email"] = "support@printy.ke"
+    return payload
 
 
 class FinishingSelectionSerializer(serializers.Serializer):
@@ -777,14 +797,7 @@ class QuoteRequestReadSerializer(serializers.ModelSerializer):
         return obj.shop_quotes.count()
 
     def get_assigned_manager(self, obj):
-        manager = getattr(obj, "assigned_manager", None)
-        if manager is None:
-            return None
-        return {
-            "id": manager.id,
-            "display_name": getattr(manager, "name", "") or getattr(manager, "email", "") or "Print Manager",
-            "short_title": "Print Manager",
-        }
+        return _assigned_manager_payload(getattr(obj, "assigned_manager", None))
 
     def get_status(self, obj):
         return normalize_quote_request_status(obj.status)
@@ -1353,14 +1366,7 @@ class ClientQuoteRequestDetailSerializer(serializers.ModelSerializer):
         return normalize_quote_request_status(obj.status)
 
     def get_assigned_manager(self, obj):
-        manager = getattr(obj, "assigned_manager", None)
-        if manager is None:
-            return None
-        return {
-            "id": manager.id,
-            "display_name": getattr(manager, "name", "") or getattr(manager, "email", "") or "Print Manager",
-            "short_title": "Print Manager",
-        }
+        return _assigned_manager_payload(getattr(obj, "assigned_manager", None))
 
     def get_shop_name(self, obj):
         topology_mode = resolve_topology_mode_for_quote_request(obj)
@@ -1488,6 +1494,23 @@ class MvpRateCardPublicShopSerializer(serializers.Serializer):
     location = serializers.CharField(required=False, allow_blank=True, default="")
 
 
+LEGACY_MVP_FINISHING_KEY_ALIASES = {
+    "matte_lamination": "matte_lamination_double",
+    "gloss_lamination": "gloss_lamination_double",
+}
+
+
+def _normalize_mvp_finishing_rows(rows):
+    normalized_rows = []
+    for row in rows or []:
+        current = dict(row or {})
+        key = str(current.get("key") or "").strip()
+        if key in LEGACY_MVP_FINISHING_KEY_ALIASES:
+            current["key"] = LEGACY_MVP_FINISHING_KEY_ALIASES[key]
+        normalized_rows.append(current)
+    return normalized_rows
+
+
 def _validate_mvp_rate_card_keys(*, rows, field_name: str, allowed_keys: set[str]):
     invalid_rows = []
     for idx, row in enumerate(rows or []):
@@ -1506,7 +1529,7 @@ class MvpRateCardPreviewSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         attrs["paper_rows"] = attrs.get("paper_prices") or attrs.get("paper_rows") or []
-        attrs["finishing_rows"] = attrs.get("finishings") or attrs.get("finishing_rows") or []
+        attrs["finishing_rows"] = _normalize_mvp_finishing_rows(attrs.get("finishings") or attrs.get("finishing_rows") or [])
         _validate_mvp_rate_card_keys(
             rows=attrs["paper_rows"],
             field_name="paper_prices",
@@ -1529,7 +1552,7 @@ class MvpRateCardSetupSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         attrs["paper_rows"] = attrs.get("paper_prices") or attrs.get("paper_rows") or []
-        attrs["finishing_rows"] = attrs.get("finishings") or attrs.get("finishing_rows") or []
+        attrs["finishing_rows"] = _normalize_mvp_finishing_rows(attrs.get("finishings") or attrs.get("finishing_rows") or [])
         _validate_mvp_rate_card_keys(
             rows=attrs["paper_rows"],
             field_name="paper_prices",
@@ -1555,7 +1578,7 @@ class MvpRateCardPublicSaveSerializer(serializers.Serializer):
             "location_area": (attrs.get("shop") or {}).get("location", ""),
         }
         attrs["paper_rows"] = attrs.get("paper_prices") or []
-        attrs["finishing_rows"] = attrs.get("finishings") or []
+        attrs["finishing_rows"] = _normalize_mvp_finishing_rows(attrs.get("finishings") or [])
         _validate_mvp_rate_card_keys(
             rows=attrs["paper_rows"],
             field_name="paper_prices",

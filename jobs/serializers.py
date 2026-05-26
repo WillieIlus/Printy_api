@@ -404,7 +404,7 @@ class JobAssignmentSerializer(serializers.ModelSerializer):
         return []
 
     def get_payment_confirmed(self, obj):
-        return str(obj.managed_job.payment_status or "").lower() in {"confirmed", "release_ready", "released"}
+        return str(obj.managed_job.payment_status or "").lower() in {"confirmed", "paid", "completed", "release_ready", "released"}
 
     def get_payout_amount(self, obj):
         return _money(obj.production_amount)

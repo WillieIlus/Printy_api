@@ -105,8 +105,6 @@ def _resolve_or_create_partner_client(
 
     created_user = False
     if resolved_user is None:
-        if not email:
-            raise ValueError("Client email is required when no existing client is selected.")
         fallback_email = email or _fallback_partner_client_email(partner_id=partner_user.id, phone=phone)
         resolved_user = User.objects.create_user(
             email=fallback_email,
@@ -447,6 +445,21 @@ class BaseRoleDetailView(BaseDashboardHomeView):
         if isinstance(nested, dict):
             return nested
         return snapshot
+
+    def _dispatch_missing_specs(self, job: ManagedJob) -> list[str]:
+        quote_request = getattr(job, "source_quote_request", None)
+        request_snapshot = self._request_snapshot(quote_request)
+        root_snapshot = self._request_snapshot_root(quote_request)
+        calculator_inputs = root_snapshot.get("calculator_inputs") if isinstance(root_snapshot.get("calculator_inputs"), dict) else {}
+        required_specs = {
+            "product_type": request_snapshot.get("product_type") or request_snapshot.get("product_label") or calculator_inputs.get("product_type"),
+            "quantity": request_snapshot.get("quantity") or calculator_inputs.get("quantity"),
+            "size": request_snapshot.get("finished_size") or request_snapshot.get("size_label") or calculator_inputs.get("finished_size"),
+            "paper": request_snapshot.get("paper_stock") or request_snapshot.get("paper_label") or calculator_inputs.get("paper_stock"),
+            "print_sides": request_snapshot.get("print_sides") or request_snapshot.get("print_sides_label") or calculator_inputs.get("print_sides"),
+            "color_mode": request_snapshot.get("color_mode") or request_snapshot.get("color_mode_label") or calculator_inputs.get("color_mode"),
+        }
+        return [key for key, value in required_specs.items() if value in (None, "", [])]
 
     def _assigned_request_match_payload(self, quote_request: QuoteRequest, overrides: dict[str, object] | None = None) -> dict[str, object]:
         snapshot = self._request_snapshot_root(quote_request)
@@ -1006,18 +1019,46 @@ class PartnerJobDispatchView(BaseRoleDetailView):
     def post(self, request, pk):
         job = get_object_or_404(self.get_queryset(request), pk=pk)
         if job.payment_status not in {"confirmed", "release_ready"} and job.status != "payment_confirmed":
-            return Response({"detail": "Client payment must be confirmed before dispatch."}, status=400)
+            return Response(
+                {
+                    "error": "payment_required",
+                    "detail": "Client payment must be confirmed before dispatch.",
+                },
+                status=400,
+            )
         if job.dispatched_at is not None:
             return Response({"detail": "This job has already been dispatched."}, status=400)
+        source_shop_quote = job.source_shop_quote
+        if source_shop_quote is None or getattr(source_shop_quote, "shop_id", None) is None:
+            return Response(
+                {
+                    "error": "no_shop_selected",
+                    "detail": "Select a production shop before dispatch.",
+                },
+                status=400,
+            )
+        missing_specs = self._dispatch_missing_specs(job)
+        if missing_specs:
+            return Response(
+                {
+                    "error": "missing_specs",
+                    "detail": "Required production specs must be confirmed before dispatch.",
+                    "missing_fields": missing_specs,
+                },
+                status=400,
+            )
         if not managed_job_has_artwork(managed_job=job):
             job.artwork_required = True
             job.save(update_fields=["artwork_required", "updated_at"])
             notify_missing_artwork(managed_job=job, actor=request.user, source="dispatch_attempt")
-            return Response({"detail": "Artwork required before dispatch. Client has been notified."}, status=400)
-
-        source_shop_quote = job.source_shop_quote
-        if source_shop_quote is None:
-            return Response({"detail": "This job has no source production quote to dispatch."}, status=400)
+            return Response(
+                {
+                    "error": "artwork_required",
+                    "detail": "Artwork required before dispatch. Client has been notified.",
+                    "client_notified": True,
+                },
+                status=400,
+            )
 
         job.assigned_shop = source_shop_quote.shop
         job.dispatched_at = timezone.now()
@@ -1040,8 +1081,11 @@ class PartnerJobDispatchView(BaseRoleDetailView):
             {
                 "job_id": job.id,
                 "assignment_id": assignment.id,
+                "dispatched": True,
                 "dispatched_at": job.dispatched_at,
                 "assignment_status": job.assignment_status,
+                "shop_name": getattr(source_shop_quote.shop, "name", "") or "Production Shop",
+                "artwork_verified": True,
             }
         )
 

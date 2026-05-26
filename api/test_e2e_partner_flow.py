@@ -5,7 +5,7 @@ from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from accounts.models import User, UserProfile
-from jobs.models import JobAssignment, JobPayment, JobSettlementSplit, ManagedJob
+from jobs.models import JobAssignment, JobFile, JobPayment, JobSettlementSplit, ManagedJob
 from quotes.models import QuoteRequest, ShopQuote
 from shops.models import Shop
 
@@ -75,6 +75,17 @@ class PartnerMediatedManagedJobFlowTestCase(TestCase):
             ],
         }
 
+    def _calculator_inputs_snapshot(self):
+        return {
+            "product_type": "business_card",
+            "quantity": 500,
+            "finished_size": "90x50mm",
+            "paper_stock": "300gsm_matte_art_card",
+            "print_sides": "SIMPLEX",
+            "color_mode": "COLOR",
+            "pricing_mode": "SHEET",
+        }
+
     def _stk_success_response(self):
         response = Mock()
         response.json.return_value = {
@@ -132,7 +143,7 @@ class PartnerMediatedManagedJobFlowTestCase(TestCase):
                 "client_name": "Fresh Partner Client",
                 "client_email": "fresh-client@test.com",
                 "client_phone": "+254711222333",
-                "calculator_inputs_snapshot": {"quantity": 500, "pricing_mode": "SHEET"},
+                "calculator_inputs_snapshot": self._calculator_inputs_snapshot(),
                 "pricing_snapshot": self._pricing_snapshot(),
                 "partner_markup": "600.00",
                 "note": "Partner-originated managed quote.",
@@ -158,7 +169,7 @@ class PartnerMediatedManagedJobFlowTestCase(TestCase):
                 "client_id": self.end_client.id,
                 "client_name": "Flow Client",
                 "client_email": "e2e-client@test.com",
-                "calculator_inputs_snapshot": {"quantity": 500, "pricing_mode": "SHEET"},
+                "calculator_inputs_snapshot": self._calculator_inputs_snapshot(),
                 "pricing_snapshot": self._pricing_snapshot(),
                 "partner_markup": "600.00",
                 "note": "Partner-originated managed quote.",
@@ -230,6 +241,15 @@ class PartnerMediatedManagedJobFlowTestCase(TestCase):
         self.assertEqual(str(payment.received_amount), "3200.00")
         self.assertEqual(managed_job.payment_status, "confirmed")
 
+        JobFile.objects.create(
+            managed_job=managed_job,
+            uploaded_by=self.end_client,
+            original_filename="partner-flow-artwork.pdf",
+            file_type="artwork",
+            visibility="client",
+            status="uploaded",
+        )
+
         self.client.force_authenticate(user=self.partner)
         dispatch_response = self.client.post(f"/api/dashboard/partner/jobs/{managed_job.id}/dispatch/", {}, format="json")
         self.assertEqual(dispatch_response.status_code, 200)
@@ -241,6 +261,10 @@ class PartnerMediatedManagedJobFlowTestCase(TestCase):
         self.assertEqual(str(assignment.production_amount), "2000.00")
 
         self.client.force_authenticate(user=self.production_user)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{assignment.id}/accept/", {}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{assignment.id}/mark-in-production/", {}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{assignment.id}/mark-finishing/", {}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{assignment.id}/mark-ready/", {}, format="json").status_code, 200)
         completed_response = self.client.post(f"/api/job-assignments/{assignment.id}/mark-completed/", {}, format="json")
         self.assertEqual(completed_response.status_code, 200)
         assignment.refresh_from_db()

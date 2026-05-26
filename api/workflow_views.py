@@ -1,6 +1,7 @@
 import logging
 from decimal import Decimal
 
+from django.conf import settings
 from django.http import FileResponse
 from django.db import OperationalError, ProgrammingError, transaction
 from django.db.models import Count, OuterRef, Q, Subquery
@@ -15,6 +16,7 @@ from rest_framework.views import APIView
 from accounts.models import User, UserProfile
 from accounts.services.capabilities import has_capability
 from accounts.services.roles import CANONICAL_PARTNER_ROLE, is_client, resolve_user_roles
+from accounts.services.system_accounts import get_printy_manager_user, is_system_account
 from .visibility import CLIENT_ACTOR, TOPOLOGY_MANAGED, project_identity
 from notifications.models import Notification
 from notifications.services import notify_quote_event
@@ -125,6 +127,8 @@ def _safe_manager_profile(user: User) -> UserProfile | None:
 
 
 def _safe_manager_display_name(user: User) -> str:
+    if is_system_account(user):
+        return "Printy"
     return (getattr(user, "name", "") or "").strip() or "Print Manager"
 
 
@@ -271,6 +275,8 @@ def _manager_active_recently(user: User) -> bool:
 def _eligible_manager_candidate(user: User, *, current_user=None, product_type: str = "") -> bool:
     if not user or not getattr(user, "is_active", False):
         return False
+    if is_system_account(user):
+        return False
     if current_user is not None and getattr(current_user, "id", None) == user.id:
         return False
     can_manage = bool(
@@ -349,6 +355,23 @@ def _manager_badge(*, manager_payloads: list[dict[str, object]], index: int) -> 
     return None
 
 
+def _build_printy_fallback_payload() -> dict[str, object] | None:
+    manager = get_printy_manager_user()
+    fallback_id = getattr(manager, "id", None) or getattr(settings, "PRINTY_MANAGER_USER_ID", None)
+    if not fallback_id:
+        return None
+    return {
+        "id": fallback_id,
+        "display_name": "Printy",
+        "short_title": "Managed by Printy",
+        "is_printy_fallback": True,
+        "avg_response_hours": 2,
+        "completed_jobs": None,
+        "badge": "printy_managed",
+        "support_email": "support@printy.ke",
+    }
+
+
 def _build_recommended_manager_payloads(*, request, current_user, product_type: str, quantity: int, paper_gsm=None, size: str = "") -> dict[str, object]:
     candidates = (
         User.objects.filter(is_active=True)
@@ -417,13 +440,15 @@ def _build_recommended_manager_payloads(*, request, current_user, product_type: 
     selected_payloads = selected_payloads[:3]
     for index in range(len(selected_payloads)):
         selected_payloads[index]["badge"] = _manager_badge(manager_payloads=selected_payloads, index=index)
+    fallback = _build_printy_fallback_payload() if not selected_payloads else None
     return {
         "results": selected_payloads,
         "message": (
             ""
             if selected_payloads
-            else "No managers available for this spec yet. Printy will handle your job directly."
+            else "No specialist managers are available for this job type right now. Printy will handle your job directly."
         ),
+        "fallback": fallback,
         "meta": {
             "product_type": product_type,
             "quantity": quantity,

@@ -33,6 +33,16 @@ def _get_env_list(name, *, fallback_names=(), default=""):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _get_env_int(name, *, fallback_names=(), default=None):
+    value = _get_env(name, fallback_names=fallback_names, default=default)
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ImproperlyConfigured(f"{name} must be an integer.") from exc
+
+
 def _env_debug_enabled():
     return os.environ.get("ENV_DEBUG", "false").lower() in ("1", "true", "yes")
 
@@ -359,6 +369,8 @@ PARTNER_MARKUP_MIN = Decimal(str(_get_env("PARTNER_MARKUP_MIN", default="0.05"))
 PARTNER_MARKUP_MAX = Decimal(str(_get_env("PARTNER_MARKUP_MAX", default="2.00")))
 PARTNER_MARKUP_DEFAULT = Decimal(str(_get_env("PARTNER_MARKUP_DEFAULT", default="0.30")))
 PARTNER_MARKUP_WARNING = Decimal(str(_get_env("PARTNER_MARKUP_WARNING", default="1.00")))
+PRINTY_MANAGER_USER_ID = _get_env_int("PRINTY_MANAGER_USER_ID")
+PRINTY_DEFAULT_MARKUP = Decimal(str(_get_env("PRINTY_DEFAULT_MARKUP", default="0.30")))
 
 if MPESA_ENV == "production":
     parsed_callback = MPESA_CALLBACK_URL.lower()

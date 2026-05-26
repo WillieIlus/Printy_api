@@ -19,6 +19,7 @@ from jobs.choices import (
     ManagedJobStatus,
 )
 from jobs.models import JobAssignment
+from jobs.payment_services import initialize_settlement_for_managed_job
 from notifications.models import Notification
 from notifications.services import notify_quote_event
 from production.models import ProductionOrder
@@ -254,6 +255,7 @@ def mark_assignment_completed(*, assignment: JobAssignment, actor=None, note: st
         note=note,
     )
     managed_job = assignment.managed_job
+    initialize_settlement_for_managed_job(managed_job=managed_job)
     _notify_progress(assignment=assignment, actor=actor, message=f"{managed_job.managed_reference or 'Managed job'} is marked completed.")
     return assignment
 

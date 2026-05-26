@@ -1349,6 +1349,111 @@ class JobAssignmentActionsTestCase(TestCase):
         self.assertIn("Cannot mark assignment ready", response.json()["detail"])
 
 
+class ProductionTimelineTestCase(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.client_user = User.objects.create_user(email="timeline-client@test.com", password="pass12345", role="client")
+        self.partner = User.objects.create_user(email="timeline-partner@test.com", password="pass12345", role="broker")
+        self.owner = User.objects.create_user(email="timeline-owner@test.com", password="pass12345", role="shop_owner")
+        self.other_owner = User.objects.create_user(email="timeline-other-owner@test.com", password="pass12345", role="shop_owner")
+        self.shop = Shop.objects.create(owner=self.owner, name="Timeline Shop", slug="timeline-shop", is_active=True)
+        self.other_shop = Shop.objects.create(owner=self.other_owner, name="Other Timeline Shop", slug="other-timeline-shop", is_active=True)
+        self.customer = Customer.objects.create(shop=self.shop, name="Timeline Customer", email="timeline-client@test.com")
+        self.quote_request = QuoteRequest.objects.create(
+            shop=self.shop,
+            created_by=self.client_user,
+            customer=self.customer,
+            customer_name="Timeline Customer",
+            customer_email="timeline-client@test.com",
+            status=QuoteStatus.CLOSED,
+            request_snapshot={
+                "request_snapshot": {
+                    "product_type": "booklet",
+                    "product_label": "Booklet",
+                    "quantity": 250,
+                    "finished_size": "A5",
+                    "paper_stock": "Art paper",
+                    "print_sides": "Double sided",
+                    "color_mode": "Full colour",
+                    "lamination": "gloss",
+                }
+            },
+        )
+        self.shop_quote = ShopQuote.objects.create(
+            quote_request=self.quote_request,
+            shop=self.shop,
+            created_by=self.owner,
+            status=ShopQuoteStatus.ACCEPTED,
+            total=Decimal("1800.00"),
+            client_total=Decimal("2600.00"),
+            production_base_price=Decimal("1800.00"),
+            broker_margin_amount=Decimal("400.00"),
+            platform_service_amount=Decimal("400.00"),
+        )
+        self.managed_job = ManagedJob.objects.create(
+            title="Timeline managed job",
+            source_quote_request=self.quote_request,
+            source_shop_quote=self.shop_quote,
+            client=self.client_user,
+            customer=self.customer,
+            broker=self.partner,
+            assigned_shop=self.shop,
+            created_by=self.client_user,
+            status="payment_confirmed",
+            payment_status="confirmed",
+            assignment_status="assignment_pending",
+            client_total=Decimal("2600.00"),
+            production_total=Decimal("1800.00"),
+            broker_commission=Decimal("400.00"),
+            platform_fee=Decimal("400.00"),
+        )
+        self.assignment = JobAssignment.objects.create(
+            managed_job=self.managed_job,
+            assigned_shop=self.shop,
+            source_shop_quote=self.shop_quote,
+            production_amount=Decimal("1800.00"),
+            status="pending",
+        )
+
+    def test_finishing_status_transition_works_and_payment_confirmed_is_shop_safe(self):
+        accept_assignment(assignment=self.assignment, actor=self.owner)
+        mark_assignment_in_production(assignment=self.assignment, actor=self.owner)
+        mark_assignment_finishing(assignment=self.assignment, actor=self.owner)
+        self.assignment.refresh_from_db()
+
+        payload = JobAssignmentSerializer(
+            self.assignment,
+            context={"request": type("Request", (), {"user": self.owner})()},
+        ).data
+        self.assertEqual(self.assignment.status, "finishing")
+        self.assertTrue(payload["payment_confirmed"])
+        self.assertEqual(payload["production_stage"], "finishing")
+        self.assertNotIn("client_total", payload)
+
+    def test_assigned_shop_can_progress_valid_states_and_completion_initializes_settlement(self):
+        self.client.force_authenticate(user=self.owner)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{self.assignment.id}/accept/", {}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-in-production/", {}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-finishing/", {}, format="json").status_code, 200)
+        self.assertEqual(self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-ready/", {}, format="json").status_code, 200)
+        completed = self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-completed/", {}, format="json")
+
+        self.assertEqual(completed.status_code, 200)
+        self.managed_job.refresh_from_db()
+        self.assertEqual(self.managed_job.status, "completed")
+        self.assertTrue(JobSettlementSplit.objects.filter(managed_job=self.managed_job).exists())
+
+    def test_invalid_transition_returns_400_and_random_shop_is_blocked(self):
+        self.client.force_authenticate(user=self.owner)
+        invalid_response = self.client.post(f"/api/job-assignments/{self.assignment.id}/mark-finishing/", {}, format="json")
+        self.assertEqual(invalid_response.status_code, 400)
+        self.assertIn("start finishing", invalid_response.json()["detail"])
+
+        self.client.force_authenticate(user=self.other_owner)
+        forbidden_response = self.client.post(f"/api/job-assignments/{self.assignment.id}/accept/", {}, format="json")
+        self.assertEqual(forbidden_response.status_code, 403)
+
+
 class ManagedJobAuditEventTestCase(TestCase):
     def setUp(self):
         self.client_user = User.objects.create_user(email="audit-client@test.com", password="pass12345", role="client")
