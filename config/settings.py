@@ -244,37 +244,6 @@ ADMIN_NOTIFY_EMAIL = os.environ.get("ADMIN_NOTIFY_EMAIL", "hello.printyke@gmail.
 
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
 
-if not DEBUG:
-    if _is_placeholder_secret(SECRET_KEY):
-        raise ImproperlyConfigured(
-            "SECRET_KEY must be replaced with a real secret when DEBUG=False."
-        )
-    if not ALLOWED_HOSTS or not _contains_production_host(ALLOWED_HOSTS):
-        raise ImproperlyConfigured(
-            "ALLOWED_HOSTS must include the real production hosts when DEBUG=False."
-        )
-    if not CSRF_TRUSTED_ORIGINS or not all(
-        origin.startswith("https://") for origin in CSRF_TRUSTED_ORIGINS
-    ):
-        raise ImproperlyConfigured(
-            "CSRF_TRUSTED_ORIGINS must contain HTTPS origins when DEBUG=False."
-        )
-    if not CORS_ALLOWED_ORIGINS or not all(
-        origin.startswith("https://") for origin in CORS_ALLOWED_ORIGINS
-    ):
-        raise ImproperlyConfigured(
-            "CORS_ALLOWED_ORIGINS must contain HTTPS origins when DEBUG=False."
-        )
-    parsed_frontend_url = FRONTEND_URL.lower()
-    if not parsed_frontend_url or "localhost" in parsed_frontend_url or "127.0.0.1" in parsed_frontend_url:
-        raise ImproperlyConfigured(
-            "FRONTEND_URL must point to the real frontend domain when DEBUG=False."
-        )
-    if not parsed_frontend_url.startswith("https://"):
-        raise ImproperlyConfigured(
-            "FRONTEND_URL must use HTTPS when DEBUG=False."
-        )
-
 EMAIL_CONFIRMATION_URL = f"{FRONTEND_URL}/auth/confirm-email"
 PASSWORD_RESET_URL = f"{FRONTEND_URL}/auth/reset-password"
 
@@ -310,6 +279,37 @@ CORS_ALLOW_HEADERS = [
 ]
 
 CORS_EXPOSE_HEADERS = ["authorization", "content-type"]
+
+if not DEBUG:
+    if _is_placeholder_secret(SECRET_KEY):
+        raise ImproperlyConfigured(
+            "SECRET_KEY must be replaced with a real secret when DEBUG=False."
+        )
+    if not ALLOWED_HOSTS or not _contains_production_host(ALLOWED_HOSTS):
+        raise ImproperlyConfigured(
+            "ALLOWED_HOSTS must include the real production hosts when DEBUG=False."
+        )
+    if not CSRF_TRUSTED_ORIGINS or not all(
+        origin.startswith("https://") for origin in CSRF_TRUSTED_ORIGINS
+    ):
+        raise ImproperlyConfigured(
+            "CSRF_TRUSTED_ORIGINS must contain HTTPS origins when DEBUG=False."
+        )
+    if not CORS_ALLOWED_ORIGINS or not all(
+        origin.startswith("https://") for origin in CORS_ALLOWED_ORIGINS
+    ):
+        raise ImproperlyConfigured(
+            "CORS_ALLOWED_ORIGINS must contain HTTPS origins when DEBUG=False."
+        )
+    parsed_frontend_url = FRONTEND_URL.lower()
+    if not parsed_frontend_url or "localhost" in parsed_frontend_url or "127.0.0.1" in parsed_frontend_url:
+        raise ImproperlyConfigured(
+            "FRONTEND_URL must point to the real frontend domain when DEBUG=False."
+        )
+    if not parsed_frontend_url.startswith("https://"):
+        raise ImproperlyConfigured(
+            "FRONTEND_URL must use HTTPS when DEBUG=False."
+        )
 
 if not DEBUG:
     SESSION_COOKIE_SAMESITE = "None"
