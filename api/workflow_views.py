@@ -17,7 +17,7 @@ from accounts.models import User, UserProfile
 from accounts.services.capabilities import has_capability
 from accounts.services.roles import CANONICAL_PARTNER_ROLE, is_client, resolve_user_roles
 from accounts.services.system_accounts import get_printy_manager_user, is_system_account
-from .visibility import CLIENT_ACTOR, TOPOLOGY_MANAGED, project_identity
+from .visibility import CLIENT_ACTOR, TOPOLOGY_MANAGED, project_identity, project_public_marketplace_response
 from notifications.models import Notification
 from notifications.services import notify_quote_event
 from jobs.managed_services import create_assignment_for_managed_job, create_managed_job_from_accepted_quote
@@ -106,7 +106,6 @@ from .workflow_serializers import (
     QuoteConversationMessageSerializer,
     ShopResponseReplySerializer,
 )
-from .public_matching_serializers import PublicCalculatorResponseSerializer
 
 logger = logging.getLogger("api.workflow")
 _MANAGER_ACTIVITY_LOOKBACK_DAYS = 30
@@ -928,7 +927,7 @@ class CalculatorConfigPreviewView(APIView):
         serializer = CalculatorConfigPreviewSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         response = build_public_calculator_preview(serializer.validated_data)
-        return Response(PublicCalculatorResponseSerializer(response).data)
+        return Response(project_public_marketplace_response(response))
 
 
 class BookletCalculatorPreviewView(APIView):

@@ -265,28 +265,19 @@ class PricingBreakdownSerializer(serializers.Serializer):
 
 
 class PublicMatchShopSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    shop_id = serializers.IntegerField()
-    name = serializers.CharField()
-    shop_name = serializers.CharField()
-    slug = serializers.CharField()
-    shop_slug = serializers.CharField()
+    option_label = serializers.CharField()
+    can_produce = serializers.BooleanField(required=False)
     currency = serializers.CharField(required=False, allow_blank=True)
-    can_calculate = serializers.BooleanField()
-    can_price_now = serializers.BooleanField()
-    can_send_quote_request = serializers.BooleanField()
-    reason = serializers.CharField()
-    summary = serializers.CharField()
+    can_calculate = serializers.BooleanField(required=False)
+    can_price_now = serializers.BooleanField(required=False)
+    can_send_quote_request = serializers.BooleanField(required=False)
+    reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    summary = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     missing_fields = serializers.ListField(child=serializers.CharField(), default=list)
     missing_specs = serializers.ListField(child=serializers.CharField(), default=list, source="missing_fields")
-    similarity_score = serializers.FloatField(required=False)
-    match_score = serializers.FloatField(required=False)
-    confidence_score = serializers.FloatField(required=False)
     match_type = serializers.CharField(required=False)
     price_confidence = serializers.CharField(required=False, allow_null=True)
     quote_basis = serializers.CharField(required=False)
-    distance_km = serializers.FloatField(required=False, allow_null=True)
-    total = serializers.CharField(required=False, allow_null=True)
     preview = serializers.JSONField(required=False, allow_null=True)
     turnaround_hours = serializers.IntegerField(required=False, allow_null=True)
     estimated_working_hours = serializers.IntegerField(required=False, allow_null=True)
@@ -300,11 +291,12 @@ class PublicMatchShopSerializer(serializers.Serializer):
     needs_confirmation = serializers.ListField(child=serializers.CharField(), default=list)
     closest_alternatives = serializers.ListField(child=serializers.JSONField(), default=list)
     alternative_suggestions = serializers.ListField(child=serializers.JSONField(), default=list, source="closest_alternatives")
-    estimated_price = serializers.FloatField(required=False, allow_null=True)
     price_range = serializers.JSONField(required=False, allow_null=True)
-    distance_label = serializers.CharField(required=False, allow_null=True)
     production_preview = ProductionPreviewSerializer(required=False, allow_null=True)
-    pricing_breakdown = PricingBreakdownSerializer(required=False, allow_null=True)
+    pricing_breakdown = serializers.SerializerMethodField()
+
+    def get_pricing_breakdown(self, obj):
+        return None
 
 
 class PublicCalculatorResponseSerializer(serializers.Serializer):
@@ -329,7 +321,7 @@ class PublicCalculatorResponseSerializer(serializers.Serializer):
     shop_matches = PublicMatchShopSerializer(many=True, required=False, source="matches")
     fixed_shop_preview = PublicMatchShopSerializer(required=False, allow_null=True)
     production_preview = ProductionPreviewSerializer(required=False, allow_null=True)
-    pricing_breakdown = PricingBreakdownSerializer(required=False, allow_null=True)
+    pricing_breakdown = serializers.SerializerMethodField()
     missing_requirements = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     missing_fields = serializers.ListField(child=serializers.CharField(), required=False, default=list, source="missing_requirements")
     unsupported_reasons = serializers.ListField(child=serializers.CharField(), required=False, default=list)
@@ -338,3 +330,6 @@ class PublicCalculatorResponseSerializer(serializers.Serializer):
     exact_or_estimated = serializers.BooleanField(required=False, default=False)
     warnings = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     visibility = serializers.JSONField(required=False, allow_null=True)
+
+    def get_pricing_breakdown(self, obj):
+        return None

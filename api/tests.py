@@ -4474,8 +4474,13 @@ class PublicMatchShopsAPITestCase(TestCase):
         payload = response.json()
         self.assertIn("matches", payload)
         self.assertTrue(payload["matches"])
-        self.assertEqual(payload["matches"][0]["slug"], "large-shop")
-        self.assertEqual(payload["shops"][0]["slug"], "large-shop")
+        self.assertEqual(payload["matches"][0]["option_label"], "Production option 1")
+        self.assertNotIn("slug", payload["matches"][0])
+        self.assertNotIn("shop_slug", payload["matches"][0])
+        self.assertNotIn("name", payload["matches"][0])
+        self.assertNotIn("shop_name", payload["matches"][0])
+        self.assertNotIn("shop_id", payload["matches"][0])
+        self.assertNotIn("slug", payload["shops"][0])
 
     def test_large_format_public_match_excludes_flat_only_shops(self):
         response = self.client.post(
@@ -4492,9 +4497,15 @@ class PublicMatchShopsAPITestCase(TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        slugs = [match["slug"] for match in response.json()["matches"]]
-        self.assertIn("large-shop", slugs)
-        self.assertNotIn("flat-shop", slugs)
+        payload = response.json()
+        self.assertTrue(payload["matches"])
+        for match in payload["matches"]:
+            self.assertNotIn("slug", match)
+            self.assertNotIn("shop_slug", match)
+            self.assertNotIn("name", match)
+            self.assertNotIn("shop_name", match)
+            self.assertNotIn("shop_id", match)
+        self.assertEqual(payload["matches_count"], len(payload["matches"]))
 
     def test_public_match_scrubs_raw_pricing_details(self):
         response = self.client.post(
@@ -4520,6 +4531,10 @@ class PublicMatchShopsAPITestCase(TestCase):
         self.assertTrue(payload["matches"])
         self.assertIsNotNone(payload["matches"][0]["preview"])
         self.assertNotIn("selection", payload["matches"][0])
+        self.assertIsNone(payload["matches"][0]["pricing_breakdown"])
+        self.assertNotIn("base_price", payload["matches"][0])
+        self.assertNotIn("production_cost", payload["matches"][0])
+        self.assertNotIn("shop_payout", payload["matches"][0])
 
 
 class PartnerProductionMatchAPITestCase(TestCase):
@@ -4719,6 +4734,11 @@ class PartnerProductionMatchAPITestCase(TestCase):
         payload = response.json()
         self.assertTrue(payload["matches"])
         self.assertNotIn("production_cost", payload["matches"][0])
+        self.assertNotIn("shop_id", payload["matches"][0])
+        self.assertNotIn("name", payload["matches"][0])
+        self.assertNotIn("shop_name", payload["matches"][0])
+        self.assertNotIn("slug", payload["matches"][0])
+        self.assertNotIn("shop_slug", payload["matches"][0])
         self.assertFalse(payload["visibility"]["exposes_internal_economics"])
 
 
@@ -4809,6 +4829,18 @@ class ClientVisibilitySerializerTestCase(TestCase):
         payload = response.json()
         self.assertNotIn("pricing_snapshot", payload["items"][0])
         self.assertNotIn("pricing_snapshot", payload["request_snapshot"])
+        self.assertNotIn("selected_shop_ids", payload["request_snapshot"])
+        self.assertNotIn("selected_shop", payload["request_snapshot"])
+        self.assertEqual(
+            payload["request_snapshot"]["production_source_label"],
+            "Production source selected by your Print Manager",
+        )
+        self.assertNotIn("id", payload["request_snapshot"]["selected_shop_preview"])
+        self.assertNotIn("shop_id", payload["request_snapshot"]["selected_shop_preview"])
+        self.assertNotIn("name", payload["request_snapshot"]["selected_shop_preview"])
+        self.assertNotIn("shop_name", payload["request_snapshot"]["selected_shop_preview"])
+        self.assertNotIn("slug", payload["request_snapshot"]["selected_shop_preview"])
+        self.assertNotIn("shop_slug", payload["request_snapshot"]["selected_shop_preview"])
         self.assertNotIn("preview", payload["request_snapshot"]["selected_shop_preview"])
         self.assertNotIn("selection", payload["request_snapshot"]["selected_shop_preview"])
         self.assertIsNone(payload["request_snapshot"]["pricing_preview_snapshot"])
@@ -5538,7 +5570,12 @@ class CalculatorConfigContractAPITestCase(TestCase):
         first_match = data["shop_matches"][0]
         self.assertIn("missing_specs", first_match)
         self.assertIn("alternative_suggestions", first_match)
-        self.assertEqual(first_match["name"], "Verified Print Partner")
+        self.assertEqual(first_match["option_label"], "Production option 1")
+        self.assertNotIn("name", first_match)
+        self.assertNotIn("shop_name", first_match)
+        self.assertNotIn("shop_id", first_match)
+        self.assertNotIn("slug", first_match)
+        self.assertNotIn("shop_slug", first_match)
         self.assertIsNone(first_match["pricing_breakdown"])
         self.assertNotIn("pricing_breakdown", first_match["preview"])
 

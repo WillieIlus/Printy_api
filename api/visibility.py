@@ -356,7 +356,7 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
     source_label = response.get("source_label")
     raw_matches = _as_list(response.get("matches"))
     projected_matches = []
-    for match in raw_matches:
+    for index, match in enumerate(raw_matches, start=1):
         if not isinstance(match, dict):
             continue
         projected_preview = project_public_preview(match.get("preview")) or {}
@@ -373,17 +373,42 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
             include_identity=False,
             topology_mode=TOPOLOGY_MANAGED,
         )
-        projected.update(
+        projected_matches.append(
             {
-                "shop_id": match.get("shop_id"),
-                "name": match.get("name"),
-                "shop_name": match.get("shop_name"),
-                "slug": match.get("slug"),
-                "shop_slug": match.get("shop_slug"),
+                "option_label": f"Production option {index}",
+                "can_produce": bool(
+                    match.get("can_produce")
+                    or match.get("can_calculate")
+                    or match.get("can_price_now")
+                ),
+                "can_calculate": match.get("can_calculate"),
+                "can_price_now": match.get("can_price_now"),
+                "can_send_quote_request": match.get("can_send_quote_request"),
+                "currency": match.get("currency"),
+                "reason": match.get("reason"),
+                "summary": match.get("summary"),
+                "missing_fields": _as_list(match.get("missing_fields")),
+                "missing_specs": _as_list(match.get("missing_specs") or match.get("missing_fields")),
+                "match_type": match.get("match_type"),
+                "price_confidence": match.get("price_confidence"),
+                "quote_basis": match.get("quote_basis"),
+                "turnaround_hours": match.get("turnaround_hours"),
+                "estimated_working_hours": match.get("estimated_working_hours"),
+                "estimated_ready_at": match.get("estimated_ready_at"),
+                "human_ready_text": match.get("human_ready_text"),
+                "turnaround_label": match.get("turnaround_label"),
+                "exact_or_estimated": match.get("exact_or_estimated"),
+                "product_match": match.get("product_match"),
+                "matched_specs": _as_list(match.get("matched_specs")),
+                "needs_confirmation": _as_list(match.get("needs_confirmation")),
+                "closest_alternatives": _as_list(match.get("closest_alternatives")),
+                "alternative_suggestions": _as_list(match.get("alternative_suggestions") or match.get("closest_alternatives")),
+                "price_range": match.get("price_range"),
                 "preview": projected_preview or None,
+                "production_preview": projected.get("production_preview"),
+                "pricing_breakdown": None,
             }
         )
-        projected_matches.append(projected)
 
     # Public shape strictly returns market range and confidence
     market_range = {
@@ -404,6 +429,9 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
     return {
         "mode": response.get("mode"),
         "can_calculate": response.get("can_calculate"),
+        "product_type": response.get("product_type"),
+        "price_mode": response.get("price_mode"),
+        "total": response.get("total"),
         "matches_count": response.get("matches_count") or len(projected_matches),
         "matches": projected_matches,
         "shops": projected_matches,
@@ -423,6 +451,7 @@ def project_public_marketplace_response(payload: dict[str, Any] | None) -> dict[
         "production_summary": production_preview,
         "pricing_breakdown": None,
         "missing_requirements": _as_list(response.get("missing_requirements")),
+        "missing_fields": _as_list(response.get("missing_requirements")),
         "unsupported_reasons": _as_list(response.get("unsupported_reasons")),
         "summary": response.get("summary"),
         "suggestions": _as_list(response.get("suggestions")),
@@ -443,6 +472,42 @@ def project_request_snapshot_for_client(payload: dict[str, Any] | None) -> dict[
         return None
     topology_mode = resolve_topology_mode_from_snapshot(snapshot)
     selected_shop_preview = snapshot.get("selected_shop_preview")
+    projected_selected_shop_preview = None
+    if isinstance(selected_shop_preview, dict):
+        projected_preview = project_match_summary(selected_shop_preview, actor=CLIENT_ACTOR, topology_mode=topology_mode)
+        projected_selected_shop_preview = {
+            "option_label": "Production source selected by your Print Manager",
+            "can_produce": bool(
+                selected_shop_preview.get("can_produce")
+                or selected_shop_preview.get("can_calculate")
+                or selected_shop_preview.get("can_price_now")
+            ),
+            "can_calculate": selected_shop_preview.get("can_calculate"),
+            "can_price_now": selected_shop_preview.get("can_price_now"),
+            "can_send_quote_request": selected_shop_preview.get("can_send_quote_request"),
+            "currency": selected_shop_preview.get("currency"),
+            "reason": selected_shop_preview.get("reason"),
+            "summary": selected_shop_preview.get("summary"),
+            "missing_fields": _as_list(selected_shop_preview.get("missing_fields")),
+            "missing_specs": _as_list(selected_shop_preview.get("missing_specs") or selected_shop_preview.get("missing_fields")),
+            "match_type": selected_shop_preview.get("match_type"),
+            "price_confidence": selected_shop_preview.get("price_confidence"),
+            "quote_basis": selected_shop_preview.get("quote_basis"),
+            "turnaround_hours": selected_shop_preview.get("turnaround_hours"),
+            "estimated_working_hours": selected_shop_preview.get("estimated_working_hours"),
+            "estimated_ready_at": selected_shop_preview.get("estimated_ready_at"),
+            "human_ready_text": selected_shop_preview.get("human_ready_text"),
+            "turnaround_label": selected_shop_preview.get("turnaround_label"),
+            "exact_or_estimated": selected_shop_preview.get("exact_or_estimated"),
+            "product_match": selected_shop_preview.get("product_match"),
+            "matched_specs": _as_list(selected_shop_preview.get("matched_specs")),
+            "needs_confirmation": _as_list(selected_shop_preview.get("needs_confirmation")),
+            "closest_alternatives": _as_list(selected_shop_preview.get("closest_alternatives")),
+            "alternative_suggestions": _as_list(selected_shop_preview.get("alternative_suggestions") or selected_shop_preview.get("closest_alternatives")),
+            "price_range": selected_shop_preview.get("price_range"),
+            "production_preview": projected_preview.get("production_preview"),
+            "pricing_breakdown": None,
+        }
     return {
         "draft_reference": snapshot.get("draft_reference"),
         "partner_brand_name": snapshot.get("partner_brand_name"),
@@ -450,27 +515,12 @@ def project_request_snapshot_for_client(payload: dict[str, Any] | None) -> dict[
         "calculator_inputs": _as_dict(snapshot.get("calculator_inputs")),
         "request_details": _as_dict(snapshot.get("request_details")),
         "custom_product_snapshot": _as_dict(snapshot.get("custom_product_snapshot")),
-        "selected_shop_ids": _as_list(snapshot.get("selected_shop_ids")),
-        "selected_shop": {
-            **_as_dict(snapshot.get("selected_shop")),
-            "name": project_shop_identity(
-                _as_dict(snapshot.get("selected_shop")).get("name"),
-                actor=CLIENT_ACTOR,
-                topology_mode=topology_mode,
-            ),
-            "slug": _as_dict(snapshot.get("selected_shop")).get("slug")
-            if can_actor_view_shop_name(actor=CLIENT_ACTOR, topology_mode=topology_mode)
-            else "partner",
-        },
+        "production_source_label": "Production source selected by your Print Manager",
         "matched_specs": _as_list(snapshot.get("matched_specs")),
         "needs_confirmation": _as_list(snapshot.get("needs_confirmation")),
         "production_preview_snapshot": project_production_intelligence(snapshot.get("production_preview_snapshot")),
         "pricing_preview_snapshot": project_pricing_breakdown(snapshot.get("pricing_preview_snapshot"), actor=CLIENT_ACTOR),
-        "selected_shop_preview": (
-            project_match_summary(selected_shop_preview, actor=CLIENT_ACTOR, topology_mode=topology_mode)
-            if isinstance(selected_shop_preview, dict)
-            else None
-        ),
+        "selected_shop_preview": projected_selected_shop_preview,
         "customer_pricing": _as_dict(snapshot.get("customer_pricing")),
         "visibility": {
             "actor": CLIENT_ACTOR,

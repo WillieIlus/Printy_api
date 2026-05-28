@@ -11,10 +11,10 @@ from services.public_matching import (
 )
 from shops.models import Shop
 
+from .visibility import project_public_marketplace_response
 from .public_matching_serializers import (
     PublicBookletMatchPayloadSerializer,
     PublicCalculatorPayloadSerializer,
-    PublicCalculatorResponseSerializer,
 )
 
 
@@ -38,7 +38,7 @@ class PublicMatchShopsView(APIView):
         serializer = PublicCalculatorPayloadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         response = get_marketplace_matches(serializer.validated_data)
-        return Response(PublicCalculatorResponseSerializer(response).data)
+        return Response(project_public_marketplace_response(response))
 
 
 class PublicMatchBookletShopsView(APIView):
@@ -49,7 +49,7 @@ class PublicMatchBookletShopsView(APIView):
         serializer = PublicBookletMatchPayloadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         response = get_booklet_marketplace_matches(serializer.validated_data)
-        return Response(PublicCalculatorResponseSerializer(response).data)
+        return Response(project_public_marketplace_response(response))
 
 
 class PublicShopCalculatorPreviewView(APIView):
@@ -72,4 +72,4 @@ class PublicShopCalculatorPreviewView(APIView):
         serializer = PublicCalculatorPayloadSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         response = get_shop_specific_preview(shop, serializer.validated_data)
-        return Response(PublicCalculatorResponseSerializer(response).data)
+        return Response(project_public_marketplace_response(response))
