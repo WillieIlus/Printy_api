@@ -1625,6 +1625,20 @@ class ManagedJobVisibilityEndpointsTestCase(TestCase):
         self.assertFalse(self.managed_job.artwork_required)
         self.assertTrue(JobFile.objects.filter(managed_job=self.managed_job, file_type="artwork").exists())
 
+        files_response = self.client.get(f"/api/managed-jobs/{self.managed_job.id}/files/")
+        self.assertEqual(files_response.status_code, 200)
+        self.assertEqual(files_response.json()[0]["original_filename"], "client-artwork.pdf")
+
+    def test_client_artwork_upload_rejects_invalid_file_type(self):
+        self.client.force_authenticate(user=self.client_user)
+        response = self.client.post(
+            f"/api/managed-jobs/{self.managed_job.id}/files/artwork/",
+            {"file": SimpleUploadedFile("client-artwork.txt", b"artwork", content_type="text/plain")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["detail"], "Unsupported artwork file type. Upload JPG, PNG, PDF, AI, or EPS.")
+
 
 class ManagedJobPublicTrackingTestCase(TestCase):
     def setUp(self):

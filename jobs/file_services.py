@@ -27,6 +27,10 @@ from notifications.services import notify
 from quotes.models import QuoteRequest, QuoteRequestAttachment, ShopQuote, ShopQuoteAttachment
 
 
+ALLOWED_ARTWORK_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf", ".ai", ".eps"}
+MAX_ARTWORK_FILE_BYTES = 50 * 1024 * 1024
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
@@ -47,6 +51,19 @@ def _stored_name(file_field: Any) -> str | None:
         return None
     name = getattr(file_field, "name", "") or None
     return name or None
+
+
+def validate_artwork_upload_file(*, file, original_filename: str = "") -> str:
+    filename = os.path.basename(original_filename or getattr(file, "name", "") or "")
+    extension = os.path.splitext(filename)[1].lower()
+    if extension not in ALLOWED_ARTWORK_EXTENSIONS:
+        raise ValueError("Unsupported artwork file type. Upload JPG, PNG, PDF, AI, or EPS.")
+    size = int(getattr(file, "size", 0) or 0)
+    if size <= 0:
+        raise ValueError("Artwork file is empty. Choose another file.")
+    if size > MAX_ARTWORK_FILE_BYTES:
+        raise ValueError("Artwork files must be 50MB or smaller.")
+    return filename
 
 
 def managed_job_has_artwork(*, managed_job: ManagedJob) -> bool:
@@ -427,6 +444,7 @@ def get_visible_job_files_for_actor(
                 JobFileVisibility.PARTNER,
             ],
             file_type__in=[
+                JobFileType.ARTWORK,
                 JobFileType.CUSTOMER_UPLOAD,
                 JobFileType.PROOF,
                 JobFileType.DELIVERY_EVIDENCE,
@@ -491,12 +509,13 @@ def upload_artwork_for_managed_job(
     original_filename: str = "",
     notes: str = "Artwork uploaded for production.",
 ) -> JobFile:
+    validated_filename = validate_artwork_upload_file(file=file, original_filename=original_filename)
     job_file = create_job_file(
         managed_job=managed_job,
         assignment=assignment,
         uploaded_by=uploaded_by,
         file=file,
-        original_filename=original_filename,
+        original_filename=validated_filename,
         file_type=JobFileType.ARTWORK,
         visibility=JobFileVisibility.CLIENT,
         status=JobFileStatus.UPLOADED,

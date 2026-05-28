@@ -467,14 +467,17 @@ class ManagedJobArtworkUploadView(APIView):
         if upload is None:
             return Response({"detail": _("An artwork file is required.")}, status=status.HTTP_400_BAD_REQUEST)
         assignment = managed_job.assignments.filter(reassigned_from__isnull=True).first()
-        job_file = upload_artwork_for_managed_job(
-            managed_job=managed_job,
-            assignment=assignment,
-            uploaded_by=request.user,
-            file=upload,
-            original_filename=getattr(upload, "name", ""),
-            notes=request.data.get("note", "") or "Artwork uploaded for production.",
-        )
+        try:
+            job_file = upload_artwork_for_managed_job(
+                managed_job=managed_job,
+                assignment=assignment,
+                uploaded_by=request.user,
+                file=upload,
+                original_filename=getattr(upload, "name", ""),
+                notes=request.data.get("note", "") or "Artwork uploaded for production.",
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(JobFileSerializer(job_file, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
