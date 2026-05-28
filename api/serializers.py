@@ -431,6 +431,13 @@ class FavoriteShopCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Shop must be active.")
         return value
 
+    def validate(self, attrs):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if getattr(user, "role", "") == "client":
+            raise serializers.ValidationError("Client accounts cannot be linked directly to shops.")
+        return attrs
+
 
 class ShopRatingSerializer(serializers.ModelSerializer):
     """Create/update shop rating (buyer)."""

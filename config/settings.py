@@ -228,6 +228,7 @@ SOCIALACCOUNT_PROVIDERS = {
 
 EMAIL_BACKEND = os.environ.get(
     "EMAIL_BACKEND",
+    # Local default only. Production must set SMTP credentials in .env.
     "django.core.mail.backends.console.EmailBackend",
 )
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
@@ -340,6 +341,7 @@ MPESA_BASE_URL = _get_env(
 MPESA_CONSUMER_KEY = _get_env("MPESA_CONSUMER_KEY", default="")
 MPESA_CONSUMER_SECRET = _get_env("MPESA_CONSUMER_SECRET", default="")
 MPESA_SHORTCODE = _get_env("MPESA_SHORTCODE", default="")
+MPESA_SHORTCODE_TYPE = _get_env("MPESA_SHORTCODE_TYPE", default="paybill")
 MPESA_PASSKEY = _get_env("MPESA_PASSKEY", default="")
 MPESA_INITIATOR_NAME = _get_env("MPESA_INITIATOR_NAME", default="")
 MPESA_INITIATOR_PASSWORD = _get_env("MPESA_INITIATOR_PASSWORD", default="")

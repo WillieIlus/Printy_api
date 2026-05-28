@@ -1,4 +1,5 @@
 from decimal import Decimal, InvalidOperation
+import logging
 
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives
@@ -7,6 +8,8 @@ from django.utils import timezone
 
 from api.visibility import CLIENT_ACTOR, project_identity
 from quotes.models import QuoteRequestMessage
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_email_error(exc: Exception) -> str:
@@ -328,6 +331,13 @@ def create_quote_message(
             _send_email_for_message(message)
         except Exception as exc:
             error_text = _safe_email_error(exc)
+            logger.warning(
+                "Quote message email failed for quote_request=%s recipient=%s type=%s: %s",
+                quote_request.id,
+                message.recipient_email,
+                message.message_type,
+                error_text,
+            )
             message.email_status = QuoteRequestMessage.EmailStatus.FAILED
             message.email_error = error_text
             message.email_sent = False

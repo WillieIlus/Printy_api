@@ -337,6 +337,9 @@ class InitiateStkPushServiceTest(TestCase):
         self.assertEqual(txn.checkout_request_id, "CHK123")
         self.assertEqual(txn.phone_number, "254712345678")
         self.assertIsNotNone(txn.raw_request)
+        self.assertEqual(txn.raw_request["TransactionType"], "CustomerPayBillOnline")
+        self.assertTrue(txn.raw_request["AccountReference"])
+        self.assertEqual(txn.raw_request["PartyB"], txn.raw_request["BusinessShortCode"])
         self.assertEqual(txn.raw_response["CheckoutRequestID"], "CHK123")
 
 
@@ -378,6 +381,9 @@ class SandboxTestStkServiceTest(TestCase):
         self.assertEqual(txn.phone_number, "254712345678")
         self.assertEqual(txn.status, PaymentTransaction.STATUS_PROCESSING)
         self.assertEqual(txn.raw_request["Amount"], 1)
+        self.assertEqual(txn.raw_request["TransactionType"], "CustomerPayBillOnline")
+        self.assertTrue(txn.raw_request["AccountReference"])
+        self.assertEqual(txn.raw_request["PartyB"], txn.raw_request["BusinessShortCode"])
 
     @override_settings(
         MPESA_ENV="production",

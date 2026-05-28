@@ -21,6 +21,7 @@ from accounts.services.roles import (
     is_super_admin,
     resolve_user_roles,
 )
+from accounts.services.capabilities import has_capability
 from accounts.models import UserProfile
 from api.services.admin_dashboard import build_admin_dashboard_payload
 from api.visibility import project_shop_identity
@@ -696,7 +697,15 @@ class ClientPaymentListView(BaseRoleDetailView):
         )
 
 
-class PartnerQuoteListDetailView(BaseRoleDetailView):
+class ManagerCapablePartnerQuoteView(BaseRoleDetailView):
+    def has_dashboard_access(self, user) -> bool:
+        return super().has_dashboard_access(user) or (
+            has_capability(user, "can_manage_clients")
+            or has_capability(user, "can_source_jobs")
+        )
+
+
+class PartnerQuoteListDetailView(ManagerCapablePartnerQuoteView):
     dashboard_role = "partner"
     allowed_roles = (CANONICAL_PARTNER_ROLE,)
 
@@ -722,7 +731,7 @@ class PartnerQuoteListDetailView(BaseRoleDetailView):
         return Response({"role": "partner", "results": [self._quote_row(item, request=request) for item in self.get_queryset(request)]})
 
 
-class PartnerQuoteSendToClientView(BaseRoleDetailView):
+class PartnerQuoteSendToClientView(ManagerCapablePartnerQuoteView):
     dashboard_role = "partner"
     allowed_roles = (CANONICAL_PARTNER_ROLE,)
 
@@ -920,7 +929,7 @@ class PartnerQuoteAttachClientView(BaseRoleDetailView):
         )
 
 
-class PartnerAssignedRequestQuoteCreateView(BaseRoleDetailView):
+class PartnerAssignedRequestQuoteCreateView(ManagerCapablePartnerQuoteView):
     dashboard_role = "partner"
     allowed_roles = (CANONICAL_PARTNER_ROLE,)
 
@@ -957,7 +966,7 @@ class PartnerAssignedRequestQuoteCreateView(BaseRoleDetailView):
         )
 
 
-class PartnerAssignedRequestShopOptionsView(BaseRoleDetailView):
+class PartnerAssignedRequestShopOptionsView(ManagerCapablePartnerQuoteView):
     dashboard_role = "partner"
     allowed_roles = (CANONICAL_PARTNER_ROLE,)
 
@@ -1095,16 +1104,30 @@ class PartnerClientListView(BaseRoleDetailView):
     allowed_roles = (CANONICAL_PARTNER_ROLE,)
 
     def get(self, request):
+        search = str(request.query_params.get("search") or "").strip()
         rows: list[dict[str, object]] = []
         seen_client_ids: set[int] = set()
 
-        saved_clients = PartnerClient.objects.filter(partner=request.user).select_related("client_user").order_by("name", "id")
+        saved_clients = PartnerClient.objects.filter(partner=request.user).select_related("client_user")
+        if search:
+            saved_clients = saved_clients.filter(
+                Q(name__icontains=search)
+                | Q(email__icontains=search)
+                | Q(client_user__name__icontains=search)
+                | Q(client_user__email__icontains=search)
+            )
+        saved_clients = saved_clients.order_by("name", "id")
         for record in saved_clients:
             if record.client_user_id:
                 seen_client_ids.add(record.client_user_id)
-            rows.append(_partner_client_row(record))
+            row = _partner_client_row(record)
+            if search and record.client_user_id:
+                row["id"] = record.client_user_id
+            rows.append(row)
 
         jobs = ManagedJob.objects.filter(broker=request.user, client_id__isnull=False).select_related("client")
+        if search:
+            jobs = jobs.filter(Q(client__name__icontains=search) | Q(client__email__icontains=search))
         for job in jobs:
             if not job.client_id or job.client_id in seen_client_ids:
                 continue
@@ -1120,6 +1143,28 @@ class PartnerClientListView(BaseRoleDetailView):
                     "is_new": False,
                 }
             )
+        if search:
+            User = get_user_model()
+            client_users = (
+                User.objects.filter(role=User.Role.CLIENT, is_active=True)
+                .filter(Q(name__icontains=search) | Q(email__icontains=search))
+                .order_by("name", "email", "id")[:20]
+            )
+            for client_user in client_users:
+                if client_user.id in seen_client_ids:
+                    continue
+                seen_client_ids.add(client_user.id)
+                rows.append(
+                    {
+                        "id": client_user.id,
+                        "client_id": client_user.id,
+                        "name": getattr(client_user, "name", "") or getattr(client_user, "email", "") or "Client",
+                        "phone": "",
+                        "email": getattr(client_user, "email", "") or "",
+                        "company": "",
+                        "is_new": False,
+                    }
+                )
         return Response({"role": "partner", "results": rows})
 
     @transaction.atomic

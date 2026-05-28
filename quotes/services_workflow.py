@@ -1,5 +1,6 @@
 """Canonical draft/request/response workflow services."""
 
+import logging
 import secrets
 
 from django.conf import settings
@@ -23,6 +24,8 @@ from api.visibility import (
     resolve_topology_mode_for_quote_request,
 )
 from pricing.models import FinishingRate, Material
+
+logger = logging.getLogger(__name__)
 from quotes.choices import QuoteDraftStatus, QuoteStatus, ShopQuoteStatus
 from quotes.messaging import create_quote_message
 from quotes.models import (
@@ -661,16 +664,24 @@ def send_quote_draft_to_shops(*, draft: QuoteDraft, shops: list[Shop], request_d
                     from django.conf import settings
                     from django.core.mail import send_mail
 
-                    send_mail(
-                        subject="Upload your artwork to keep your Printy request moving",
-                        message=(
-                            "Your quote request was sent. Don't forget to upload your artwork so production can begin "
-                            "as soon as you accept a quote."
-                        ),
-                        from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
-                        recipient_list=[draft.user.email],
-                        fail_silently=True,
-                    )
+                    try:
+                        send_mail(
+                            subject="Upload your artwork to keep your Printy request moving",
+                            message=(
+                                "Your quote request was sent. Don't forget to upload your artwork so production can begin "
+                                "as soon as you accept a quote."
+                            ),
+                            from_email=getattr(settings, "DEFAULT_FROM_EMAIL", None),
+                            recipient_list=[draft.user.email],
+                            fail_silently=False,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to send missing-artwork reminder for quote_draft=%s user=%s",
+                            draft.id,
+                            getattr(draft.user, "email", ""),
+                            exc_info=True,
+                        )
             created_requests.append(quote_request)
             draft.status = QuoteDraftStatus.SENT
             draft.save(update_fields=["status", "updated_at"])

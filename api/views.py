@@ -1352,7 +1352,7 @@ class MeFavoritesViewSet(viewsets.ViewSet):
         return Response(serializer.data)
 
     def create(self, request):
-        serializer = FavoriteShopCreateSerializer(data=request.data)
+        serializer = FavoriteShopCreateSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         shop = serializer.validated_data["shop"]
         fav, created = FavoriteShop.objects.get_or_create(
@@ -1387,6 +1387,11 @@ class ShopRateView(APIView):
     def post(self, request, shop_id):
         shop = get_object_or_404(Shop, pk=shop_id, is_active=True)
         user = request.user
+        if getattr(user, "role", "") == "client":
+            return Response(
+                {"detail": "Client accounts cannot be linked directly to shops."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         has_eligible_quote = QuoteRequest.objects.filter(
             shop=shop,
             created_by=user,

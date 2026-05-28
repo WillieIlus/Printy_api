@@ -8,6 +8,7 @@ from django.utils.translation import gettext_lazy as _
 from common.models import TimeStampedModel
 from inventory.choices import SheetSize
 from inventory.models import Machine, ProductionPaperSize
+from inventory.models import Paper as PaperStock
 from shops.models import Shop
 
 from .choices import (
